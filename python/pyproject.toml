@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blinkcms-datarouter"
+version = "0.2.0"
+description = "Python bindings for the BlinkCMS datarouter IPC protocol."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {text = "Proprietary"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
+[tool.setuptools.packages.find]
+include = ["blinkcms_datarouter*"]
+
+[tool.setuptools.package-data]
+"blinkcms_datarouter._native" = ["*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

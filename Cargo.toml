@@ -1,0 +1,49 @@
+[package]
+name = "blinkcms-datarouter"
+version = "0.2.0"
+edition = "2024"
+license = "Proprietary"
+description = "BlinkCMS local shared-memory datarouter C ABI packaged for Cargo"
+readme = "README.md"
+repository = "https://github.com/Creeper23456/blinkcms"
+links = "datarouter"
+build = "build.rs"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "include/datarouter.h",
+    "include/datarouter_frontend.h",
+    "include/datarouter_protocol.h",
+    "src/lib.rs",
+    "src/logging.rs",
+    "src/frontend.rs",
+    "src/frontend/*.rs",
+    "src/protocol.rs",
+    "src/query/*.rs",
+    "src/protocol_ffi.rs",
+    "src/common.c",
+    "src/datarouter_internal.h",
+    "src/datarouter_registry.h",
+    "src/datarouter_router.h",
+    "src/datarouter_scheduler.h",
+    "src/datarouter_signal.h",
+    "src/platform_linux.c",
+    "src/platform_windows.c",
+    "src/port.c",
+    "src/registry.c",
+    "src/router.c",
+    "src/ring.c",
+    "src/scheduler.c",
+    "src/signal.c",
+    "docs/*.md",
+]
+
+[lib]
+name = "blinkcms_datarouter"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[[bench]]
+name = "protocol_hot_path"
+harness = false

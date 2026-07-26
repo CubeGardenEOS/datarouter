@@ -1,0 +1,13 @@
+[package]
+name = "blinkcms-datarouter-jni"
+version = "0.2.0"
+edition = "2024"
+license = "Proprietary"
+description = "Java 17 JNI frontend for blinkcms-datarouter"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blinkcms-datarouter = { path = ".." }
+jni = "0.21"
