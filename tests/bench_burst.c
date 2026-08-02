@@ -186,7 +186,7 @@ int main(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 3000U;
 

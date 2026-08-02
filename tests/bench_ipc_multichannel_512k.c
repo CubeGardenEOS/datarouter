@@ -609,7 +609,7 @@ static void print_augmented_result(const char *cms_json, uint64_t max_rss, const
 }
 
 static datarouter_port *open_and_logon(const char *shm_name, const char *service, uint32_t timeout_ms) {
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = shm_name;
     opts.timeout_ms = timeout_ms;
     datarouter_port *port = NULL;

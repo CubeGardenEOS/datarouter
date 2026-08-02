@@ -122,7 +122,7 @@ static pid_t start_logged_service(const char *name, const char *service, int rea
     pid_t pid = fork();
     require_int(pid >= 0, "fork logged service");
     if (pid == 0) {
-        datarouter_options opts;
+        datarouter_options opts = {0};
         opts.shm_name = name;
         opts.timeout_ms = 1000U;
 
@@ -368,7 +368,7 @@ static void test_route_and_allowlist(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 5000U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -443,7 +443,7 @@ static void test_concurrent_send_from_shared_port(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 5000U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -507,7 +507,7 @@ static void test_wait_timeout(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 5000U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -528,7 +528,7 @@ static void test_active_service_not_replaced_before_ttl(void) {
     pid_t dead_core = start_logged_service_wait(name, "Core");
     stop_logged_service(dead_core);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -549,7 +549,7 @@ static void test_snapshot_reports_active_services_without_pid_cleanup(void) {
     pid_t sw = start_switch(name, 5000U);
     pid_t dead_core = start_logged_service_wait(name, "Core");
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -580,7 +580,7 @@ static void test_send_to_active_dead_pid_service_uses_registry_state(void) {
     pid_t sw = start_switch(name, 5000U);
     pid_t dead_core = start_logged_service_wait(name, "Core");
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -743,7 +743,7 @@ static void test_ttl_reuse(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 100U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -816,7 +816,7 @@ static void test_stale_self_slot_reuse_returns_not_found(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 100U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -871,7 +871,7 @@ static void test_idle_wait_keeps_service_registered(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 100U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -905,7 +905,7 @@ static void test_close_releases_service_slot(void) {
     unlink_shm(name);
     pid_t sw = start_switch(name, 5000U);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -935,7 +935,7 @@ static void test_config_allowlist_and_capacity(void) {
     require_int(mapping.shm->control.channel_count == 10U, "config owns channel count");
     datarouter_platform_close(&mapping);
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 
@@ -974,7 +974,7 @@ static void test_config_is_startup_only(void) {
     pid_t sw = start_switch_config(name, 5000U, config_path);
     write_config(config_path, "Core,MLHelper,Extra");
 
-    datarouter_options opts;
+    datarouter_options opts = {0};
     opts.shm_name = name;
     opts.timeout_ms = 1000U;
 

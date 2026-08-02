@@ -525,8 +525,19 @@ impl FrontendInner {
                 self.stats.switch_recoveries.fetch_add(1, Ordering::Relaxed);
                 result
             }
-            NotFoundRecovery::TargetMissing | NotFoundRecovery::Ambiguous => {
-                Err(crate::DATAROUTER_ERR_NOT_FOUND)
+            NotFoundRecovery::TargetMissing => Err(crate::DATAROUTER_ERR_NOT_FOUND),
+            NotFoundRecovery::RetryCurrentPort => {
+                // Another thread (reader, keepalive, or a concurrent sender)
+                // already re-registered this frontend on a fresh port between
+                // our failed send and this recovery, or the target registered
+                // mid-flight. The port is live and the registry shows both
+                // sides, so the original failure was a stale-port artifact:
+                // retry the send here instead of surfacing a spurious
+                // NOT_FOUND to the application.
+                guard
+                    .as_ref()
+                    .ok_or(crate::DATAROUTER_ERR_INTERNAL)?
+                    .send(target_service, packed)
             }
         }
     }
@@ -619,7 +630,10 @@ pub(crate) fn c_source_to_string(
 enum NotFoundRecovery {
     ReconnectSelf,
     TargetMissing,
-    Ambiguous,
+    /// Both this frontend and the target are currently registered while the
+    /// port is live: the failed send raced a concurrent self-recovery, so the
+    /// send is retried on the existing port instead of reported as missing.
+    RetryCurrentPort,
 }
 
 fn not_found_recovery(
@@ -671,7 +685,7 @@ fn not_found_recovery_from_entries(
     match (has_self, has_target) {
         (false, _) => NotFoundRecovery::ReconnectSelf,
         (true, false) => NotFoundRecovery::TargetMissing,
-        (true, true) => NotFoundRecovery::Ambiguous,
+        (true, true) => NotFoundRecovery::RetryCurrentPort,
     }
 }
 
@@ -702,13 +716,16 @@ mod tests {
             not_found_recovery_from_entries(vec!["portal".to_owned()], "portal", "core"),
             NotFoundRecovery::TargetMissing
         );
+        // Both sides registered on a live port: the failure was a stale-port
+        // artifact of a concurrent self-recovery, so the send must be retried
+        // on the current port rather than reported as NOT_FOUND.
         assert_eq!(
             not_found_recovery_from_entries(
                 vec!["portal".to_owned(), "core".to_owned()],
                 "portal",
                 "core"
             ),
-            NotFoundRecovery::Ambiguous
+            NotFoundRecovery::RetryCurrentPort
         );
     }
 
@@ -741,6 +758,80 @@ mod tests {
             too_long_ttl.normalized(),
             Err(crate::DATAROUTER_ERR_INVALID_ARGUMENT)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_sends_never_report_spurious_not_found_after_slot_reclaim() {
+        let Some(mut switch) = start_test_switch("rust-stress-race") else {
+            return;
+        };
+        let shm_name = switch.shm_name.clone();
+        let _core = Frontend::connect(FrontendOptions {
+            shm_name: shm_name.clone(),
+            service_name: "core".to_owned(),
+            connect_timeout_ms: 1000,
+            recv_timeout_ms: 1000,
+            ..FrontendOptions::default()
+        })
+        .expect("connect core frontend");
+        let local = Frontend::connect(FrontendOptions {
+            shm_name,
+            service_name: "portal".to_owned(),
+            connect_timeout_ms: 1000,
+            recv_timeout_ms: 1000,
+            ..FrontendOptions::default()
+        })
+        .expect("connect local frontend");
+
+        // Reclaim the portal slot each round, let a fresh occupant steal it,
+        // then fire concurrent sends. One sender (or the reader/keepalive
+        // threads) re-registers portal; every other sender must retry on the
+        // fresh port instead of surfacing a spurious NOT_FOUND from the stale
+        // slot it failed on.
+        let mut failures = 0usize;
+        for round in 0..25 {
+            local
+                .inner
+                .with_port(|port| port.test_release_self_slot())
+                .expect("access local port")
+                .expect("release local slot");
+            let occupant = Frontend::connect(FrontendOptions {
+                shm_name: switch.shm_name.clone(),
+                service_name: "occupant".to_owned(),
+                connect_timeout_ms: 1000,
+                recv_timeout_ms: 1000,
+                ..FrontendOptions::default()
+            })
+            .expect("connect slot occupant");
+
+            let mut msg = protocol::Message::new(protocol::MSG_BUSINESS_REQUEST);
+            msg.body = format!("race-{round}").into_bytes();
+            let packed = protocol::pack(&msg).expect("pack message");
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let inner = std::sync::Arc::clone(&local.inner);
+                let packed = packed.clone();
+                handles.push(std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1));
+                    super::outbound::send(&inner, "core", &packed, 1000)
+                }));
+            }
+            let results: Vec<Result<(), i32>> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("sender thread"))
+                .collect();
+            for result in results {
+                if let Err(crate::DATAROUTER_ERR_NOT_FOUND) = result {
+                    failures += 1;
+                } else if let Err(code) = result {
+                    panic!("unexpected send error round={round} code={code}");
+                }
+            }
+            drop(occupant);
+        }
+        assert_eq!(failures, 0, "spurious NOT_FOUND on {failures} sends");
+        switch.stop();
     }
 
     #[cfg(unix)]
