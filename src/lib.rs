@@ -13,6 +13,9 @@ pub mod logging;
 pub mod protocol;
 mod protocol_ffi;
 pub mod query;
+pub mod switch_frontend;
+
+include!(concat!(env!("OUT_DIR"), "/generated_switch_bin.rs"));
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
@@ -34,6 +37,17 @@ pub const DATAROUTER_MAX_PORTS: usize = 64;
 pub const DATAROUTER_DEFAULT_MAX_PORTS: usize = 4;
 pub const DATAROUTER_CHANNEL_COUNT: usize = DATAROUTER_DEFAULT_MAX_PORTS * 2;
 include!(concat!(env!("OUT_DIR"), "/generated_constants.rs"));
+/// 8-byte ring header (two `atomic_uint`).
+pub const DATAROUTER_RING_HEADER_SIZE: usize = 8;
+/// 8-byte per-frame route/length header.
+pub const DATAROUTER_FRAME_HEADER_SIZE: usize = 8;
+/// Usable payload bytes of one 512 KiB ring channel.
+pub const DATAROUTER_RING_CAPACITY: usize =
+    DATAROUTER_CHANNEL_SIZE as usize - DATAROUTER_RING_HEADER_SIZE;
+/// Largest single-frame payload. The legacy 60 KiB cap is disabled; the whole
+/// ring fits in one frame (512 KiB - 16 bytes).
+pub const DATAROUTER_MAX_APP_PAYLOAD: usize =
+    DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE;
 pub const DATAROUTER_SERVICE_NAME_MAX: usize = 31;
 pub const DATAROUTER_DEFAULT_TIMEOUT_MS: u32 = 3000;
 
@@ -49,6 +63,9 @@ pub struct datarouter_port {
 pub struct datarouter_options {
     pub shm_name: *const c_char,
     pub timeout_ms: u32,
+    /// Optional shared secret for switch auth (see `SwitchConfig::token`).
+    /// Must be NULL when the switch runs without `--token`.
+    pub auth_token: *const c_char,
 }
 
 impl Default for datarouter_options {
@@ -56,6 +73,7 @@ impl Default for datarouter_options {
         Self {
             shm_name: DATAROUTER_DEFAULT_SHM_NAME.as_ptr().cast(),
             timeout_ms: DATAROUTER_DEFAULT_TIMEOUT_MS,
+            auth_token: std::ptr::null(),
         }
     }
 }
@@ -122,6 +140,7 @@ unsafe extern "C" {
         info: *mut datarouter_message_info,
     ) -> c_int;
     pub fn datarouter_poll(port: *mut datarouter_port) -> c_int;
+    pub fn datarouter_frame_len(port: *mut datarouter_port, payload_len: *mut usize) -> c_int;
     pub fn datarouter_touch(port: *mut datarouter_port) -> c_int;
     pub fn datarouter_wait(port: *mut datarouter_port, timeout_ms: u32) -> c_int;
     pub fn datarouter_drain(
@@ -139,6 +158,8 @@ unsafe extern "C" {
         count: *mut usize,
     ) -> c_int;
     pub fn datarouter_ttl_ms(port: *mut datarouter_port) -> u32;
+    pub fn datarouter_max_ports(port: *mut datarouter_port) -> u32;
+    pub fn datarouter_active_ports(port: *mut datarouter_port) -> u32;
     pub fn datarouter_transport_stats_snapshot(
         port: *mut datarouter_port,
         out: *mut datarouter_transport_stats,

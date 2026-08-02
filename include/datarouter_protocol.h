@@ -76,7 +76,8 @@ extern "C" {
 #define DATAROUTER_TAG_ACTOR_UUID      0x15
 #define DATAROUTER_TAG_TRACE_ID        0x16
 
-#define DATAROUTER_MAX_APP_PAYLOAD     (60 * 1024)
+#define DATAROUTER_MAX_APP_PAYLOAD \
+    (DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
 
 /* ── Opaque Types ───────────────────────────────────────────────────────── */
 

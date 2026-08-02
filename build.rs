@@ -12,6 +12,7 @@ const C_SOURCES: &[&str] = &[
     "src/scheduler.c",
     "src/signal.c",
 ];
+const SWITCH_SOURCES: &[&str] = &["src/config.c", "src/switch.c"];
 const HEADERS: &[&str] = &[
     "Cargo.toml",
     "include/datarouter.h",
@@ -31,6 +32,10 @@ const HEADERS: &[&str] = &[
     "src/datarouter_router.h",
     "src/datarouter_scheduler.h",
     "src/datarouter_signal.h",
+    "src/config.h",
+    "src/config.c",
+    "src/switch.c",
+    "src/frontend/switch_frontend.rs",
 ];
 
 fn main() {
@@ -70,6 +75,28 @@ fn main() {
         .collect();
 
     archive_static_library(&objects, &out_dir, is_msvc);
+
+    let switch_bin = build_switch_binary(
+        &objects,
+        &out_dir,
+        is_windows,
+        is_msvc,
+        channel_size,
+        platform_source,
+    );
+    let generated_switch = out_dir.join("generated_switch_bin.rs");
+    let generated_switch_body = match &switch_bin {
+        Some(path) => {
+            // Embed the switch binary directly into the consuming executable
+            // at compile time: `SwitchHandle::start` spawns the switch from
+            // these bytes without depending on any resource file on disk.
+            let literal = path.display().to_string().replace('\\', "/");
+            format!("pub const DATAROUTER_SWITCH_BYTES: &[u8] = include_bytes!(\"{literal}\");\n")
+        }
+        None => "pub const DATAROUTER_SWITCH_BYTES: &[u8] = &[];\n".to_owned(),
+    };
+    std::fs::write(&generated_switch, generated_switch_body)
+        .expect("write generated switch binary constant");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=datarouter");
@@ -141,6 +168,76 @@ fn compile_c(
     }
 
     object
+}
+
+fn build_switch_binary(
+    objects: &[PathBuf],
+    out_dir: &Path,
+    is_windows: bool,
+    is_msvc: bool,
+    channel_size: u32,
+    platform_source: &str,
+) -> Option<PathBuf> {
+    let mut switch_objects: Vec<PathBuf> = objects.to_vec();
+    for source in SWITCH_SOURCES {
+        switch_objects.push(compile_c(
+            source,
+            out_dir,
+            is_windows,
+            is_msvc,
+            channel_size,
+        ));
+    }
+    let binary = out_dir.join(if is_windows {
+        "datarouter-switch.exe"
+    } else {
+        "datarouter-switch"
+    });
+    let _ = platform_source;
+    if is_msvc {
+        let linker = env::var_os("LD").unwrap_or_else(|| OsString::from("link"));
+        let mut cmd = Command::new(linker);
+        cmd.arg("/nologo")
+            .arg(format!("/OUT:{}", binary.display()))
+            .arg("/SUBSYSTEM:CONSOLE");
+        cmd.args(&switch_objects);
+        cmd.arg("kernel32.lib").arg("user32.lib");
+        if run_optional(cmd, "link datarouter-switch") {
+            return Some(binary);
+        }
+        eprintln!("cargo:warning=datarouter switch binary unavailable on this MSVC toolchain");
+        return None;
+    }
+    let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
+    let mut cmd = Command::new(compiler);
+    cmd.arg("-std=c11")
+        .args(&switch_objects)
+        .arg("-o")
+        .arg(&binary);
+    if is_windows {
+        cmd.arg("-lws2_32");
+    } else {
+        cmd.arg("-pthread");
+    }
+    if run_optional(cmd, "link datarouter-switch") {
+        return Some(binary);
+    }
+    eprintln!("cargo:warning=datarouter switch binary unavailable on this toolchain");
+    None
+}
+
+fn run_optional(mut cmd: Command, label: &str) -> bool {
+    match cmd.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("cargo:warning=linker step failed for {label}: {status}");
+            false
+        }
+        Err(err) => {
+            eprintln!("cargo:warning=linker unavailable for {label}: {err}");
+            false
+        }
+    }
 }
 
 fn archive_static_library(objects: &[PathBuf], out_dir: &Path, is_msvc: bool) {

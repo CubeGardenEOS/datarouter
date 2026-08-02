@@ -70,7 +70,8 @@ class TestTagConstantsMatchRust(unittest.TestCase):
         self.assertEqual(MSG_LOG_NOTICE, 0x8D)
 
     def test_max_app_payload(self) -> None:
-        self.assertEqual(MAX_APP_PAYLOAD, 60 * 1024)
+        # 512 KiB ring minus 8-byte ring header and 8-byte frame header.
+        self.assertEqual(MAX_APP_PAYLOAD, (512 * 1024) - 16)
 
 
 class TestPackUnpack(unittest.TestCase):

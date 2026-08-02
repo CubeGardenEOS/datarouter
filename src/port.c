@@ -225,6 +225,47 @@ static int channel_has_complete_frame(datarouter_port *port, datarouter_channel 
     return DATAROUTER_OK;
 }
 
+int datarouter_frame_len(datarouter_port *port, size_t *payload_len) {
+    if (!port || !port->shm || !payload_len ||
+        port->slot_index >= datarouter_active_max_ports(port->shm)) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    datarouter_registry_entry *self = pin_self_entry(port);
+    if (!self) {
+        return DATAROUTER_ERR_NOT_FOUND;
+    }
+    datarouter_touch_entry(self, datarouter_now_ns());
+    datarouter_channel *rx = datarouter_rx_channel(port->shm, port->slot_index);
+    size_t used = 0U;
+    int rc = datarouter_ring_validate(rx, &used);
+    if (rc == DATAROUTER_OK) {
+        if (used < DATAROUTER_FRAME_HEADER_SIZE) {
+            rc = used == 0U ? DATAROUTER_ERR_AGAIN : DATAROUTER_ERR_PROTOCOL;
+        } else {
+            uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
+            rc = datarouter_ring_peek(rx, header, sizeof(header));
+            if (rc == DATAROUTER_OK) {
+                uint32_t source_route = 0U;
+                uint32_t len = 0U;
+                decode_frame_header(header, &source_route, &len);
+                if (source_route == 0U ||
+                    len > (uint32_t)(DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE) ||
+                    used < DATAROUTER_FRAME_HEADER_SIZE + (size_t)len) {
+                    rc = DATAROUTER_ERR_PROTOCOL;
+                    report_corrupt_self(port);
+                } else {
+                    *payload_len = (size_t)len;
+                }
+            }
+        }
+    }
+    if (rc == DATAROUTER_ERR_PROTOCOL) {
+        report_corrupt_self(port);
+    }
+    datarouter_registry_unpin(self);
+    return rc;
+}
+
 static void fill_message_info(
     datarouter_port *port,
     uint32_t source_route,
@@ -605,6 +646,15 @@ int datarouter_open(const datarouter_options *options, datarouter_port **out) {
         datarouter_platform_close(&mapping);
         return DATAROUTER_ERR_NOT_FOUND;
     }
+    uint64_t expected_fingerprint = mapping.shm->control.auth_fingerprint;
+    const char *token = options && options->auth_token && options->auth_token[0] != '\0'
+        ? options->auth_token
+        : NULL;
+    if (expected_fingerprint != 0ULL &&
+        datarouter_auth_fingerprint(token) != expected_fingerprint) {
+        datarouter_platform_close(&mapping);
+        return DATAROUTER_ERR_PERMISSION;
+    }
 
     datarouter_port *port = (datarouter_port *)calloc(1U, sizeof(*port));
     if (!port) {
@@ -947,6 +997,25 @@ uint32_t datarouter_ttl_ms(datarouter_port *port) {
     return port && port->shm && switch_identity_alive(port, 0)
         ? port->shm->control.ttl_ms
         : 0U;
+}
+
+uint32_t datarouter_max_ports(datarouter_port *port) {
+    return port && port->shm ? datarouter_active_max_ports(port->shm) : 0U;
+}
+
+uint32_t datarouter_active_ports(datarouter_port *port) {
+    if (!port || !port->shm) {
+        return 0U;
+    }
+    uint32_t active = 0U;
+    uint32_t max_ports = datarouter_active_max_ports(port->shm);
+    for (uint32_t i = 0U; i < max_ports; i++) {
+        if (atomic_load_explicit(&port->shm->control.registry[i].state, memory_order_acquire) ==
+            DATAROUTER_PORT_ACTIVE) {
+            active++;
+        }
+    }
+    return active;
 }
 
 int datarouter_transport_stats_snapshot(

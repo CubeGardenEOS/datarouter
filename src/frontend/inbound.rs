@@ -9,7 +9,6 @@ use crate::protocol::{self, InboundResultKind};
 
 use super::{FrontendInner, QueuedMessage};
 
-const RAW_RECV_BUF_SIZE: usize = crate::DATAROUTER_CHANNEL_SIZE as usize;
 const DRAIN_FRAME_BUDGET: usize = 256;
 
 pub fn spawn_reader(inner: Arc<FrontendInner>) -> JoinHandle<()> {
@@ -39,13 +38,12 @@ fn run_receive_loop(inner: Arc<FrontendInner>) {
         max_bytes: inner.options.max_reassembly_bytes,
         max_message_bytes: inner.options.max_message_bytes,
     });
-    let mut recv_buf = vec![0_u8; RAW_RECV_BUF_SIZE];
     while !inner.closing.load(Ordering::Acquire) {
         expire_reassemblies(&inner, &mut processor);
         if !wait_for_frame(&inner) {
             continue;
         }
-        drain_available(&inner, &mut processor, &mut recv_buf);
+        drain_available(&inner, &mut processor);
     }
 }
 
@@ -73,40 +71,102 @@ fn wait_for_frame(inner: &FrontendInner) -> bool {
     }
 }
 
-fn drain_available(
-    inner: &FrontendInner,
-    processor: &mut protocol::InboundProcessor,
-    recv_buf: &mut [u8],
-) {
+fn drain_available(inner: &FrontendInner, processor: &mut protocol::InboundProcessor) {
     for _ in 0..DRAIN_FRAME_BUDGET {
+        let mut buffer = inner.take_buffer();
         let frame = inner
-            .with_port(|port| port.recv(recv_buf))
+            .with_port(|port| port.recv_into(&mut buffer))
             .unwrap_or(Err(crate::DATAROUTER_ERR_INTERNAL));
         match frame {
             Ok(Some(frame)) => {
                 inner.stats.received_frames.fetch_add(1, Ordering::Relaxed);
-                match protocol::unpack(&frame.data) {
-                    Ok(msg) => handle_inbound_message(inner, processor, frame.source, msg),
-                    Err(_) => {
-                        inner.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                handle_raw_frame(inner, processor, frame.source, frame.data);
             }
-            Ok(None) => return,
+            Ok(None) => {
+                inner.recycle_buffer(buffer);
+                return;
+            }
             Err(crate::DATAROUTER_ERR_NOT_FOUND) => {
                 inner.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                inner.recycle_buffer(buffer);
                 let _ = inner.recover_self_after_not_found("reader recv");
                 return;
             }
             Err(code) => {
                 inner.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 inner.stats.reader_errors.fetch_add(1, Ordering::Relaxed);
+                inner.recycle_buffer(buffer);
                 eprintln!(
                     "datarouter frontend reader recv failed service={} shm={} code={}",
                     inner.options.service_name, inner.options.shm_name, code
                 );
                 return;
             }
+        }
+    }
+}
+
+/// Route one raw wire frame with the minimum possible copies.
+///
+/// A well-formed single-frame message (no chunk metadata TLV, not a chunk
+/// control message) is queued verbatim: the bytes received from the ring are
+/// handed to the application queue without unpacking or repacking. Chunked and
+/// control frames fall back to the full protocol path, whose behavior is
+/// identical to the historical reader.
+fn handle_raw_frame(
+    inner: &FrontendInner,
+    processor: &mut protocol::InboundProcessor,
+    source: [c_char; crate::DATAROUTER_SERVICE_NAME_MAX + 1],
+    raw: Vec<u8>,
+) {
+    let Some((message_type, _, vd_len, _)) = protocol::raw_frame_layout(&raw) else {
+        inner.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let is_chunk_control = matches!(
+        message_type,
+        protocol::MSG_CHUNK_ACK | protocol::MSG_CHUNK_ERROR
+    );
+    if !is_chunk_control
+        && protocol::raw_is_single_frame(
+            &raw[protocol::HEADER_SIZE..protocol::HEADER_SIZE + vd_len],
+        )
+    {
+        queue_complete_raw(inner, source, raw);
+        return;
+    }
+    match protocol::unpack(&raw) {
+        Ok(msg) => handle_inbound_message(inner, processor, source, msg),
+        Err(_) => {
+            inner.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Queue a complete single-frame message without any repacking copy.
+/// Matches the historical `queue_complete` for the no-chunk-ack case.
+fn queue_complete_raw(
+    inner: &FrontendInner,
+    source: [c_char; crate::DATAROUTER_SERVICE_NAME_MAX + 1],
+    raw: Vec<u8>,
+) {
+    if raw.len() > inner.options.max_message_bytes {
+        inner.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    match inner.complete_queue.try_push(QueuedMessage {
+        source,
+        packed: raw,
+    }) {
+        Ok(()) => {
+            inner
+                .stats
+                .received_complete
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(queued) => {
+            inner.stats.queue_full.fetch_add(1, Ordering::Relaxed);
+            let _ = queued;
         }
     }
 }

@@ -19,6 +19,7 @@ include = [
     "src/logging.rs",
     "src/frontend.rs",
     "src/frontend/*.rs",
+    "src/switch_frontend.rs",
     "src/protocol.rs",
     "src/query/*.rs",
     "src/protocol_ffi.rs",
@@ -28,6 +29,9 @@ include = [
     "src/datarouter_router.h",
     "src/datarouter_scheduler.h",
     "src/datarouter_signal.h",
+    "src/config.h",
+    "src/config.c",
+    "src/switch.c",
     "src/platform_linux.c",
     "src/platform_windows.c",
     "src/port.c",
@@ -36,8 +40,12 @@ include = [
     "src/ring.c",
     "src/scheduler.c",
     "src/signal.c",
+    "benches/*.rs",
     "docs/*.md",
 ]
+
+[dependencies]
+libc = "0.2"
 
 [lib]
 name = "blinkcms_datarouter"
@@ -46,4 +54,8 @@ crate-type = ["staticlib", "rlib"]
 
 [[bench]]
 name = "protocol_hot_path"
+harness = false
+
+[[bench]]
+name = "ipc_frontend"
 harness = false

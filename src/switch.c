@@ -38,6 +38,8 @@ typedef struct {
     const char *shm_name;
     mode_t mode;
     uint32_t ttl_ms;
+    uint32_t max_ports;
+    const char *auth_token;
     char allowlist[DATAROUTER_MAX_PORTS][DATAROUTER_SERVICE_NAME_MAX + 1U];
     uint32_t allowlist_len;
     int allow_any;
@@ -130,6 +132,7 @@ static void print_usage(const char *argv0) {
     fprintf(
         stderr,
         "usage: %s [--name /datarouter] [--mode 0600] [--ttl-ms 30000] "
+        "[--max-ports 4] [--token secret] "
         "(--allow Core,MLHelper | --config path.ini | --allow-any) [--once] "
         "[--reap-dead-processes] "
         "[--log-level error|warn|info|debug|trace]\n",
@@ -274,6 +277,7 @@ static int parse_args(int argc, char **argv, switch_options *options) {
     options->shm_name = DATAROUTER_DEFAULT_SHM_NAME;
     options->mode = 0600;
     options->ttl_ms = DATAROUTER_DEFAULT_TTL_MS;
+    options->max_ports = DATAROUTER_DEFAULT_MAX_PORTS;
     options->log_level = SWITCH_LOG_INFO;
     datarouter_config_init(&options->config);
 
@@ -288,6 +292,17 @@ static int parse_args(int argc, char **argv, switch_options *options) {
             if (parse_u32_strict(argv[++i], 1U, 600000U, &options->ttl_ms) != DATAROUTER_OK) {
                 return DATAROUTER_ERR_INVALID_ARGUMENT;
             }
+        } else if (strcmp(argv[i], "--max-ports") == 0 && i + 1 < argc) {
+            if (parse_u32_strict(argv[++i], 1U, DATAROUTER_MAX_PORTS, &options->max_ports) !=
+                DATAROUTER_OK) {
+                return DATAROUTER_ERR_INVALID_ARGUMENT;
+            }
+        } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            const char *token = argv[++i];
+            if (token[0] == '\0' || strlen(token) > 128U) {
+                return DATAROUTER_ERR_INVALID_ARGUMENT;
+            }
+            options->auth_token = token;
         } else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc) {
             if (options->config_mode || options->allow_any || options->allowlist_len != 0U ||
                 parse_allowlist(options, argv[++i]) != DATAROUTER_OK) {
@@ -332,6 +347,17 @@ static int parse_args(int argc, char **argv, switch_options *options) {
     } else if (!options->allow_any && options->allowlist_len == 0U) {
         fprintf(stderr, "datarouter-switch: an allowlist is required; use --allow-any explicitly\n");
         return DATAROUTER_ERR_PERMISSION;
+    }
+    if (options->config_mode &&
+        options->config.allow_port_count > options->max_ports) {
+        fprintf(stderr, "datarouter-switch: config allowlist needs %u ports, --max-ports is %u\n",
+                options->config.allow_port_count, options->max_ports);
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    if (options->allowlist_len > options->max_ports) {
+        fprintf(stderr, "datarouter-switch: allowlist needs %u ports, --max-ports is %u\n",
+                options->allowlist_len, options->max_ports);
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     return DATAROUTER_OK;
 }
@@ -949,12 +975,17 @@ int main(int argc, char **argv) {
         );
     }
 
-    uint32_t max_ports = options.config_mode
+    uint32_t allowlist_ports = options.config_mode
         ? options.config.allow_port_count
-        : DATAROUTER_DEFAULT_MAX_PORTS;
-    size_t map_size = datarouter_shared_memory_size(max_ports);
+        : options.allowlist_len;
+    uint32_t max_ports = options.max_ports > allowlist_ports ? options.max_ports : allowlist_ports;
     datarouter_mapping mapping;
     switch_start_lock start_lock;
+    if (max_ports == 0U || max_ports > DATAROUTER_MAX_PORTS) {
+        fprintf(stderr, "datarouter-switch: invalid max_ports %u\n", max_ports);
+        return 1;
+    }
+    size_t map_size = datarouter_shared_memory_size(max_ports);
     rc = acquire_start_lock(options.shm_name, &start_lock);
     if (rc != DATAROUTER_OK) {
         fprintf(stderr, "datarouter-switch: acquire startup lock failed: %s\n", datarouter_strerror(rc));
@@ -966,7 +997,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "datarouter-switch: create shm failed: %s\n", datarouter_strerror(rc));
         return 1;
     }
-    rc = datarouter_init_shared_memory_with_ttl(mapping.shm, max_ports, options.ttl_ms);
+    uint64_t auth_fingerprint = datarouter_auth_fingerprint(options.auth_token);
+    rc = datarouter_init_shared_memory_full(mapping.shm, max_ports, options.ttl_ms, auth_fingerprint);
     if (rc != DATAROUTER_OK) {
         fprintf(stderr, "datarouter-switch: init shm failed: %s\n", datarouter_strerror(rc));
         datarouter_platform_close(&mapping);
@@ -982,7 +1014,7 @@ int main(int argc, char **argv) {
         &options,
         SWITCH_LOG_INFO,
         "start pid=%d start_id=%" PRIu64 " shm=%s mode=%04o ttl_ms=%u max_ports=%u "
-        "%s once=%d reap_dead_processes=%d version=%s layout=%u channel_size=%u",
+        "%s once=%d reap_dead_processes=%d auth=%s version=%s layout=%u channel_size=%u",
         (int)switch_pid(),
         mapping.shm->control.switch_start_id,
         options.shm_name,
@@ -992,6 +1024,7 @@ int main(int argc, char **argv) {
         allow_desc,
         options.once,
         options.reap_dead_processes,
+        options.auth_token ? "enabled" : "disabled",
         datarouter_version(),
         DATAROUTER_LAYOUT_VERSION,
         DATAROUTER_CHANNEL_SIZE

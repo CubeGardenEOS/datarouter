@@ -30,15 +30,14 @@ typedef pthread_mutex_t datarouter_mutex;
 
 #define DATAROUTER_VERSION "0.2.0"
 #define DATAROUTER_MAGIC 0x534D4342U
-#define DATAROUTER_LAYOUT_VERSION 9U
+#define DATAROUTER_LAYOUT_VERSION 10U
 #define DATAROUTER_ROUTE_SLOT_BITS 6U
 #define DATAROUTER_ROUTE_SLOT_MASK ((1U << DATAROUTER_ROUTE_SLOT_BITS) - 1U)
 #define DATAROUTER_ROUTE_GENERATION_MASK 0x03ffffffU
 #define DATAROUTER_RX_CHANNEL(slot_index) ((uint32_t)((slot_index) * 2U))
 #define DATAROUTER_TX_CHANNEL(slot_index) ((uint32_t)((slot_index) * 2U + 1U))
-#define DATAROUTER_RING_CAPACITY \
-    (DATAROUTER_CHANNEL_SIZE - sizeof(datarouter_ring_header))
-#define DATAROUTER_FRAME_HEADER_SIZE 8U
+/* Ring geometry is defined publicly in include/datarouter.h. The assert below
+ * (after the ring header typedef) keeps the internal header in lockstep. */
 #define DATAROUTER_CONTROL_LOCK_FREE 0U
 #define DATAROUTER_CONTROL_LOCK_HELD 1U
 #define DATAROUTER_DEFAULT_TTL_MS 30000U
@@ -86,6 +85,8 @@ typedef struct {
     atomic_uint head;
     atomic_uint tail;
 } datarouter_ring_header;
+
+_Static_assert(sizeof(datarouter_ring_header) == DATAROUTER_RING_HEADER_SIZE, "ring header size mismatch");
 
 typedef struct {
     datarouter_ring_header header;
@@ -142,6 +143,7 @@ typedef struct {
     uint32_t switch_uid;
     uint64_t switch_start_id;
     uint32_t ttl_ms;
+    uint64_t auth_fingerprint;
     atomic_uint initialized;
     atomic_uint control_lock;
     atomic_ullong request_ready_mask;
@@ -223,6 +225,13 @@ int datarouter_init_shared_memory_with_ttl(
     uint32_t max_ports,
     uint32_t ttl_ms
 );
+int datarouter_init_shared_memory_full(
+    datarouter_shared_memory *shm,
+    uint32_t max_ports,
+    uint32_t ttl_ms,
+    uint64_t auth_fingerprint
+);
+uint64_t datarouter_auth_fingerprint(const char *token);
 int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_t map_size);
 size_t datarouter_shared_memory_size(uint32_t max_ports);
 uint32_t datarouter_active_max_ports(const datarouter_shared_memory *shm);

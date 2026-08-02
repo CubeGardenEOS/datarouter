@@ -24,6 +24,20 @@ const char *datarouter_version(void) {
     return DATAROUTER_VERSION;
 }
 
+uint64_t datarouter_auth_fingerprint(const char *token) {
+    /* FNV-1a 64. The fingerprint is not reversible; the raw token is never
+     * stored in shared memory. Zero is reserved for "auth disabled". */
+    if (!token || token[0] == '\0') {
+        return 0ULL;
+    }
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char *cursor = (const unsigned char *)token; *cursor; cursor++) {
+        hash ^= (uint64_t)*cursor;
+        hash *= 1099511628211ULL;
+    }
+    return hash == 0ULL ? 1ULL : hash;
+}
+
 const char *datarouter_strerror(int code) {
     switch (code) {
         case DATAROUTER_OK:
@@ -322,6 +336,15 @@ int datarouter_init_shared_memory_with_ttl(
     uint32_t max_ports,
     uint32_t ttl_ms
 ) {
+    return datarouter_init_shared_memory_full(shm, max_ports, ttl_ms, 0ULL);
+}
+
+int datarouter_init_shared_memory_full(
+    datarouter_shared_memory *shm,
+    uint32_t max_ports,
+    uint32_t ttl_ms,
+    uint64_t auth_fingerprint
+) {
     size_t total_size = datarouter_shared_memory_size(max_ports);
     if (!shm || ttl_ms == 0U || total_size == 0U || total_size > UINT32_MAX) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
@@ -335,6 +358,7 @@ int datarouter_init_shared_memory_with_ttl(
     shm->control.control_size = (uint32_t)sizeof(datarouter_control_plane);
     shm->control.data_offset = (uint32_t)sizeof(datarouter_control_plane);
     shm->control.total_size = (uint32_t)total_size;
+    shm->control.auth_fingerprint = auth_fingerprint;
     uint32_t switch_uid = 0U;
     uint64_t switch_start_id = 0ULL;
 #ifdef _WIN32

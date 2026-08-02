@@ -28,6 +28,17 @@ extern "C" {
 #ifndef DATAROUTER_CHANNEL_SIZE
 #define DATAROUTER_CHANNEL_SIZE 524288U
 #endif
+/* Official ring geometry: the 512 KiB channel carries a small atomic ring
+ * header followed by DATAROUTER_RING_CAPACITY data bytes. A frame adds an
+ * 8-byte route/length header, so the largest single-frame payload is
+ * DATAROUTER_MAX_APP_PAYLOAD (about 512 KiB - 16). The legacy 60 KiB cap
+ * is deliberately gone: the whole ring is usable as one frame. */
+#define DATAROUTER_FRAME_HEADER_SIZE 8U
+#define DATAROUTER_RING_HEADER_SIZE 8U
+#define DATAROUTER_RING_CAPACITY \
+    (DATAROUTER_CHANNEL_SIZE - DATAROUTER_RING_HEADER_SIZE)
+#define DATAROUTER_MAX_APP_PAYLOAD \
+    (DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
 #define DATAROUTER_SERVICE_NAME_MAX 31
 #define DATAROUTER_SHM_NAME_MAX 120
 #define DATAROUTER_DEFAULT_TIMEOUT_MS 3000U
@@ -37,6 +48,11 @@ typedef struct datarouter_port datarouter_port;
 typedef struct {
     const char *shm_name;
     uint32_t timeout_ms;
+    /* Optional shared secret for switch auth. When the switch was started
+     * with --token, this must match or datarouter_open fails with
+     * DATAROUTER_ERR_PERMISSION. NULL/empty is only accepted when the switch
+     * runs with auth disabled. */
+    const char *auth_token;
 } datarouter_options;
 
 typedef struct {
@@ -94,6 +110,7 @@ int datarouter_recv(
     datarouter_message_info *info
 );
 int datarouter_poll(datarouter_port *port);
+int datarouter_frame_len(datarouter_port *port, size_t *payload_len);
 int datarouter_touch(datarouter_port *port);
 int datarouter_wait(datarouter_port *port, uint32_t timeout_ms);
 int datarouter_drain(
@@ -111,6 +128,8 @@ int datarouter_registry_snapshot(
     size_t *count
 );
 uint32_t datarouter_ttl_ms(datarouter_port *port);
+uint32_t datarouter_max_ports(datarouter_port *port);
+uint32_t datarouter_active_ports(datarouter_port *port);
 int datarouter_transport_stats_snapshot(
     datarouter_port *port,
     datarouter_transport_stats *out

@@ -306,6 +306,7 @@ unsafe fn frontend_options_from_c(
     Ok(FrontendOptions {
         shm_name: unsafe { read_c_string(options.shm_name)? },
         service_name: unsafe { read_c_string(options.service_name)? },
+        auth_token: None,
         connect_timeout_ms: options.connect_timeout_ms,
         recv_timeout_ms: options.recv_timeout_ms,
         ack_timeout_ms: options.ack_timeout_ms,

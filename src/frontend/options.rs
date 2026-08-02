@@ -18,6 +18,10 @@ pub const MAX_CHUNK_TTL_MS: u32 = 300_000;
 pub struct FrontendOptions {
     pub shm_name: String,
     pub service_name: String,
+    /// Optional shared secret for switch auth. Required when the switch was
+    /// started with `--token`; leaving it empty on an authenticated switch
+    /// makes `datarouter_open` fail with `DATAROUTER_ERR_PERMISSION`.
+    pub auth_token: Option<String>,
     pub connect_timeout_ms: u32,
     pub recv_timeout_ms: u32,
     pub ack_timeout_ms: u32,
@@ -38,6 +42,7 @@ impl Default for FrontendOptions {
             )
             .into_owned(),
             service_name: String::new(),
+            auth_token: None,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             recv_timeout_ms: DEFAULT_RECV_TIMEOUT_MS,
             ack_timeout_ms: DEFAULT_ACK_TIMEOUT_MS,
@@ -60,6 +65,12 @@ impl FrontendOptions {
         }
         if self.service_name.is_empty() {
             return Err(crate::DATAROUTER_ERR_INVALID_ARGUMENT);
+        }
+        if let Some(token) = self.auth_token.as_mut()
+            && token.is_empty()
+        {
+            *token = String::new();
+            self.auth_token = None;
         }
         if self.connect_timeout_ms == 0 {
             self.connect_timeout_ms = defaults.connect_timeout_ms;

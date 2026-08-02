@@ -77,6 +77,11 @@ pub struct FrontendInner {
     pub closing: AtomicBool,
     pub ack_waiters: outbound::AckWaiters,
     pub complete_queue: queue::BoundedQueue<QueuedMessage>,
+    /// Reusable receive buffers returned by the application side after
+    /// draining a queued message. The reader hands each received frame to the
+    /// queue by moving a pooled buffer (zero-copy), and `recv`/`recv_packed`
+    /// recycle it here, so steady-state reception performs no allocation.
+    pub buffer_pool: Mutex<std::collections::VecDeque<Vec<u8>>>,
     pub stats: FrontendStats,
     keepalive_interval: Duration,
     keepalive_wait: Condvar,
@@ -111,6 +116,7 @@ impl Frontend {
         let inner = Arc::new(FrontendInner {
             complete_queue: queue::BoundedQueue::new(options.app_queue_capacity),
             ack_waiters: outbound::AckWaiters::new(options.max_pending_acks),
+            buffer_pool: Mutex::new(std::collections::VecDeque::new()),
             closing: AtomicBool::new(false),
             stats: FrontendStats::default(),
             port: RwLock::new(Some(port)),
@@ -149,6 +155,7 @@ impl Frontend {
         let queued = self.inner.complete_queue.recv(timeout_ms)?;
         let message =
             protocol::unpack(&queued.packed).map_err(|_| crate::DATAROUTER_ERR_PROTOCOL)?;
+        self.inner.recycle_buffer(queued.packed);
         self.report_ipc_response_timing(&message);
         Ok(FrontendMessage {
             source: c_source_to_string(&queued.source),
@@ -178,10 +185,12 @@ impl Frontend {
             self.report_ipc_response_timing(&message);
         }
         out_buf[..queued.packed.len()].copy_from_slice(&queued.packed);
-        Ok(crate::datarouter_message_info {
+        let info = crate::datarouter_message_info {
             source: queued.source,
             len: queued.packed.len(),
-        })
+        };
+        self.inner.recycle_buffer(queued.packed);
+        Ok(info)
     }
 
     pub fn registry_snapshot(
@@ -192,6 +201,15 @@ impl Frontend {
         self.inner
             .with_port(|port| port.registry_snapshot(entries, count))
             .unwrap_or(crate::DATAROUTER_ERR_INTERNAL)
+    }
+
+    /// Current switch capacity: `(max_ports, active_ports)`. `max_ports` is
+    /// the number of slots the running switch allocated; it grows via
+    /// `switch_frontend::SwitchHandle::expand_capacity`.
+    pub fn capacity(&self) -> Result<(u32, u32), c_int> {
+        self.inner
+            .with_port(|port| port.capacity())
+            .unwrap_or(Err(crate::DATAROUTER_ERR_INTERNAL))
     }
 
     pub fn registry_diagnostic(&self, capacity: usize) -> RegistryDiagnostic {
@@ -299,6 +317,9 @@ impl Frontend {
         self.inner
             .ack_waiters
             .close_all(crate::DATAROUTER_ERR_INTERNAL);
+        if let Ok(mut pool) = self.inner.buffer_pool.lock() {
+            pool.clear();
+        }
     }
 
     pub fn is_closing(&self) -> bool {
@@ -365,6 +386,27 @@ pub enum RecvPackedError {
 }
 
 impl FrontendInner {
+    /// Take a receive buffer from the pool (or a fresh empty Vec).
+    pub fn take_buffer(&self) -> Vec<u8> {
+        self.buffer_pool
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.pop_front())
+            .unwrap_or_default()
+    }
+
+    /// Return a drained receive buffer to the pool (bounded to keep pooled
+    /// memory at a few channel-sized buffers).
+    pub fn recycle_buffer(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        let limit = self.options.app_queue_capacity.min(16).max(1);
+        if let Ok(mut pool) = self.buffer_pool.lock()
+            && pool.len() < limit
+        {
+            pool.push_back(buffer);
+        }
+    }
+
     pub fn with_port<R>(
         &self,
         f: impl FnOnce(&port_frontend::PortFrontend) -> R,
@@ -562,7 +604,9 @@ pub(crate) fn unix_time_ns() -> u64 {
         .unwrap_or(0)
 }
 
-fn c_source_to_string(source: &[c_char; crate::DATAROUTER_SERVICE_NAME_MAX + 1]) -> String {
+pub(crate) fn c_source_to_string(
+    source: &[c_char; crate::DATAROUTER_SERVICE_NAME_MAX + 1],
+) -> String {
     let bytes: Vec<u8> = source
         .iter()
         .take_while(|value| **value != 0)

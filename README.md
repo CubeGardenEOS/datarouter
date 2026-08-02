@@ -42,6 +42,24 @@ Linux 后端通过 `shm_open`、`ftruncate`、`fchmod` 和 `mmap` 使用 POSIX s
 
 ## IPC Benchmark
 
+### Rust Frontend 全链路（改造后 vs 基线）
+
+`benches/ipc_frontend.rs` 走完整 Rust Frontend（reader 线程 + 队列 + switch 路由），对比同一台机器上旧实现（reader 解包→重新打包、`MAX_APP_PAYLOAD=60KiB`）与本实现（原始字节入队、512KiB 单帧、4 次拷贝）。单程吞吐（portal→core，`recv_packed`）：
+
+| payload | 旧实现 | 新实现 | 提升 |
+|---|---|---|---|
+| 1KiB | 2.17µs/帧，460k msg/s，449 MiB/s | 1.36µs/帧，733k msg/s，716 MiB/s | 1.6× |
+| 32KiB | 11.7µs/帧，85k msg/s，2.6 GiB/s | 3.57µs/帧，280k msg/s，8.6 GiB/s | 3.3× |
+| 64KiB | 166.8µs/帧（2 片+ACK），6.0k msg/s | 9.02µs/帧（单帧），111k msg/s | 18× |
+| 300KiB | 552.9µs/帧（5 片串行 ACK），1.8k msg/s | 135.7µs/帧（单帧），7.4k msg/s | 4× |
+
+pingpong 300KiB 往返 p50 从 `1152µs` 降到 `345µs`（3.3×）。64B/1KiB 往返 p50 基本持平（`55µs`/`72µs`）。拷贝预算从 7 次降到 4 次（`recv_packed` 全程不再 unpack/repack）。
+
+```bash
+DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head -1) \
+  cargo bench --bench ipc_frontend
+```
+
 ### 默认基准
 
 默认 `build/main.py datarouter bench` 使用主构建产物；所有构建的 channel size 均为 `512KiB`：
@@ -263,7 +281,36 @@ let options = blinkcms_datarouter::frontend::FrontendOptions {
 };
 ```
 
-Cargo 包只暴露应用侧 Port ABI。需要创建 shared memory 并路由帧的进程仍要用 Makefile 构建并运行 `datarouter-switch`。
+`build.rs` 会把 `datarouter-switch` 编译进 Cargo target 目录并**用 `include_bytes!` 把它的字节嵌入到使用方可执行文件里**：`SwitchHandle::start` 在运行时从内存直接派生子进程（Linux 上用匿名 `memfd` 执行，`/proc/<pid>/exe` 显示为 `/memfd:datarouter-switch`；其他平台回退到瞬时 0700 临时文件，进程起来后立即 unlink）。因此导入方**不需要脚本、配置文件，也不依赖 `build/` 或任何目录下的资源文件**：
+
+```rust
+use blinkcms_datarouter::switch_frontend::{SwitchConfig, SwitchHandle};
+
+// 生命周期：启动 / 探活 / 优雅停止 / 重启。switch 作为子进程随应用启动。
+let mut switch = SwitchHandle::start(SwitchConfig {
+    shm_name: "/my-app".to_owned(),
+    allow: vec!["core".to_owned(), "portal".to_owned()],
+    max_ports: 8,                     // 初始可注册进程数（1..=64）
+    token: Some("secret".to_owned()), // 简单鉴权（仅存 FNV-1a 指纹）
+    ..SwitchConfig::default()
+})?;
+
+// 动态扩容：满时优雅重启 switch，扩大可注册进程数；既有 Frontend 自动重连。
+switch.expand_capacity(32)?;
+
+// 鉴权自检：无 token 打开必须被拒（ERR_PERMISSION），带 token 必须成功。
+switch.verify_auth()?;
+
+// 客户端侧携带同一 token：
+let core = blinkcms_datarouter::frontend::Frontend::connect(FrontendOptions {
+    shm_name: "/my-app".to_owned(),
+    service_name: "core".to_owned(),
+    auth_token: Some("secret".to_owned()),
+    ..Default::default()
+})?;
+```
+
+`SwitchHandle` 管理 switch 生命周期并支持动态扩容：`snapshot()` 读取当前 `max_ports`/活跃数/已注册服务；`expand_capacity(n)` 用更大的 `--max-ports` 优雅重启（既有 frontend 通过既有的 NOT_FOUND 自愈路径自动重注册）；`ensure_capacity(n)` 仅在不足时扩容。`--token` 启用简单鉴权：控制面只保存 token 的 FNV-1a 指纹，`datarouter_open` 校验客户端 token，缺失或错误返回 `DATAROUTER_ERR_PERMISSION`。
 
 原生构建要求：
 
@@ -440,7 +487,18 @@ Switch 只读取 8 字节帧头，然后转发 payload 字节，不检查业务�
 - **启动顺序**：datarouter 模式下，必须先启动 `datarouter-switch`，再启动 Core、Edge Node 或 Python worker。否则 `datarouter_open` 返回 `ERR_PLATFORM`。
 - **权限与信任边界**：生产默认必须使用 `0600`，switch 与客户端由同一运行 UID 启动。更宽的 `--mode` 会输出醒目告警，只应用于受控调试。本加固边界把同一 UID 下的进程视为可信，不宣称能阻止同 UID 恶意进程直接改写 shared memory。
 
-Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024`、总重组内存为 `128MiB`，并按 `chunk_ttl_ms`（默认 30 秒）回收不完整消息。分块 ACK 会绑定预期来源；最后一块只有在完整消息成功进入应用队列后才确认。`MAX_APP_PAYLOAD` 保持 `60KiB`，因此大消息仍按小帧分块，而不是使用整条 512KiB ring 作为单帧。
+Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024`、总重组内存为 `128MiB`，并按 `chunk_ttl_ms`（默认 30 秒）回收不完整消息。分块 ACK 会绑定预期来源；最后一块只有在完整消息成功进入应用队列后才确认。**`MAX_APP_PAYLOAD` 已正式采用整条 `512KiB` ring**（约 `512KiB - 16B`），旧的 `60KiB` 上限被禁用：≤512KiB 的消息直接作为单帧传输，只有更大消息才进入分块+逐片 ACK 路径。
+
+### 拷贝预算（全链路 4 次）
+
+接收热路径不再解包/重新打包：reader 线程把 C 侧 `datarouter_recv` 写出的 ring 字节原样移交应用队列（零额外拷贝），分块/控制帧才走完整协议路径。全链路（发送应用 → 接收应用）固定为 4 次 payload 拷贝：
+
+1. 发送端 packed 字节 → TX ring；
+2. switch 把帧从 TX ring 搬到目标 RX ring；
+3. RX ring → 接收端 reader 的缓冲（唯一接收侧拷贝）；
+4. 队列中的原始字节 → 接收应用（`recv` 解包或 `recv_packed` 复制）。
+
+`recv_packed` 全程不再经过 Rust `Message` 往返；reader 使用可回收缓冲池，稳态接收不产生每帧分配。
 
 ## Port 行为
 
@@ -454,7 +512,7 @@ Port 库是应用面对的 ABI。它打开 switch-owned shared memory，调用 `
 
 ### 布局升级
 
-当前 shared-memory layout 9、8 字节帧头、26 位 route generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和 switch，替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，再整体启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；旧 frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
+当前 shared-memory layout 10（控制面新增 `auth_fingerprint`）、8 字节帧头、26 位 route generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和 switch，替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，再整体启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；旧 frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
 
 ### 启动顺序
 
@@ -468,6 +526,10 @@ datarouter 模式下，**必须先启动 `datarouter-switch`**，再启动 Core�
 
 # 本地调试如 root 启动 switch、普通用户启动 portal：
 # ./build/datarouter-switch --mode 0666 --config /path/to/switch.ini &
+
+# 动态容量与简单鉴权（可选）：
+# ./build/datarouter-switch --name /my-app --max-ports 32 --token secret \
+#     --allow core,portal,storage &
 
 # 2. 再启动 Core
 cd core && go run . &

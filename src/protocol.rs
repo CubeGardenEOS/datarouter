@@ -101,8 +101,9 @@ pub const TAG_ACTOR_UUID: u8 = 0x15;
 /// Trace identifier string (distributed tracing correlation).
 pub const TAG_TRACE_ID: u8 = 0x16;
 
-/// Maximum application payload size (60KB).
-pub const MAX_APP_PAYLOAD: usize = 60 * 1024;
+/// Maximum application payload size. The full 512 KiB ring is usable as one
+/// single frame; the legacy 60 KiB cap is disabled.
+pub const MAX_APP_PAYLOAD: usize = crate::DATAROUTER_MAX_APP_PAYLOAD;
 /// Header size in bytes.
 pub const HEADER_SIZE: usize = 8;
 
@@ -1083,17 +1084,60 @@ pub fn ack_key(msg: &Message) -> Option<String> {
     Some(format!("{chunk_id}:{chunk_index}"))
 }
 
-fn chunk_control_fields(msg: &Message) -> Option<(u64, u16)> {
-    validate_tlvs(&msg.var_data).ok()?;
+// ── Borrowed Raw-Frame Helpers ───────────────────────────────────────────
+//
+// The receive hot path classifies and queues raw wire frames without
+// allocating `Message` (and without the old unpack->repack round trip). These
+// helpers borrow the frame bytes; only chunked frames pay the unpack cost.
+
+/// Borrowed wire header: `(message_type, flags, var_data_len, body_len)`.
+/// Returns `None` when the frame is shorter than the header or its declared
+/// lengths do not match the buffer exactly (same rules as [`unpack`]).
+pub fn raw_frame_layout(data: &[u8]) -> Option<(u8, u8, usize, usize)> {
+    if data.len() < HEADER_SIZE {
+        return None;
+    }
+    let vd_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+    let b_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let expected_len = HEADER_SIZE
+        .checked_add(vd_len)
+        .and_then(|len| len.checked_add(b_len))?;
+    if data.len() != expected_len {
+        return None;
+    }
+    Some((data[0], data[1], vd_len, b_len))
+}
+
+/// True when the var_data block is well-formed and carries no chunk
+/// metadata TLV at all. Such a frame is a complete single-frame message and
+/// can be queued verbatim (zero-copy) instead of being unpacked/repacked.
+pub fn raw_is_single_frame(var_data: &[u8]) -> bool {
+    if validate_tlvs(var_data).is_err() {
+        return false;
+    }
+    let mut offset = 0usize;
+    while offset < var_data.len() {
+        let tag = var_data[offset];
+        let len = u16::from_le_bytes([var_data[offset + 1], var_data[offset + 2]]) as usize;
+        if matches!(tag, TAG_CHUNK_ID | TAG_CHUNK_INDEX | TAG_CHUNK_COUNT) {
+            return false;
+        }
+        offset = offset + 3 + len;
+    }
+    true
+}
+
+fn chunk_control_fields_from_var_data(var_data: &[u8]) -> Option<(u64, u16)> {
+    validate_tlvs(var_data).ok()?;
     let mut id = None;
     let mut index = None;
     let mut offset = 0usize;
-    while offset < msg.var_data.len() {
-        let tag = msg.var_data[offset];
-        let len = u16::from_le_bytes([msg.var_data[offset + 1], msg.var_data[offset + 2]]) as usize;
+    while offset < var_data.len() {
+        let tag = var_data[offset];
+        let len = u16::from_le_bytes([var_data[offset + 1], var_data[offset + 2]]) as usize;
         let value_start = offset + 3;
         let value_end = value_start + len;
-        let value = &msg.var_data[value_start..value_end];
+        let value = &var_data[value_start..value_end];
         match tag {
             TAG_CHUNK_ID if id.is_none() && value.len() == 8 => {
                 id = Some(u64::from_le_bytes(value.try_into().ok()?));
@@ -1107,6 +1151,10 @@ fn chunk_control_fields(msg: &Message) -> Option<(u64, u16)> {
         offset = value_end;
     }
     Some((id?, index?))
+}
+
+fn chunk_control_fields(msg: &Message) -> Option<(u64, u16)> {
+    chunk_control_fields_from_var_data(&msg.var_data)
 }
 
 fn chunk_control_message(message_type: u8, chunk_id: u64, chunk_index: u16) -> Message {
