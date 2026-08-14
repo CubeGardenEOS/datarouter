@@ -9,37 +9,47 @@ switch 仅保留控制面（注册/注销/TTL/死进程回收）与控制请求�
    `rx_signal[target]`）；
 2. RX ring → 接收端应用 buffer（直接 `datarouter_recv`，无 reader 线程、无队列）。
 
-对比对象：同一台机器、同一 benchmark 结构（`benches/ipc_frontend.rs` 正常路径 vs
-`benches/ipc_unsafe.rs` unsafe 路径）、默认 512KiB ring、同一 switch 二进制。
+## 测试结果（本机，两种配置）
 
-## 单程吞吐（portal → core）
+| 配置 | 单元测试 | unsafe 集成测试 |
+|---|---|---|
+| `cargo test`（无 unsafe） | 68 通过 | 0（feature 关闭，cfg 排除） |
+| `cargo test --features unsafe` | 68 通过 | 4 通过（往返/混合模式/ERR_FULL/NOT_FOUND） |
 
-| payload | 正常路径（4 次拷贝） | unsafe（2 次拷贝） | 提升 |
+## 跑分结果（中位数，各 3 次）
+
+机器：AMD Ryzen 5 3600（12 线程），默认 512KiB ring，同一 switch 二进制。
+测量时机器有后台负载（Gradle daemon ~57% CPU + 两个 pi 进程），正常路径抖动
+±30–60%；unsafe 路径三次跑分稳定（抖动 <10%）。下表取 3 次中位数。
+
+### 单程吞吐（portal → core）
+
+| payload | 无 unsafe 正常路径（4 拷贝） | 有 unsafe（2 拷贝） | 提升 |
 |---|---|---|---|
-| 1KiB   | 1.454µs/帧，687k msg/s，671 MiB/s   | 1.758µs/帧，569k msg/s，555 MiB/s   | 0.83×（持平） |
-| 32KiB  | 5.155µs/帧，194k msg/s，6.1 GiB/s   | 3.197µs/帧，313k msg/s，9.8 GiB/s   | 1.6× |
-| 64KiB  | 12.97µs/帧，77k msg/s，4.8 GiB/s    | 4.513µs/帧，222k msg/s，13.8 GiB/s  | 2.9× |
-| 300KiB | 145.8µs/帧，6.9k msg/s，2.0 GiB/s   | 15.85µs/帧，63k msg/s，18.5 GiB/s   | 9.2× |
+| 1KiB   | 1.90µs/帧，525k msg/s，513 MiB/s    | 1.72µs/帧，583k msg/s，569 MiB/s   | ≈持平（±10% 噪声内） |
+| 32KiB  | 4.60µs/帧，218k msg/s，6.6 GiB/s   | 3.04µs/帧，329k msg/s，10.1 GiB/s  | 1.5× |
+| 64KiB  | 11.9µs/帧，84k msg/s，5.1 GiB/s    | 4.36µs/帧，229k msg/s，14.0 GiB/s  | 2.7× |
+| 300KiB | 155.6µs/帧，6.4k msg/s，1.8 GiB/s  | 15.7µs/帧，64k msg/s，18.2 GiB/s   | 9.9× |
 
-## pingpong 往返（portal → core → portal）
+### pingpong 往返（portal → core → portal）
 
-| payload | 正常路径 p50 | unsafe p50 | 提升 |
+| payload | 无 unsafe 正常路径 p50 | 有 unsafe p50 | 提升 |
 |---|---|---|---|
-| 64B    | 28.2µs  | 3.10µs  | 9.1× |
-| 1KiB   | 71.3µs  | 3.25µs  | 22×  |
-| 300KiB | 347µs   | 29.6µs  | 11.7× |
+| 64B    | 30.0µs | 3.06µs | 9.8× |
+| 1KiB   | 63.2µs | 3.18µs | 19.9× |
+| 300KiB | 318.7µs | 29.5µs | 10.8× |
 
-64B/1KiB 往返 p50 ≈ 3.1–3.2µs，接近共享内存读写 + 两次 memcpy 的物理下限；
-300KiB 单程吞吐达 18.5 GiB/s，受限于是 memcpy 带宽（2 次 300KiB 拷贝）。
+unsafe 路径 64B/1KiB 往返 p50 ≈ 3.1µs，接近共享内存读写 + 两次 memcpy 的物理
+下限；300KiB 单程吞吐 18.2 GiB/s，受限于是 memcpy 带宽（2 次 300KiB 拷贝）。
 
 ## 1KiB 单程为什么持平
 
 `benches/ipc_unsafe.rs` 与正常 bench 一样是单线程交替 send/recv。正常路径靠 core
 的 reader 线程后台把帧预取进队列，`recv_packed` 直接弹出，pipeline 更深；unsafe
 路径没有 reader/队列，`unsafe_recv` 每帧直接读 ring，发送与接收在同一线程内串行。
-小帧时系统调用与原子操作开销占比高，二者相当。大帧（≥32KiB）memcpy 占主导，
-unsafe 少 2 次拷贝的优势完全体现。应用若需要小帧高吞吐，可自行起接收线程把
-`unsafe_recv` 挪到后台（数据面仍是 2 次拷贝）。
+小帧时系统调用与原子操作开销占比高，二者相当（本次中位数 unsafe 略快，在噪声
+范围内）。大帧（≥32KiB）memcpy 占主导，unsafe 少 2 次拷贝的优势完全体现。应用
+若需要小帧高吞吐，可自行起接收线程把 `unsafe_recv` 挪到后台（数据面仍是 2 次拷贝）。
 
 ## 约束（开发中特性）
 
@@ -53,10 +63,11 @@ unsafe 少 2 次拷贝的优势完全体现。应用若需要小帧高吞吐，�
 ## 复现
 
 ```bash
-# 正常路径基线
-DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head -1) \
-  cargo bench --bench ipc_frontend --features unsafe
-# unsafe 直接数据面
-DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head -1) \
-  cargo bench --bench ipc_unsafe --features unsafe
+# 无 unsafe 正常路径基线（默认 feature）
+cargo bench --bench ipc_frontend
+# 有 unsafe 直接数据面
+cargo bench --bench ipc_unsafe --features unsafe
+# 测试
+cargo test
+cargo test --features unsafe
 ```

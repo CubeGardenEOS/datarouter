@@ -46,3 +46,19 @@ DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head
 
 机器噪声说明：本机曾残留多个空转 switch 进程（各 ~17% CPU），清理后
 各 payload 的帧耗时仍有 ±30% 抖动；上表取清理后的单次干净运行。
+
+## unsafe 直接数据面对比（2026-08 复测）
+
+同机、3 次中位数（后台有 Gradle daemon 噪声，正常路径抖动 ±30–60%），
+unsafe 路径把拷贝从 4 次降到 2 次、绕过 switch 路由，详见
+`docs/benchmark-unsafe-2026-08.md`：
+
+| 场景 | 无 unsafe | 有 unsafe | 提升 |
+|---|---|---|---|
+| pingpong 64B p50   | 30.0µs   | 3.06µs   | 9.8× |
+| pingpong 1KiB p50  | 63.2µs   | 3.18µs   | 19.9× |
+| pingpong 300KiB p50 | 318.7µs | 29.5µs   | 10.8× |
+| 单程 32KiB 吞吐     | 6.6 GiB/s | 10.1 GiB/s | 1.5× |
+| 单程 64KiB 吞吐     | 5.1 GiB/s | 14.0 GiB/s | 2.7× |
+| 单程 300KiB 吞吐    | 1.8 GiB/s | 18.2 GiB/s | 9.9× |
+| 单程 1KiB 吞吐      | 513 MiB/s | 569 MiB/s | 持平（±10%） |

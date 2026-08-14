@@ -529,10 +529,11 @@ let info = core.unsafe_recv(&mut buf, 1000)?;   // 直接读自己的 RX ring
 ```
 
 限制（开发中）：同一目标 ring 只允许一个逻辑写者；目标 ring 满返回 `ERR_FULL`（无 switch
-阻塞重排协议）；单帧 ≤ `MAX_APP_PAYLOAD`，无分块/ACK。基准见
-`docs/benchmark-unsafe-2026-08.md`：pingpong 64B/1KiB 往返 p50 ≈ 3.1µs（约 10–22×），
-300KiB 单程吞吐 18.5 GiB/s（约 9×）；小帧单程吞吐因 bench 单线程交替 send/recv、
-unsafe 路径无 reader 预取而与正常路径持平。
+阻塞重排协议）；单帧 ≤ `MAX_APP_PAYLOAD`，无分块/ACK。本机基准（3 次中位数，Ryzen 5
+3600，后台有 Gradle daemon 噪声）：pingpong 64B/1KiB 往返 p50 ≈ 3.1µs（约 10–20×），
+300KiB 单程吞吐 17.8 GiB/s（约 9.9×），32KiB/64KiB 单程 1.5–2.7×；小帧单程因 bench
+单线程交替 send/recv、unsafe 路径无 reader 预取而与正常路径持平（±10% 噪声内）。
+详见 `docs/benchmark-unsafe-2026-08.md`。
 
 ## Port 行为
 
