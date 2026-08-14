@@ -103,6 +103,18 @@ int datarouter_send(
     const void *data,
     size_t len
 );
+#ifdef DATAROUTER_UNSAFE
+/* 开发中特性：直接数据面。把帧直接写进目标 RX ring，绕过 switch 路由；
+ * switch 仅保留控制面。配合正常 datarouter_recv/wait 使用，全链路 2 次拷贝。
+ * 限制：同一目标 ring 只允许一个逻辑写者（与 switch 单写者一致）；
+ * 目标 ring 满时返回 DATAROUTER_ERR_FULL（无 switch 阻塞队列协议）。 */
+int datarouter_unsafe_send(
+    datarouter_port *port,
+    const char *target_service,
+    const void *data,
+    size_t len
+);
+#endif /* DATAROUTER_UNSAFE */
 int datarouter_recv(
     datarouter_port *port,
     void *buffer,

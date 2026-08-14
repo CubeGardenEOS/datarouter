@@ -793,6 +793,115 @@ out:
     return rc;
 }
 
+#ifdef DATAROUTER_UNSAFE
+
+/* Direct (unsafe) data plane: bypass the switch for payload movement.
+ *
+ * The sender resolves the target from the shared-memory registry, pins the
+ * target slot (blocking release/reuse while the write is in flight), tracks
+ * the inflight counter exactly like the switch's router would, then appends
+ * the frame header + payload straight into the target's RX ring and posts the
+ * target's rx_signal directly. The switch never touches the payload bytes; it
+ * only keeps control-plane duties (register/unregister, TTL/dead-process
+ * reaping) and remains the control-request interrupt target.
+ *
+ * The frame format is identical to the switch-routed path, so a receiver may
+ * use either the normal `datarouter_recv`/`datarouter_wait` or the direct
+ * Frontend API; both complete the inflight counter the same way.
+ *
+ * Constraints (dev feature):
+ *  - one logical writer per target RX ring (the switch's router is also a
+ *    single writer per ring); concurrent direct writers to the same target
+ *    from different processes are not serialized,
+ *  - a full target RX ring returns DATAROUTER_ERR_FULL (no switch blocked
+ *    queue/requeue protocol in the direct path),
+ *  - the target is re-validated against the registry while pinned, so slot
+ *    release/reuse cannot race the write; a mid-write unregister may still
+ *    drop the frame when the slot is finalized.
+ */
+int datarouter_unsafe_send(
+    datarouter_port *port,
+    const char *target_service,
+    const void *data,
+    size_t len
+) {
+    if (!port || !port->shm || port->slot_index >= datarouter_active_max_ports(port->shm) ||
+        !datarouter_valid_service_name(target_service) || (!data && len > 0U)) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    if (len > UINT32_MAX ||
+        len > DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE) {
+        return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
+    }
+    int lock_rc = port_tx_mutex_lock(port);
+    if (lock_rc != DATAROUTER_OK) {
+        return lock_rc;
+    }
+    int rc = DATAROUTER_OK;
+    datarouter_registry_entry *self = pin_self_entry(port);
+    if (!self) {
+        rc = DATAROUTER_ERR_NOT_FOUND;
+        goto out;
+    }
+    datarouter_registry_metadata target;
+    if (!datarouter_registry_find_active_metadata_by_name(
+            port->shm,
+            target_service,
+            &target
+        )) {
+        rc = DATAROUTER_ERR_NOT_FOUND;
+        goto out;
+    }
+    uint32_t target_slot = target.slot_index;
+    if (target_slot >= datarouter_active_max_ports(port->shm)) {
+        rc = DATAROUTER_ERR_NOT_FOUND;
+        goto out;
+    }
+    datarouter_registry_entry *target_entry = &port->shm->control.registry[target_slot];
+    /* Write pin: seq_cst io_users handshake blocks finalize_release (and
+     * therefore slot reuse by a new registration) until the write completes.
+     * Re-verify the pinned entry is still the same active registration. */
+    atomic_fetch_add_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+    datarouter_registry_metadata recheck;
+    if (!datarouter_registry_read_active(target_entry, &recheck) ||
+        recheck.route_id != target.route_id || recheck.slot_index != target_slot) {
+        atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+        rc = DATAROUTER_ERR_NOT_FOUND;
+        goto out;
+    }
+    datarouter_channel *rx = datarouter_rx_channel(port->shm, target_slot);
+    if (!rx) {
+        atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+        rc = DATAROUTER_ERR_INTERNAL;
+        goto out;
+    }
+    uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
+    encode_frame_header(header, port->route_id, len);
+    /* Account for the frame before publishing the RX head, mirroring the
+     * switch's router; the receiver decrements on read. */
+    datarouter_registry_track_inflight(port->shm, port->slot_index, target_slot);
+    rc = datarouter_ring_write_parts(rx, header, sizeof(header), (const uint8_t *)data, len);
+    if (rc != DATAROUTER_OK) {
+        /* Nothing was published; undo the inflight increment. */
+        datarouter_registry_complete_inflight(port->shm, port->route_id, target_slot);
+        atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+        if (rc == DATAROUTER_ERR_PROTOCOL) {
+            report_corrupt_self(port);
+        }
+        goto out;
+    }
+    atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+    datarouter_signal_post(&port->shm->control.rx_signal[target_slot]);
+    datarouter_touch_entry(self, datarouter_now_ns());
+
+out:
+    datarouter_registry_unpin(self);
+    port_tx_mutex_unlock(port);
+    return rc;
+}
+
+#endif /* DATAROUTER_UNSAFE */
+
 int datarouter_recv(
     datarouter_port *port,
     void *buffer,

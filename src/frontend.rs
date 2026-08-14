@@ -3,6 +3,12 @@
 //! `Frontend` is the only application transport boundary. It owns the raw port
 //! read loop and keeps chunking, ACKs, reassembly, queueing, backpressure, and
 //! registry access inside Rust.
+//!
+//! With the `unsafe` Cargo feature (dev-only, off by default),
+//! [`Frontend::connect_unsafe`] skips the reader thread and queue: data moves
+//! with [`Frontend::unsafe_send`]/[`Frontend::unsafe_recv`] directly against
+//! the target RX ring (2 copies per direction), bypassing the switch's data
+//! plane.
 
 pub mod ffi;
 pub mod inbound;
@@ -17,7 +23,7 @@ use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-#[cfg(debug_assertions)]
+#[cfg(any(feature = "unsafe", debug_assertions))]
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -136,6 +142,46 @@ impl Frontend {
         })
     }
 
+    /// Connect in direct (unsafe) data-plane mode (development feature, off
+    /// by default). The port logs on through the switch's control plane as
+    /// usual, but **no reader thread is spawned** and the data path uses
+    /// [`unsafe_send`](Self::unsafe_send)/[`unsafe_recv`](Self::unsafe_recv):
+    /// the sender writes straight into the target's RX ring, so the switch
+    /// never touches payload bytes and the full chain costs two copies
+    /// (app -> target RX ring, RX ring -> app buffer). The switch keeps only
+    /// control-plane duties (register/unregister, TTL/dead reaping) plus
+    /// control-request interrupts.
+    ///
+    /// The keepalive thread still runs so the registration survives TTL.
+    /// [`recv`](Self::recv)/[`recv_packed`](Self::recv_packed) are unusable
+    /// here (no queue); use the direct methods below.
+    #[cfg(feature = "unsafe")]
+    pub fn connect_unsafe(options: FrontendOptions) -> Result<Self, c_int> {
+        let options = options.normalized()?;
+        let port = port_frontend::PortFrontend::open(&options)?;
+        let keepalive_interval = keepalive_interval(port.ttl_ms());
+        let inner = Arc::new(FrontendInner {
+            complete_queue: queue::BoundedQueue::new(options.app_queue_capacity),
+            ack_waiters: outbound::AckWaiters::new(options.max_pending_acks),
+            buffer_pool: Mutex::new(std::collections::VecDeque::new()),
+            closing: AtomicBool::new(false),
+            stats: FrontendStats::default(),
+            port: RwLock::new(Some(port)),
+            keepalive_interval,
+            keepalive_wait: Condvar::new(),
+            keepalive_wait_state: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            ipc_timings: Mutex::new(HashMap::new()),
+            options,
+        });
+        let keepalive = spawn_keepalive(Arc::clone(&inner));
+        Ok(Self {
+            inner,
+            reader: Mutex::new(None),
+            keepalive: Mutex::new(Some(keepalive)),
+        })
+    }
+
     pub fn send(&self, target_service: &str, packed: &[u8], timeout_ms: u32) -> Result<(), c_int> {
         #[cfg(debug_assertions)]
         let tracked_request_id = self.track_ipc_request_timing(target_service, packed);
@@ -148,6 +194,81 @@ impl Frontend {
             timings.remove(&request_id);
         }
         result
+    }
+
+    /// Direct (unsafe) send: append `data` straight into the target's RX
+    /// ring, bypassing the switch's routing loop. No chunking/ACK and no
+    /// blocked-queue protocol on this path, so `data` must be a single frame
+    /// (≤ `DATAROUTER_MAX_APP_PAYLOAD`); a full target ring returns
+    /// `DATAROUTER_ERR_FULL`. On a stale self slot the port is re-registered
+    /// and the send retried, matching the normal path.
+    #[cfg(feature = "unsafe")]
+    pub fn unsafe_send(&self, target_service: &str, data: &[u8]) -> Result<(), c_int> {
+        if data.is_empty() {
+            return Err(crate::DATAROUTER_ERR_INVALID_ARGUMENT);
+        }
+        if data.len() > self.inner.options.max_message_bytes {
+            return Err(crate::DATAROUTER_ERR_PAYLOAD_TOO_LARGE);
+        }
+        let result = self.inner.unsafe_send_frame(target_service, data);
+        if result.is_ok() {
+            self.inner.stats.sent_frames.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Direct (unsafe) receive: block until a frame arrives, then read it
+    /// straight out of our RX ring into `out_buf` (single ring -> buffer
+    /// copy; no reader thread, no queue). The frame bytes land in `out_buf`
+    /// and the returned info carries `source` + `len`. `Ok(None)` when the
+    /// timeout elapses without a frame.
+    #[cfg(feature = "unsafe")]
+    pub fn unsafe_recv(
+        &self,
+        out_buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<Option<crate::datarouter_message_info>, c_int> {
+        let timeout_ms =
+            options::normalize_timeout(timeout_ms, self.inner.options.recv_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            if let Ok(Some(info)) = self.inner.with_port(|port| port.unsafe_recv(out_buf))? {
+                self.inner.stats.received_frames.fetch_add(1, Ordering::Relaxed);
+                self.inner.stats.received_complete.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(info));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let wait_ms = u32::try_from(remaining.as_millis())
+                .unwrap_or(u32::MAX)
+                .max(1);
+            match self.inner.with_port(|port| port.wait(wait_ms))? {
+                crate::DATAROUTER_OK => {}
+                crate::DATAROUTER_ERR_TIMEOUT | crate::DATAROUTER_ERR_AGAIN => {
+                    return Ok(None);
+                }
+                crate::DATAROUTER_ERR_NOT_FOUND => {
+                    if !self.inner.recover_self_after_not_found("unsafe recv wait") {
+                        return Err(crate::DATAROUTER_ERR_NOT_FOUND);
+                    }
+                }
+                code => return Err(code),
+            }
+        }
+    }
+
+    /// Direct (unsafe) poll: `Ok(true)` when our RX ring holds a complete
+    /// frame, `Ok(false)` when it is empty.
+    #[cfg(feature = "unsafe")]
+    pub fn unsafe_poll(&self) -> Result<bool, c_int> {
+        match self.inner.with_port(|port| port.poll())? {
+            crate::DATAROUTER_OK => Ok(true),
+            crate::DATAROUTER_ERR_AGAIN | crate::DATAROUTER_ERR_TIMEOUT => Ok(false),
+            crate::DATAROUTER_ERR_NOT_FOUND => Err(crate::DATAROUTER_ERR_NOT_FOUND),
+            code => Err(code),
+        }
     }
 
     pub fn recv(&self, timeout_ms: u32) -> Result<FrontendMessage, c_int> {
@@ -435,6 +556,58 @@ impl FrontendInner {
         packed: &[u8],
     ) -> Result<(), c_int> {
         self.with_port(|port| port.send_to_c_source(source, packed))?
+    }
+
+    /// Direct (unsafe) data-plane send with the same stale-port recovery as
+    /// the normal path: a NOT_FOUND whose self registration is gone triggers
+    /// a re-register + retry, while a missing target stays NOT_FOUND.
+    #[cfg(feature = "unsafe")]
+    pub fn unsafe_send_frame(&self, target_service: &str, data: &[u8]) -> Result<(), c_int> {
+        match self.with_port(|port| port.unsafe_send(target_service, data))? {
+            Ok(()) => Ok(()),
+            Err(crate::DATAROUTER_ERR_NOT_FOUND) => {
+                self.unsafe_recover_not_found_and_retry(target_service, data)
+            }
+            Err(code) => Err(code),
+        }
+    }
+
+    #[cfg(feature = "unsafe")]
+    fn unsafe_recover_not_found_and_retry(
+        &self,
+        target_service: &str,
+        data: &[u8],
+    ) -> Result<(), c_int> {
+        let mut guard = self
+            .port
+            .write()
+            .map_err(|_| crate::DATAROUTER_ERR_INTERNAL)?;
+        let recovery = {
+            let port = guard.as_ref().ok_or(crate::DATAROUTER_ERR_INTERNAL)?;
+            match port.touch() {
+                Err(crate::DATAROUTER_ERR_NOT_FOUND) => NotFoundRecovery::ReconnectSelf,
+                Err(code) => return Err(code),
+                Ok(()) => not_found_recovery(port, &self.options.service_name, target_service)?,
+            }
+        };
+        match recovery {
+            NotFoundRecovery::ReconnectSelf => {
+                let replacement = port_frontend::PortFrontend::open(&self.options)?;
+                let result = replacement.unsafe_send(target_service, data);
+                let previous = guard.replace(replacement);
+                drop(previous);
+                self.stats
+                    .registration_recoveries
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.switch_recoveries.fetch_add(1, Ordering::Relaxed);
+                result
+            }
+            NotFoundRecovery::TargetMissing => Err(crate::DATAROUTER_ERR_NOT_FOUND),
+            NotFoundRecovery::RetryCurrentPort => guard
+                .as_ref()
+                .ok_or(crate::DATAROUTER_ERR_INTERNAL)?
+                .unsafe_send(target_service, data),
+        }
     }
 
     pub fn touch(&self) -> Result<(), c_int> {

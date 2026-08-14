@@ -92,6 +92,10 @@ impl PortFrontend {
         unsafe { crate::datarouter_wait(self.port, timeout_ms) }
     }
 
+    pub fn poll(&self) -> c_int {
+        unsafe { crate::datarouter_poll(self.port) }
+    }
+
     pub fn touch(&self) -> Result<(), c_int> {
         status_to_result(unsafe { crate::datarouter_touch(self.port) })
     }
@@ -201,6 +205,55 @@ impl PortFrontend {
                     data: std::mem::take(buf),
                 }))
             }
+            crate::DATAROUTER_OK => Err(crate::DATAROUTER_ERR_PROTOCOL),
+            crate::DATAROUTER_ERR_AGAIN | crate::DATAROUTER_ERR_TIMEOUT => Ok(None),
+            code => Err(code),
+        }
+    }
+
+    /// Direct (unsafe) send: append the frame straight into the target's RX
+    /// ring, bypassing the switch's routing loop (the switch only keeps
+    /// control-plane duties). See `datarouter_unsafe_send` for the dev-mode
+    /// constraints: one logical writer per target ring, `ERR_FULL` instead of
+    /// the switch blocked-queue protocol, single-frame payloads only.
+    #[cfg(feature = "unsafe")]
+    pub fn unsafe_send(&self, target_service: &str, data: &[u8]) -> Result<(), c_int> {
+        let target =
+            CString::new(target_service).map_err(|_| crate::DATAROUTER_ERR_INVALID_ARGUMENT)?;
+        status_to_result(unsafe {
+            crate::datarouter_unsafe_send(
+                self.port,
+                target.as_ptr(),
+                data.as_ptr().cast::<c_void>(),
+                data.len(),
+            )
+        })
+    }
+
+    /// Direct (unsafe) receive: read one frame straight out of our RX ring
+    /// into the caller buffer (single ring -> buffer copy; no reader thread,
+    /// no queue). `Ok(None)` when the ring is empty. The frame format is
+    /// identical to switch-routed frames, so this works against normal
+    /// senders too (mixed mode).
+    #[cfg(feature = "unsafe")]
+    pub fn unsafe_recv(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<Option<crate::datarouter_message_info>, c_int> {
+        let mut info = crate::datarouter_message_info {
+            source: [0; crate::DATAROUTER_SERVICE_NAME_MAX + 1],
+            len: 0,
+        };
+        let rc = unsafe {
+            crate::datarouter_recv(
+                self.port,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+                &mut info,
+            )
+        };
+        match rc {
+            crate::DATAROUTER_OK if info.len <= buf.len() => Ok(Some(info)),
             crate::DATAROUTER_OK => Err(crate::DATAROUTER_ERR_PROTOCOL),
             crate::DATAROUTER_ERR_AGAIN | crate::DATAROUTER_ERR_TIMEOUT => Ok(None),
             code => Err(code),

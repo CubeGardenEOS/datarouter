@@ -47,6 +47,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DATAROUTER_CHANNEL_SIZE");
 
     let channel_size = datarouter_channel_size();
+    // `unsafe` 开发中特性：编译 C 时定义 DATAROUTER_UNSAFE，启用直接指针数据面。
+    let unsafe_enabled = env::var_os("CARGO_FEATURE_UNSAFE").is_some();
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE");
 
     let target = env::var("TARGET").expect("Cargo did not set TARGET");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
@@ -71,7 +74,16 @@ fn main() {
 
     let objects: Vec<PathBuf> = sources
         .iter()
-        .map(|source| compile_c(source, &out_dir, is_windows, is_msvc, channel_size))
+        .map(|source| {
+            compile_c(
+                source,
+                &out_dir,
+                is_windows,
+                is_msvc,
+                channel_size,
+                unsafe_enabled,
+            )
+        })
         .collect();
 
     archive_static_library(&objects, &out_dir, is_msvc);
@@ -83,6 +95,7 @@ fn main() {
         is_msvc,
         channel_size,
         platform_source,
+        unsafe_enabled,
     );
     let generated_switch = out_dir.join("generated_switch_bin.rs");
     let generated_switch_body = match &switch_bin {
@@ -122,6 +135,7 @@ fn compile_c(
     is_windows: bool,
     is_msvc: bool,
     channel_size: u32,
+    unsafe_enabled: bool,
 ) -> PathBuf {
     let source_path = Path::new(source);
     let stem = source_path
@@ -134,6 +148,16 @@ fn compile_c(
         format!("{stem}.o")
     });
 
+    let unsafe_flag = if unsafe_enabled {
+        if is_msvc {
+            "/DDATAROUTER_UNSAFE".to_owned()
+        } else {
+            "-DDATAROUTER_UNSAFE".to_owned()
+        }
+    } else {
+        String::new()
+    };
+
     if is_msvc {
         let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cl"));
         let mut cmd = Command::new(compiler);
@@ -144,8 +168,11 @@ fn compile_c(
             .arg(format!("/DDATAROUTER_CHANNEL_SIZE={channel_size}U"))
             .arg("/Iinclude")
             .arg("/Isrc")
-            .arg(format!("/Fo{}", object.display()))
-            .arg(source);
+            .arg(format!("/Fo{}", object.display()));
+        if !unsafe_flag.is_empty() {
+            cmd.arg(&unsafe_flag);
+        }
+        cmd.arg(source);
         run(cmd, source);
     } else {
         let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
@@ -161,6 +188,9 @@ fn compile_c(
             .arg(source)
             .arg("-o")
             .arg(&object);
+        if !unsafe_flag.is_empty() {
+            cmd.arg(&unsafe_flag);
+        }
         if !is_windows {
             cmd.arg("-D_POSIX_C_SOURCE=200809L").arg("-fPIC");
         }
@@ -177,6 +207,7 @@ fn build_switch_binary(
     is_msvc: bool,
     channel_size: u32,
     platform_source: &str,
+    unsafe_enabled: bool,
 ) -> Option<PathBuf> {
     let mut switch_objects: Vec<PathBuf> = objects.to_vec();
     for source in SWITCH_SOURCES {
@@ -186,6 +217,7 @@ fn build_switch_binary(
             is_windows,
             is_msvc,
             channel_size,
+            unsafe_enabled,
         ));
     }
     let binary = out_dir.join(if is_windows {

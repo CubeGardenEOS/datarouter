@@ -44,6 +44,14 @@ include = [
     "docs/*.md",
 ]
 
+[features]
+default = []
+# 开发中特性：直接指针数据面。绕过 switch 的数据路由，发送端把帧直接写进
+# 目标 RX ring（像 port.c 一样对共享内存做指针操作），全链路拷贝降到 2 次
+# （app -> 目标 RX ring，RX ring -> app buffer）。switch 仅保留控制面
+# （注册/注销/TTL/死进程回收）。生产构建默认关闭。
+unsafe = []
+
 [dependencies]
 libc = "0.2"
 
@@ -59,3 +67,8 @@ harness = false
 [[bench]]
 name = "ipc_frontend"
 harness = false
+
+[[bench]]
+name = "ipc_unsafe"
+harness = false
+required-features = ["unsafe"]

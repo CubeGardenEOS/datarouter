@@ -42,6 +42,12 @@ Linux 后端通过 `shm_open`、`ftruncate`、`fchmod` 和 `mmap` 使用 POSIX s
 
 ## IPC Benchmark
 
+### unsafe 直接数据面（开发中）
+
+`benches/ipc_unsafe.rs`（`cargo bench --bench ipc_unsafe --features unsafe`）走 unsafe 直接
+数据面：2 次拷贝、switch 不碰 payload。与下方正常路径对比见
+`docs/benchmark-unsafe-2026-08.md`。
+
 ### Rust Frontend 全链路（改造后 vs 基线）
 
 `benches/ipc_frontend.rs` 走完整 Rust Frontend（reader 线程 + 队列 + switch 路由），对比同一台机器上旧实现（reader 解包→重新打包、`MAX_APP_PAYLOAD=60KiB`）与本实现（原始字节入队、512KiB 单帧、4 次拷贝）。单程吞吐（portal→core，`recv_packed`）：
@@ -499,6 +505,34 @@ Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024
 4. 队列中的原始字节 → 接收应用（`recv` 解包或 `recv_packed` 复制）。
 
 `recv_packed` 全程不再经过 Rust `Message` 往返；reader 使用可回收缓冲池，稳态接收不产生每帧分配。
+
+### unsafe 直接数据面（开发中特性，默认关闭）
+
+`unsafe` Cargo feature（`--features unsafe`）提供直接指针数据面：`Frontend::connect_unsafe`
+照常通过 switch 控制面注册，但数据交换不再经过 switch 路由——发送端像 port.c 一样直接对
+共享内存做指针操作，把帧 append 到目标 RX ring 并直接 post 目标 `rx_signal`；switch 仅保留
+控制面（注册/注销/TTL/死进程回收）与控制请求中断。全链路 payload 拷贝从 4 次降到 **2 次**：
+
+1. 发送端 packed 字节 → 目标 RX ring（`datarouter_unsafe_send`）；
+2. RX ring → 接收端应用 buffer（直接 `datarouter_recv`，无 reader 线程、无队列）。
+
+```toml
+# Cargo.toml 使用方
+blinkcms-datarouter = { version = "0.2", features = ["unsafe"] }
+```
+
+```rust
+let portal = Frontend::connect_unsafe(FrontendOptions { service_name: "portal".into(), .. })?;
+let core = Frontend::connect_unsafe(FrontendOptions { service_name: "core".into(), .. })?;
+portal.unsafe_send("core", &packed)?;          // 直接写 core 的 RX ring
+let info = core.unsafe_recv(&mut buf, 1000)?;   // 直接读自己的 RX ring
+```
+
+限制（开发中）：同一目标 ring 只允许一个逻辑写者；目标 ring 满返回 `ERR_FULL`（无 switch
+阻塞重排协议）；单帧 ≤ `MAX_APP_PAYLOAD`，无分块/ACK。基准见
+`docs/benchmark-unsafe-2026-08.md`：pingpong 64B/1KiB 往返 p50 ≈ 3.1µs（约 10–22×），
+300KiB 单程吞吐 18.5 GiB/s（约 9×）；小帧单程吞吐因 bench 单线程交替 send/recv、
+unsafe 路径无 reader 预取而与正常路径持平。
 
 ## Port 行为
 

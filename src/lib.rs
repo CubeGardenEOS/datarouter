@@ -7,6 +7,15 @@
 //! The `protocol` module provides the binary message codec for IPC, including
 //! message types, TLV encoding, chunking, and business message builders.
 //! The `protocol_ffi` module exports these as C ABI functions for Go/Python.
+//!
+//! # Development feature: `unsafe` direct data plane
+//!
+//! The `unsafe` Cargo feature (off by default) enables a direct pointer data
+//! plane: `Frontend::connect_unsafe` registers through the switch's control
+//! plane as usual, but `unsafe_send`/`unsafe_recv` move payload bytes straight
+//! between the application and the target RX ring (2 copies per direction)
+//! without routing them through the switch. The switch keeps only control-plane
+//! duties (register/unregister, TTL/dead reaping). See `docs/benchmark-unsafe-2026-08.md`.
 
 pub mod frontend;
 pub mod logging;
@@ -128,6 +137,13 @@ unsafe extern "C" {
         errbuf_len: usize,
     ) -> c_int;
     pub fn datarouter_send(
+        port: *mut datarouter_port,
+        target_service: *const c_char,
+        data: *const c_void,
+        len: usize,
+    ) -> c_int;
+    #[cfg(feature = "unsafe")]
+    pub fn datarouter_unsafe_send(
         port: *mut datarouter_port,
         target_service: *const c_char,
         data: *const c_void,
