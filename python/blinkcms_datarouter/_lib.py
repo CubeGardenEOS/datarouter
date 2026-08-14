@@ -92,6 +92,9 @@ class datarouter_frontend_stats(ctypes.Structure):
         ("corrupted_rings", ctypes.c_uint64),
         ("registration_recoveries", ctypes.c_uint64),
         ("blocked_wakeups", ctypes.c_uint64),
+        ("dead_process_reaps", ctypes.c_uint64),
+        ("transport_generation", ctypes.c_uint64),
+        ("switch_recoveries", ctypes.c_uint64),
     ]
 
 

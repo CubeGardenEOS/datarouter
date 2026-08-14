@@ -1,30 +1,28 @@
 # TODO：unsafe 直接数据面 → 缺省工作模式（临时目标清单）
 
-状态：**本阶段只做检查与修复，不实际迁移**。unsafe 仍是 `--features unsafe` 的
-开发中特性；本清单记录迁移到缺省工作模式前的全部讨论、设计决策与待办，供后续
-阶段逐个落实。已完成的审计修复见文末「已完成（2026-08）」小节与 README。
+状态：**unsafe 已是缺省工作模式（2026-08 翻转）**。crate 缺省开启 `unsafe` feature，
+safe 拷贝模式经 `--no-default-features` 保留；ABI 兼容性（Rust/C/JNI/Python wheel）
+已全链路验证（见「已完成（2026-08）」）。本清单剩余项是**后续阶段**的运行时
+per-shm 模式强制（§1）与排他写者规则（§2）等。
 
 ## 1. safe 模式保留旧拷贝模式（不删除）
 
-要求：旧拷贝模式（switch 路由，4 次拷贝）**不得移除**，作为可选的 safe 模式保留，
-由 switch 启动参数或设置选项激活。
+**crate 级已完成**：`--no-default-features`（`default-features = false`）即旧拷贝模式
+（switch 路由，4 次拷贝），一键回滚；两个配置共享同一 layout 12 / C ABI（直接面只
+多导出符号），`cargo test` 与 `cargo test --no-default-features` 均 68+ 通过。
 
-候选设计（待定稿）：
+**运行时 per-shm 全局模式（未实现，下一阶段）**：switch 启动参数 `--data-plane
+routed|direct`（别名 `--safe-mode`）写入 shared memory 控制面（`data_plane_mode`
+字段，layout 13）并在注册响应中回传；客户端设置项映射 + 校验 echo。语义：
 
-- switch 启动参数 `--data-plane routed|direct`（别名 `--safe-mode`），写入 shared
-  memory 控制面（`data_plane_mode` 字段，layout 12）并在注册响应中回传。
-- 客户端设置项 `FrontendOptions.safe_mode: bool` / `SwitchConfig.safe_mode`，映射到
-  上述 switch 参数；`datarouter_frontend_options` v3 增加对应字段（ABI 校验 struct
-  size，向前兼容）。
-- 语义：
-  - `routed`（safe）：只有拷贝数据面可用；`datarouter_unsafe_send` 返回
-    `DATAROUTER_ERR_PERMISSION`（或新错误码），保证「safe 模式下不可能有直写」。
-  - `direct`（未来缺省）：直写为主，拷贝路径仍保留（switch 仍路由），但必须配合
-    §2 的排他写者规则，否则混用即双写者竞态。
+- `routed`（safe）：只有拷贝数据面可用；`datarouter_unsafe_send` 返回
+  `DATAROUTER_ERR_PERMISSION`（或新错误码），保证「safe 模式下不可能有直写」。
+- `direct`（缺省）：直写为主，拷贝路径仍保留（switch 仍路由），但必须配合
+  §2 的排他写者规则，否则混用即双写者竞态。
 - 关键点：模式是 **per-shm 全局**（所有客户端一致），由 switch 强制，客户端只是
   声明意图并校验 switch 回传的模式，避免「一半 direct 一半 routed」的撕裂部署。
-- 缺省值迁移路径：先在 `routed` 下灰度收集 unsafe 统计 → 切 `direct` 观察 → 再
-  决定把缺省翻转。任何时候可用 `--data-plane routed` 一键回滚到拷贝模式。
+- 缺省值：crate 编译期缺省已是 direct；运行时开关与回滚路径待 layout 13 落地。
+  届时同步处理 `tests/test_switch.c` 的既有 config 用例（见文末「已知的既有问题」）。
 
 ## 2. 混合模式排他写者规则（当前最危险的正确性缺口）
 
@@ -143,6 +141,27 @@ AVX-512 机器（Zen 4/Intel）上评估，只需新增 `copy_avx512` 内核
 - 全量测试：`cargo test`（68）与 `cargo test --features unsafe`（68+6）通过；
   `tests/test_layout.c` 通过。
 
+### 缺省翻转与 ABI 兼容性验证（2026-08）
+
+- **unsafe 成为缺省**：`Cargo.toml` `default = ["unsafe"]`；`--no-default-features`
+  即旧拷贝模式（safe mode）。翻转不改变 layout（仍 12）/ C ABI（仍 v2），直接面只多
+  导出符号。验证：`cargo test`（68+4+6）、`cargo test --no-default-features`（68+4）、
+  C 侧 test_ring/test_config/test_layout 在有无 `-DDATAROUTER_UNSAFE` 下均通过。
+- **ABI 钉扎测试**：新增 `tests/abi_compat.rs`（layout 12 常量 + frontend ABI v2 +
+  C `version` 符号 + `copy_strategy` 缺省 scalar）；JNI 同步钉扎布局常量。
+- **JNI 修复（历史漂移）**：`FrontendOptions` 初始化缺 `auth_token` 字段（auth 特性
+  引入后 JNI 从未重新编译），补 `auth_token: None`；`cargo test`（jni/）通过，
+  Java 侧 `javac --release 17` 编译通过。
+- **Python 修复（历史漂移，由新测试抓出）**：`datarouter_frontend_stats` 的 ctypes
+  镜像缺最后 3 个字段（`dead_process_reaps`/`transport_generation`/`switch_recoveries`），
+  `stats_snapshot_v2` 因此返回 `PROTOCOL`；已补齐 `_lib.py` 与 `port.py`。
+- **Python wheel 稳定性**：`setup.py` 强制平台标签 `py3-none-linux_x86_64`（原为
+  `py3-none-any`，会跨平台错装）；新增 `python/tests/test_native_abi.py`（真实 .so
+  ABI 交叉校验 + spawn 真实 switch 的端到端收发 + stats）；python 套件 34 用例全过；
+  构建 wheel 后在全新 venv 安装并跑通全链路。
+- **已知残余**：运行时 per-shm 模式强制（§1 layout 13）、§2 排他写者规则、§6 可观测性
+  仍未实现（本清单后续阶段）。
+
 ## 已知的既有问题（非本次引入，未修）
 
 - `tests/test_switch.c` 的 `test_config_allowlist_and_capacity` 在 main 上即失败：
@@ -152,3 +171,7 @@ AVX-512 机器（Zen 4/Intel）上评估，只需新增 `copy_avx512` 内核
   `build/datarouter-switch`；布局变更后必须用 `target/.../out/datarouter-switch`
   刷新该文件，否则出现 `DATAROUTER_ERR_PROTOCOL` 假失败。建议后续让测试直接用
   嵌入的 `DATAROUTER_SWITCH_BYTES` 或从 OUT_DIR 复制。
+- python 测试套件（含新增 `test_native_abi.py`）需要真实 `.so`：源码树路径为
+  `build/libblinkcms_datarouter.so`（`cargo build --release` 后按 `python/setup.py`
+  的方式链接，或直接构建 wheel 安装后从 `_native/` 解析）；缺失时
+  `test_protocol.py` 与 `test_native_abi.py` 都会失败（一致契约，非静默跳过）。

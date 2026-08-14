@@ -60,9 +60,9 @@ unsafe 路径无 reader 预取的已知现象（与 2026-08 文档一致），�
 
 ```text
 # 三模式端到端（每次独立进程，copy 策略进程级全局）
-IPC_BENCH_MODE=safe   DATAROUTER_COPY=scalar cargo bench --bench ipc_modes
-IPC_BENCH_MODE=unsafe DATAROUTER_COPY=scalar cargo bench --bench ipc_modes --features unsafe
-IPC_BENCH_MODE=unsafe DATAROUTER_COPY=avx2   cargo bench --bench ipc_modes --features unsafe
+IPC_BENCH_MODE=safe   DATAROUTER_COPY=scalar cargo bench --bench ipc_modes --no-default-features
+IPC_BENCH_MODE=unsafe DATAROUTER_COPY=scalar cargo bench --bench ipc_modes
+IPC_BENCH_MODE=unsafe DATAROUTER_COPY=avx2   cargo bench --bench ipc_modes
 
 # 拷贝原语微基准（cache 热）
 cc -O3 -fno-strict-aliasing -DDATAROUTER_CHANNEL_SIZE=524288U -Iinclude -Isrc \

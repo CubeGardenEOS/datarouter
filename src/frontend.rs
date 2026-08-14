@@ -4,11 +4,12 @@
 //! read loop and keeps chunking, ACKs, reassembly, queueing, backpressure, and
 //! registry access inside Rust.
 //!
-//! With the `unsafe` Cargo feature (dev-only, off by default),
+//! With the default `unsafe` Cargo feature (direct data plane, 2 copies),
 //! [`Frontend::connect_unsafe`] skips the reader thread and queue: data moves
 //! with [`Frontend::unsafe_send`]/[`Frontend::unsafe_recv`] directly against
 //! the target RX ring (2 copies per direction), bypassing the switch's data
-//! plane.
+//! plane. Build with `--no-default-features` for the safe copy-mode
+//! transport (switch routed, 4 copies).
 
 pub mod ffi;
 pub mod inbound;
@@ -142,8 +143,8 @@ impl Frontend {
         })
     }
 
-    /// Connect in direct (unsafe) data-plane mode (development feature, off
-    /// by default). The port logs on through the switch's control plane as
+    /// Connect in direct (unsafe) data-plane mode (default feature; build
+    /// with `--no-default-features` for the safe copy mode). The port logs on through the switch's control plane as
     /// usual, but **no reader thread is spawned** and the data path uses
     /// [`unsafe_send`](Self::unsafe_send)/[`unsafe_recv`](Self::unsafe_recv):
     /// the sender writes straight into the target's RX ring, so the switch

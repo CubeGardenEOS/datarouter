@@ -189,6 +189,7 @@ fn read_options(env: &mut JNIEnv, options: JObject) -> Result<FrontendOptions, c
     let options = FrontendOptions {
         shm_name: get_option_string(env, &options, "sharedMemoryName")?,
         service_name: get_option_string(env, &options, "serviceName")?,
+        auth_token: None, // JNI ABI v1 predates switch auth; --token switches reject here.
         connect_timeout_ms: get_option_int(env, &options, "connectTimeoutMillis")? as u32,
         recv_timeout_ms: get_option_int(env, &options, "receiveTimeoutMillis")? as u32,
         ack_timeout_ms: get_option_int(env, &options, "acknowledgementTimeoutMillis")? as u32,
@@ -505,6 +506,13 @@ mod tests {
         assert_eq!(FRONTEND_ABI_VERSION, 2);
         assert_eq!(JNI_ABI_VERSION, 1);
         assert_eq!(blinkcms_datarouter::DATAROUTER_CHANNEL_SIZE, 524_288);
+        assert_eq!(blinkcms_datarouter::DATAROUTER_RING_CAPACITY, 524_288);
+        assert_eq!(
+            blinkcms_datarouter::DATAROUTER_MAX_APP_PAYLOAD,
+            524_288 - 8
+        );
+        assert_eq!(blinkcms_datarouter::DATAROUTER_RING_HEADER_SIZE, 8);
+        assert_eq!(blinkcms_datarouter::DATAROUTER_FRAME_HEADER_SIZE, 8);
         assert_eq!(ABI_FINGERPRINT.len(), 64);
     }
 }

@@ -59,6 +59,9 @@ class FrontendStats:
     corrupted_rings: int
     registration_recoveries: int
     blocked_wakeups: int
+    dead_process_reaps: int
+    transport_generation: int
+    switch_recoveries: int
 
 
 class Port:
@@ -234,6 +237,9 @@ class Port:
                 corrupted_rings=int(raw.corrupted_rings),
                 registration_recoveries=int(raw.registration_recoveries),
                 blocked_wakeups=int(raw.blocked_wakeups),
+                dead_process_reaps=int(raw.dead_process_reaps),
+                transport_generation=int(raw.transport_generation),
+                switch_recoveries=int(raw.switch_recoveries),
             )
 
     def close(self) -> None:

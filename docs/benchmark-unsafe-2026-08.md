@@ -1,6 +1,7 @@
 # DataRouter unsafe 直接数据面基准（2026-08）
 
-`unsafe` 是开发中 Cargo feature（`--features unsafe`，默认关闭）。它把数据面从
+`unsafe` 是缺省 Cargo feature（直接数据面，2026-08 翻转；旧拷贝模式用
+`--no-default-features` 保留）。它把数据面从
 switch 路由改为发送端直接指针写目标 RX ring（形似 port.c 对共享内存的指针操作），
 switch 仅保留控制面（注册/注销/TTL/死进程回收）与控制请求中断。全链路 payload
 拷贝从 4 次降到 2 次：
@@ -13,8 +14,8 @@ switch 仅保留控制面（注册/注销/TTL/死进程回收）与控制请求�
 
 | 配置 | 单元测试 | unsafe 集成测试 |
 |---|---|---|
-| `cargo test`（无 unsafe） | 68 通过 | 0（feature 关闭，cfg 排除） |
-| `cargo test --features unsafe` | 68 通过 | 4 通过（往返/混合模式/ERR_FULL/NOT_FOUND） |
+| `cargo test`（缺省 = unsafe） | 68 通过 | 6 通过（往返/混合/撕裂/超尺寸/…） |
+| `cargo test --no-default-features`（safe） | 68 通过 | 0（feature 关闭，cfg 排除） |
 
 ## 跑分结果（中位数，各 3 次）
 
@@ -63,11 +64,11 @@ unsafe 路径 64B/1KiB 往返 p50 ≈ 3.1µs，接近共享内存读写 + 两次
 ## 复现
 
 ```bash
-# 无 unsafe 正常路径基线（默认 feature）
-cargo bench --bench ipc_frontend
-# 有 unsafe 直接数据面
-cargo bench --bench ipc_unsafe --features unsafe
-# 测试
+# 无 unsafe 正常路径基线（safe 模式）
+cargo bench --bench ipc_frontend --no-default-features
+# 有 unsafe 直接数据面（缺省）
+cargo bench --bench ipc_unsafe
+# 测试（缺省 = unsafe；safe 用 --no-default-features）
 cargo test
-cargo test --features unsafe
+cargo test --no-default-features
 ```

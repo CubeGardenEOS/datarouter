@@ -6,6 +6,27 @@ from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_py import build_py as _build_py
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+
+class bdist_wheel(_bdist_wheel):
+    """Force a platform-specific wheel tag.
+
+    The wheel ships a native `_native/libblinkcms_datarouter.so`, so it must
+    not be tagged `py3-none-any` (which would let pip install it on the wrong
+    platform or share it across unrelated caches).
+    """
+
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        self.root_is_pure = False
+
+    def get_tag(self) -> tuple[str, str, str]:
+        # The shipped .so is a plain C/Rust library loaded via ctypes: it has
+        # no CPython C-API dependency, so tag it python-version independent
+        # (py3-none) while keeping the platform tag.
+        _, _, plat = super().get_tag()
+        return "py3", "none", plat
 
 
 class build_py(_build_py):
@@ -47,4 +68,4 @@ class build_py(_build_py):
         )
 
 
-setup(cmdclass={"build_py": build_py})
+setup(cmdclass={"build_py": build_py, "bdist_wheel": bdist_wheel})

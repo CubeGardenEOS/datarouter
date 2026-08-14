@@ -42,11 +42,11 @@ Linux 后端通过 `shm_open`、`ftruncate`、`fchmod` 和 `mmap` 使用 POSIX s
 
 ## IPC Benchmark
 
-### unsafe 直接数据面（开发中）
+### unsafe 直接数据面（缺省）
 
-`benches/ipc_unsafe.rs`（`cargo bench --bench ipc_unsafe --features unsafe`）走 unsafe 直接
-数据面：2 次拷贝、switch 不碰 payload。与下方正常路径对比见
-`docs/benchmark-unsafe-2026-08.md`。
+`benches/ipc_unsafe.rs`（`cargo bench --bench ipc_unsafe`，缺省即 unsafe；safe 模式用
+`--no-default-features`）走 unsafe 直接数据面：2 次拷贝、switch 不碰 payload。与下方正常
+路径对比见 `docs/benchmark-unsafe-2026-08.md`。
 
 ### Rust Frontend 全链路（改造后 vs 基线）
 
@@ -506,9 +506,9 @@ Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024
 
 `recv_packed` 全程不再经过 Rust `Message` 往返；reader 使用可回收缓冲池，稳态接收不产生每帧分配。
 
-### unsafe 直接数据面（开发中特性，默认关闭）
+### unsafe 直接数据面（缺省开启；safe 拷贝模式保留，可用 `--no-default-features` 回退）
 
-`unsafe` Cargo feature（`--features unsafe`）提供直接指针数据面：`Frontend::connect_unsafe`
+crate 缺省开启 `unsafe` Cargo feature（直接指针数据面）：`Frontend::connect_unsafe`
 照常通过 switch 控制面注册，但数据交换不再经过 switch 路由——发送端像 port.c 一样直接对
 共享内存做指针操作，把帧 append 到目标 RX ring 并直接 post 目标 `rx_signal`；switch 仅保留
 控制面（注册/注销/TTL/死进程回收）与控制请求中断。全链路 payload 拷贝从 4 次降到 **2 次**：
@@ -517,8 +517,11 @@ Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024
 2. RX ring → 接收端应用 buffer（直接 `datarouter_recv`，无 reader 线程、无队列）。
 
 ```toml
-# Cargo.toml 使用方
-blinkcms-datarouter = { version = "0.2", features = ["unsafe"] }
+# Cargo.toml 使用方（缺省即 unsafe；无需显式 feature）
+blinkcms-datarouter = { version = "0.2" }
+
+# 需要旧拷贝模式（switch 路由 4 次拷贝，safe mode）时：
+blinkcms-datarouter = { version = "0.2", default-features = false }
 ```
 
 ```rust
@@ -537,7 +540,7 @@ let info = core.unsafe_recv(&mut buf, 1000)?;   // 直接读自己的 RX ring
 含 ring 容量 mask 化与手写 AVX2 拷贝的评估结论）见
 `docs/benchmark-modes-2026-08.md`。
 
-直接数据面审计加固（layout 11）：直写者改用独立 `direct_writers` pin 计数器并记录写者
+直接数据面审计加固（layout 11→12）：直写者改用独立 `direct_writers` pin 计数器并记录写者
 进程身份，槽位释放（含目标 owner 崩溃后回收）只在写者进程存活时等待其收尾、写者已死
 才清零，杜绝旧实现 `io_users` 被误清后环形重置与在途 memcpy 竞态（以及随之而来的计数
 下溢）；接收侧新增进程内 `rx_mutex`，直接模式多线程并发 `unsafe_recv` 不再撕裂 SPSC
@@ -564,6 +567,32 @@ generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止�
 启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；旧
 frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct
 size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
+
+### ABI 兼容性测试（缺省翻转后全链路验证）
+
+缺省翻转（`unsafe` 缺省开启）本身**不改变 shared-memory layout 与 C ABI**（仍为 layout
+12、frontend ABI v2）；直接数据面只是额外导出符号（`datarouter_unsafe_send` 等）。ABI
+表面由三层测试钉扎，任何 layout/struct 变更必须同步更新：
+
+- `tests/abi_compat.rs`：锁定 layout 12 常量（`CHANNEL_SIZE`=2^19、`RING_CAPACITY`=2^19
+  且为 2 的幂、`MAX_APP_PAYLOAD`=2^19-8、8B 帧头/ring 头、frontend ABI v2）并调用 C 库
+  `version` 符号证明 staticlib 正确链接；`copy_strategy()` 缺省为 scalar。
+- `jni/src/lib.rs`：`compatibility_fingerprint_is_fixed_for_jni_abi_one` 同步钉扎
+  JNI ABI v1 / frontend ABI v2 与布局常量。修复了历史漂移：JNI 的 `FrontendOptions`
+  初始化缺 `auth_token` 字段（auth 特性引入后 JNI 从未重新编译），已补 `auth_token: None`。
+- `python/tests/test_native_abi.py`：加载真实 `.so` 交叉校验——frontend ABI version、
+  `datarouter_max_app_payload`=524280（layout 12 几何）、`datarouter_frontend_open_v2` 的
+  struct size/ABI 校验路径（错误 size → `PROTOCOL`，正确 size → `NOT_FOUND`）、缺省构建
+  导出 unsafe 符号，以及 spawn 真实 switch 的端到端收发 + `stats()` 快照。修复了历史
+  漂移：python `datarouter_frontend_stats` 镜像缺最后 3 个字段（`dead_process_reaps` /
+  `transport_generation` / `switch_recoveries`），`stats_snapshot_v2` 因此返回
+  `PROTOCOL`，已补齐（`_lib.py` ctypes struct + `port.py` `FrontendStats`）。
+
+Python wheel 稳定性：`setup.py` 强制平台 wheel 标签（`py3-none-linux_x86_64`，而非默认
+的 `py3-none-any`）——wheel 内含 `_native/libblinkcms_datarouter.so`，`any` 标签会让 pip
+在错误平台安装；`.so` 是纯 C/Rust ctypes 库（无 CPython C-API 依赖），故 python 版本
+无关但平台相关。验证：`pip wheel ./python` → 全新 venv 安装 → 中性目录跑通
+`pack → send → recv → unpack → stats` 全链路（见 `docs/todo-unsafe-default.md`）。
 
 ### 启动顺序
 

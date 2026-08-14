@@ -8,14 +8,24 @@
 //! message types, TLV encoding, chunking, and business message builders.
 //! The `protocol_ffi` module exports these as C ABI functions for Go/Python.
 //!
-//! # Development feature: `unsafe` direct data plane
+//! # Data plane: `unsafe` direct mode (default) vs safe copy mode
 //!
-//! The `unsafe` Cargo feature (off by default) enables a direct pointer data
-//! plane: `Frontend::connect_unsafe` registers through the switch's control
-//! plane as usual, but `unsafe_send`/`unsafe_recv` move payload bytes straight
-//! between the application and the target RX ring (2 copies per direction)
-//! without routing them through the switch. The switch keeps only control-plane
-//! duties (register/unregister, TTL/dead reaping). See `docs/benchmark-unsafe-2026-08.md`.
+//! The crate's default build enables the direct pointer data plane (the
+//! `unsafe` feature, default-on since 0.2.x): `Frontend::connect_unsafe`
+//! registers through the switch's control plane as usual, but
+//! `unsafe_send`/`unsafe_recv` move payload bytes straight between the
+//! application and the target RX ring (2 copies per direction) without
+//! routing them through the switch. The switch keeps only control-plane
+//! duties (register/unregister, TTL/dead reaping).
+//! See `docs/benchmark-unsafe-2026-08.md`.
+//!
+//! The legacy switch-routed copy mode (4 copies, "safe mode") is retained
+//! and can be selected with `--no-default-features`; use it for
+//! compatibility or as a one-shot rollback. Both modes share the same C ABI
+//! and shared-memory layout (layout 12), so mixed deployments stay ABI
+//! compatible; the direct plane just exposes extra symbols.
+//! See `docs/todo-unsafe-default.md` for the migration plan and
+//! `tests/abi_compat.rs` for the pinned ABI surface.
 
 pub mod frontend;
 pub mod logging;

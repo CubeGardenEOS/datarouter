@@ -2,12 +2,13 @@
 //! direct (2 copies, scalar memcpy), unsafe direct (2 copies, AVX2).
 //!
 //! Run the same binary three times from separate processes (the C copy
-//! strategy is process-global and pinned by `DATAROUTER_COPY`):
+//! strategy is process-global and pinned by `DATAROUTER_COPY`). The direct
+//! mode is the crate default; `--no-default-features` selects safe mode:
 //!
 //! ```text
-//! IPC_BENCH_MODE=safe   DATAROUTER_COPY=scalar cargo bench --bench ipc_modes
-//! IPC_BENCH_MODE=unsafe DATAROUTER_COPY=scalar cargo bench --bench ipc_modes --features unsafe
-//! IPC_BENCH_MODE=unsafe DATAROUTER_COPY=avx2   cargo bench --bench ipc_modes --features unsafe
+//! IPC_BENCH_MODE=safe   DATAROUTER_COPY=scalar cargo bench --bench ipc_modes --no-default-features
+//! IPC_BENCH_MODE=unsafe DATAROUTER_COPY=scalar cargo bench --bench ipc_modes
+//! IPC_BENCH_MODE=unsafe DATAROUTER_COPY=avx2   cargo bench --bench ipc_modes
 //! ```
 //!
 //! Output is tab-separated so the three runs can be pasted side by side:
