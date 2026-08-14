@@ -50,11 +50,13 @@ include!(concat!(env!("OUT_DIR"), "/generated_constants.rs"));
 pub const DATAROUTER_RING_HEADER_SIZE: usize = 8;
 /// 8-byte per-frame route/length header.
 pub const DATAROUTER_FRAME_HEADER_SIZE: usize = 8;
-/// Usable payload bytes of one 512 KiB ring channel.
-pub const DATAROUTER_RING_CAPACITY: usize =
-    DATAROUTER_CHANNEL_SIZE as usize - DATAROUTER_RING_HEADER_SIZE;
+/// Usable payload bytes of one ring channel = the power-of-two
+/// `DATAROUTER_CHANNEL_SIZE` (default 2^19), so the ring index wrap is a
+/// mask instead of a division. The channel on disk is the 8-byte ring header
+/// plus this many data bytes.
+pub const DATAROUTER_RING_CAPACITY: usize = DATAROUTER_CHANNEL_SIZE as usize;
 /// Largest single-frame payload. The legacy 60 KiB cap is disabled; the whole
-/// ring fits in one frame (512 KiB - 16 bytes).
+/// ring fits in one frame (512 KiB - 8 bytes).
 pub const DATAROUTER_MAX_APP_PAYLOAD: usize =
     DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE;
 pub const DATAROUTER_SERVICE_NAME_MAX: usize = 31;
@@ -125,6 +127,7 @@ pub type DatarouterDrainCallback = unsafe extern "C" fn(
 
 unsafe extern "C" {
     pub fn datarouter_version() -> *const c_char;
+    pub fn datarouter_copy_strategy() -> *const c_char;
     pub fn datarouter_strerror(code: c_int) -> *const c_char;
     pub fn datarouter_open(
         options: *const datarouter_options,
@@ -205,6 +208,21 @@ pub fn version() -> &'static CStr {
             CStr::from_ptr(ptr)
         }
     }
+}
+
+/// Resolved data-plane copy strategy ("scalar" or "avx2") for this process.
+/// Selected lazily by the C library from `DATAROUTER_COPY=scalar|avx2`
+/// (default scalar = libc memcpy, which is AVX2-tuned by glibc anyway; the
+/// avx2 strategy is a benchmark-only hand-rolled loop that measured slower).
+pub fn copy_strategy() -> &'static str {
+    let strategy = unsafe {
+        let ptr = datarouter_copy_strategy();
+        if ptr.is_null() {
+            return "unknown";
+        }
+        CStr::from_ptr(ptr)
+    };
+    strategy.to_str().unwrap_or("unknown")
 }
 
 #[cfg(test)]

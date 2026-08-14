@@ -96,6 +96,58 @@ static void port_tx_mutex_destroy(datarouter_port *port) {
 #endif
 }
 
+static int port_rx_mutex_init(datarouter_port *port) {
+    if (!port) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+#ifdef _WIN32
+    InitializeCriticalSection(&port->rx_mutex);
+    return DATAROUTER_OK;
+#else
+    return pthread_mutex_init(&port->rx_mutex, NULL) == 0
+        ? DATAROUTER_OK
+        : DATAROUTER_ERR_PLATFORM;
+#endif
+}
+
+#ifdef DATAROUTER_UNSAFE
+static int port_rx_mutex_lock(datarouter_port *port) {
+    if (!port) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+#ifdef _WIN32
+    EnterCriticalSection(&port->rx_mutex);
+    return DATAROUTER_OK;
+#else
+    return pthread_mutex_lock(&port->rx_mutex) == 0
+        ? DATAROUTER_OK
+        : DATAROUTER_ERR_PLATFORM;
+#endif
+}
+
+static void port_rx_mutex_unlock(datarouter_port *port) {
+    if (!port) {
+        return;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&port->rx_mutex);
+#else
+    (void)pthread_mutex_unlock(&port->rx_mutex);
+#endif
+}
+#endif /* DATAROUTER_UNSAFE */
+
+static void port_rx_mutex_destroy(datarouter_port *port) {
+    if (!port) {
+        return;
+    }
+#ifdef _WIN32
+    DeleteCriticalSection(&port->rx_mutex);
+#else
+    (void)pthread_mutex_destroy(&port->rx_mutex);
+#endif
+}
+
 static void encode_frame_header(
     uint8_t header[DATAROUTER_FRAME_HEADER_SIZE],
     uint32_t route_id,
@@ -686,9 +738,17 @@ int datarouter_open(const datarouter_options *options, datarouter_port **out) {
         free(port);
         return rc;
     }
+    rc = port_rx_mutex_init(port);
+    if (rc != DATAROUTER_OK) {
+        port_tx_mutex_destroy(port);
+        datarouter_platform_close(&mapping);
+        free(port);
+        return rc;
+    }
     port->drain_buffer = (uint8_t *)malloc(port->drain_buffer_capacity);
     if (!port->drain_buffer) {
         port_tx_mutex_destroy(port);
+        port_rx_mutex_destroy(port);
         datarouter_platform_close(&mapping);
         free(port);
         return DATAROUTER_ERR_INTERNAL;
@@ -798,12 +858,13 @@ out:
 /* Direct (unsafe) data plane: bypass the switch for payload movement.
  *
  * The sender resolves the target from the shared-memory registry, pins the
- * target slot (blocking release/reuse while the write is in flight), tracks
- * the inflight counter exactly like the switch's router would, then appends
- * the frame header + payload straight into the target's RX ring and posts the
- * target's rx_signal directly. The switch never touches the payload bytes; it
- * only keeps control-plane duties (register/unregister, TTL/dead-process
- * reaping) and remains the control-request interrupt target.
+ * target slot via the direct-writer pin counter (blocking release/reuse while
+ * the write is in flight), tracks the inflight counter exactly like the
+ * switch's router would, then appends the frame header + payload straight
+ * into the target's RX ring and posts the target's rx_signal directly. The
+ * switch never touches the payload bytes; it only keeps control-plane duties
+ * (register/unregister, TTL/dead-process reaping) and remains the
+ * control-request interrupt target.
  *
  * The frame format is identical to the switch-routed path, so a receiver may
  * use either the normal `datarouter_recv`/`datarouter_wait` or the direct
@@ -858,20 +919,39 @@ int datarouter_unsafe_send(
         goto out;
     }
     datarouter_registry_entry *target_entry = &port->shm->control.registry[target_slot];
-    /* Write pin: seq_cst io_users handshake blocks finalize_release (and
-     * therefore slot reuse by a new registration) until the write completes.
-     * Re-verify the pinned entry is still the same active registration. */
-    atomic_fetch_add_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+    /* Write pin: the seq_cst direct_writers handshake blocks finalize_release
+     * (and therefore slot reuse by a new registration) until the write
+     * completes. The pin lives on its own counter with writer identity so the
+     * switch never mistakes a live foreign writer for a stale owner pin.
+     * Identity is stored BEFORE the increment: finalize_release reads the
+     * counter with acquire and sees the store through the release RMW. */
+    atomic_store_explicit(
+        &target_entry->direct_writer_pid,
+        current_pid(),
+        memory_order_relaxed
+    );
+    atomic_store_explicit(
+        &target_entry->direct_writer_uid,
+        current_uid(),
+        memory_order_relaxed
+    );
+    atomic_store_explicit(
+        &target_entry->direct_writer_start_id,
+        port->process_start_id,
+        memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
+    /* Re-verify the pinned entry is still the same active registration. */
     datarouter_registry_metadata recheck;
     if (!datarouter_registry_read_active(target_entry, &recheck) ||
         recheck.route_id != target.route_id || recheck.slot_index != target_slot) {
-        atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+        atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
         rc = DATAROUTER_ERR_NOT_FOUND;
         goto out;
     }
     datarouter_channel *rx = datarouter_rx_channel(port->shm, target_slot);
     if (!rx) {
-        atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+        atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
         rc = DATAROUTER_ERR_INTERNAL;
         goto out;
     }
@@ -884,13 +964,13 @@ int datarouter_unsafe_send(
     if (rc != DATAROUTER_OK) {
         /* Nothing was published; undo the inflight increment. */
         datarouter_registry_complete_inflight(port->shm, port->route_id, target_slot);
-        atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+        atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
         if (rc == DATAROUTER_ERR_PROTOCOL) {
             report_corrupt_self(port);
         }
         goto out;
     }
-    atomic_fetch_sub_explicit(&target_entry->io_users, 1U, memory_order_seq_cst);
+    atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
     datarouter_signal_post(&port->shm->control.rx_signal[target_slot]);
     datarouter_touch_entry(self, datarouter_now_ns());
 
@@ -921,9 +1001,24 @@ int datarouter_recv(
         return DATAROUTER_ERR_NOT_FOUND;
     }
     datarouter_touch_entry(self, datarouter_now_ns());
+#ifdef DATAROUTER_UNSAFE
+    /* The direct (unsafe) data plane has no reader thread; multiple
+     * application threads may call datarouter_recv concurrently on the same
+     * SPSC RX ring. Serialize ring reads within this process. */
+    int rx_lock_rc = port_rx_mutex_lock(port);
+    if (rx_lock_rc != DATAROUTER_OK) {
+        datarouter_registry_unpin(self);
+        return rx_lock_rc;
+    }
+    int rc = recv_frame_unchecked(port, rx, buffer, capacity, info, 1);
+    port_rx_mutex_unlock(port);
+    datarouter_registry_unpin(self);
+    return rc;
+#else
     int rc = recv_frame_unchecked(port, rx, buffer, capacity, info, 1);
     datarouter_registry_unpin(self);
     return rc;
+#endif
 }
 
 int datarouter_poll(datarouter_port *port) {
@@ -1035,6 +1130,13 @@ int datarouter_drain(
     uint64_t started = datarouter_now_ns();
     uint64_t budget_ns = (uint64_t)normalize_drain_budget_us(budget_us) * 1000ULL;
     int last_rc = DATAROUTER_ERR_AGAIN;
+#ifdef DATAROUTER_UNSAFE
+    int rx_lock_rc = port_rx_mutex_lock(port);
+    if (rx_lock_rc != DATAROUTER_OK) {
+        datarouter_registry_unpin(self);
+        return rx_lock_rc;
+    }
+#endif
     while (*drained < max_frames) {
         datarouter_message_info info;
         int rc = recv_frame_unchecked(
@@ -1063,6 +1165,9 @@ int datarouter_drain(
     if (*drained > 0U && datarouter_scheduler_wake_blocked(port->shm) > 0U) {
         datarouter_signal_post(&port->shm->control.switch_signal);
     }
+#ifdef DATAROUTER_UNSAFE
+    port_rx_mutex_unlock(port);
+#endif
     datarouter_registry_unpin(self);
     return *drained > 0U && last_rc == DATAROUTER_ERR_AGAIN ? DATAROUTER_OK : last_rc;
 }
@@ -1201,6 +1306,7 @@ void datarouter_close(datarouter_port *port) {
     datarouter_platform_close(&mapping);
     free(port->drain_buffer);
     port_tx_mutex_destroy(port);
+    port_rx_mutex_destroy(port);
     free(port);
 }
 

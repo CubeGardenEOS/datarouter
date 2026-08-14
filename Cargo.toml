@@ -69,6 +69,10 @@ name = "ipc_frontend"
 harness = false
 
 [[bench]]
+name = "ipc_modes"
+harness = false
+
+[[bench]]
 name = "ipc_unsafe"
 harness = false
 required-features = ["unsafe"]

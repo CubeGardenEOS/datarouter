@@ -28,15 +28,16 @@ extern "C" {
 #ifndef DATAROUTER_CHANNEL_SIZE
 #define DATAROUTER_CHANNEL_SIZE 524288U
 #endif
-/* Official ring geometry: the 512 KiB channel carries a small atomic ring
- * header followed by DATAROUTER_RING_CAPACITY data bytes. A frame adds an
- * 8-byte route/length header, so the largest single-frame payload is
- * DATAROUTER_MAX_APP_PAYLOAD (about 512 KiB - 16). The legacy 60 KiB cap
+/* Official ring geometry: the channel carries an 8-byte atomic ring header
+ * followed by DATAROUTER_RING_CAPACITY data bytes, where RING_CAPACITY is
+ * exactly the (power-of-two) DATAROUTER_CHANNEL_SIZE — default 2^19, so the
+ * hot-path index wrap is a single mask (`& (CAP - 1)`) instead of a division.
+ * A frame adds an 8-byte route/length header, so the largest single-frame
+ * payload is DATAROUTER_MAX_APP_PAYLOAD (512 KiB - 8). The legacy 60 KiB cap
  * is deliberately gone: the whole ring is usable as one frame. */
 #define DATAROUTER_FRAME_HEADER_SIZE 8U
 #define DATAROUTER_RING_HEADER_SIZE 8U
-#define DATAROUTER_RING_CAPACITY \
-    (DATAROUTER_CHANNEL_SIZE - DATAROUTER_RING_HEADER_SIZE)
+#define DATAROUTER_RING_CAPACITY (DATAROUTER_CHANNEL_SIZE)
 #define DATAROUTER_MAX_APP_PAYLOAD \
     (DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
 #define DATAROUTER_SERVICE_NAME_MAX 31

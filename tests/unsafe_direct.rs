@@ -186,3 +186,90 @@ fn unsafe_send_reports_not_found_for_missing_target() {
         other => panic!("expected NOT_FOUND for unregistered target, got {other:?}"),
     }
 }
+
+#[test]
+fn concurrent_unsafe_recv_never_torn_reads() {
+    // The direct plane has no reader thread; several application threads may
+    // call unsafe_recv on the same frontend. The per-port RX mutex must keep
+    // each frame whole and hand each thread exactly one frame.
+    let sw = start_switch("unsafe-multirecv");
+    let core = connect_unsafe(&sw, "core");
+    let portal = connect_unsafe(&sw, "portal");
+
+    const FRAMES: usize = 64;
+    let frames: Vec<Vec<u8>> = (0..FRAMES)
+        .map(|i| pack_request(&format!("concurrent-frame-{i}").into_bytes()))
+        .collect();
+
+    let core = std::sync::Arc::new(core);
+    let mut threads = Vec::new();
+    for _ in 0..4 {
+        let core = std::sync::Arc::clone(&core);
+        threads.push(std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 20];
+            let mut got = 0usize;
+            let mut body_ok = true;
+            loop {
+                let info = match core.unsafe_recv(&mut buf, 5000) {
+                    Ok(Some(info)) => info,
+                    Ok(None) => break,
+                    Err(code) => panic!("unsafe_recv failed: {code}"),
+                };
+                if info.len == 0 || info.len > buf.len() {
+                    body_ok = false;
+                    break;
+                }
+                if let Ok(msg) = protocol::unpack(&buf[..info.len])
+                    && !msg.body.starts_with(b"concurrent-frame-")
+                {
+                    body_ok = false;
+                    break;
+                }
+                got += 1;
+                if got >= FRAMES {
+                    break;
+                }
+            }
+            (got, body_ok)
+        }));
+    }
+    for packed in &frames {
+        portal
+            .unsafe_send("core", packed)
+            .expect("unsafe send succeeds");
+    }
+    let mut total = 0usize;
+    for thread in threads {
+        let (got, body_ok) = thread.join().expect("recv thread");
+        assert!(body_ok, "torn or corrupted frame body observed");
+        total += got;
+    }
+    assert_eq!(total, FRAMES, "every frame delivered exactly once");
+}
+
+#[test]
+fn unsafe_recv_oversized_frame_is_retained_for_a_larger_buffer() {
+    let sw = start_switch("unsafe-oversize");
+    let core = connect_unsafe(&sw, "core");
+    let portal = connect_unsafe(&sw, "portal");
+
+    let packed = pack_request(&vec![0xC3u8; 300 * 1024]);
+    portal.unsafe_send("core", &packed).expect("unsafe send");
+
+    let mut small = vec![0u8; 1024];
+    let rc = core.unsafe_recv(&mut small, 2000);
+    assert!(
+        matches!(rc, Err(blinkcms_datarouter::DATAROUTER_ERR_PAYLOAD_TOO_LARGE)),
+        "small buffer must reject with PAYLOAD_TOO_LARGE, got {rc:?}"
+    );
+
+    // The rejected frame must NOT have been consumed: a fresh large buffer
+    // still receives the same wire bytes.
+    let mut large = vec![0u8; 1 << 20];
+    let info = core
+        .unsafe_recv(&mut large, 2000)
+        .expect("unsafe recv ok")
+        .expect("frame still present");
+    assert_eq!(info.len, packed.len());
+    assert_eq!(&large[..info.len], &packed[..]);
+}

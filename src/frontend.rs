@@ -222,6 +222,13 @@ impl Frontend {
     /// copy; no reader thread, no queue). The frame bytes land in `out_buf`
     /// and the returned info carries `source` + `len`. `Ok(None)` when the
     /// timeout elapses without a frame.
+    ///
+    /// A frame larger than `out_buf` returns
+    /// `DATAROUTER_ERR_PAYLOAD_TOO_LARGE` and is **not consumed**; use
+    /// [`frame_len`](Self::frame_len) or a larger buffer and call again.
+    /// Concurrent `unsafe_recv` from multiple threads of one frontend is
+    /// serialized by the port's RX mutex (safe, but they contend on the
+    /// single RX ring; prefer one consumer thread per frontend).
     #[cfg(feature = "unsafe")]
     pub fn unsafe_recv(
         &self,
@@ -232,7 +239,14 @@ impl Frontend {
             options::normalize_timeout(timeout_ms, self.inner.options.recv_timeout_ms);
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
-            if let Ok(Some(info)) = self.inner.with_port(|port| port.unsafe_recv(out_buf))? {
+            let arrived = match self.inner.with_port(|port| port.unsafe_recv(out_buf))? {
+                Ok(Some(info)) => Some(info),
+                Ok(None) => None,
+                // PAYLOAD_TOO_LARGE (frame kept in the ring) and any other
+                // hard error must surface, not masquerade as "no frame".
+                Err(code) => return Err(code),
+            };
+            if let Some(info) = arrived {
                 self.inner.stats.received_frames.fetch_add(1, Ordering::Relaxed);
                 self.inner.stats.received_complete.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(info));
@@ -269,6 +283,16 @@ impl Frontend {
             crate::DATAROUTER_ERR_NOT_FOUND => Err(crate::DATAROUTER_ERR_NOT_FOUND),
             code => Err(code),
         }
+    }
+
+    /// Peek the next RX frame's payload length without consuming it
+    /// (`Ok(None)` when empty). In direct (unsafe) mode a frame larger than
+    /// the caller's `unsafe_recv` buffer returns
+    /// `DATAROUTER_ERR_PAYLOAD_TOO_LARGE` **without consuming the frame**;
+    /// call this first (or retry with a larger buffer) to size the receive
+    /// buffer, then call [`unsafe_recv`](Self::unsafe_recv) again.
+    pub fn frame_len(&self) -> Result<Option<usize>, c_int> {
+        self.inner.with_port(|port| port.frame_len())?
     }
 
     pub fn recv(&self, timeout_ms: u32) -> Result<FrontendMessage, c_int> {

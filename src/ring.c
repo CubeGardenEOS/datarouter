@@ -1,10 +1,116 @@
 #include "datarouter_internal.h"
 
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
+
+/* ---- data-plane copy strategy --------------------------------------------
+ * The hot-path ring copies dispatch to a per-process copy routine so the
+ * same binary can be compared across copy strategies: DATAROUTER_COPY names
+ * a strategy from the table below (default "scalar" = libc memcpy, which on
+ * x86-64 is already AVX2-tuned: glibc __memmove_avx_unaligned_erms). A
+ * hand-rolled 256-bit load/store loop measured consistently SLOWER
+ * (docs/benchmark-modes-2026-08), so "avx2" exists only as a benchmark knob.
+ *
+ * AVX-512 upgrade path: add a copy_avx512 kernel (target("avx512f"), 64-byte
+ * loadu/storeu loop) plus one table row below; DATAROUTER_COPY=avx512 then
+ * works with no other changes. Only pursue on an AVX-512 CPU where glibc's
+ * __memmove_avx512 is not already winning. Selection is process-global and
+ * lazy, so benchmarks run each strategy from a separate process without
+ * rebuilding. Copies under 64 bytes always use memcpy to skip the dispatch.
+ * The strategy also applies to the switch's routed copies, which is why a
+ * "safe mode" run pins DATAROUTER_COPY=scalar. */
+
+typedef void (*datarouter_copy_fn)(void *dst, const void *src, size_t n);
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2")))
+static void copy_avx2(void *dst, const void *src, size_t n) {
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned char *d = (unsigned char *)dst;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)(const void *)(s + i));
+        _mm256_storeu_si256((__m256i *)(void *)(d + i), chunk);
+    }
+    if (i < n) {
+        memcpy(d + i, s + i, n - i);
+    }
+}
+#else
+static void copy_avx2(void *dst, const void *src, size_t n) {
+    memcpy(dst, src, n);
+}
+#endif
+
+static void copy_scalar(void *dst, const void *src, size_t n) {
+    memcpy(dst, src, n);
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+static int copy_cpu_supports_avx2(void) {
+    return __builtin_cpu_supports("avx2");
+}
+#else
+static int copy_cpu_supports_avx2(void) {
+    return 0;
+}
+#endif
+
+typedef struct {
+    const char *name; /* DATAROUTER_COPY value that selects this strategy */
+    datarouter_copy_fn fn;
+    int (*supported)(void); /* NULL = always available (default) */
+} datarouter_copy_strategy_def;
+
+static const datarouter_copy_strategy_def kCopyStrategies[] = {
+    { "scalar", copy_scalar, NULL },
+    { "avx2", copy_avx2, copy_cpu_supports_avx2 },
+    /* AVX-512 (future): { "avx512", copy_avx512, copy_cpu_supports_avx512 }, */
+};
+
+static datarouter_copy_fn g_copy_large = copy_scalar;
+static const datarouter_copy_strategy_def *g_copy_active = &kCopyStrategies[0];
+static pthread_once_t g_copy_once = PTHREAD_ONCE_INIT;
+
+static void copy_init(void) {
+    const char *choice = getenv("DATAROUTER_COPY");
+    if (choice) {
+        for (size_t i = 0; i < sizeof(kCopyStrategies) / sizeof(kCopyStrategies[0]); i++) {
+            if (strcmp(choice, kCopyStrategies[i].name) == 0) {
+                if (kCopyStrategies[i].supported == NULL || kCopyStrategies[i].supported()) {
+                    g_copy_active = &kCopyStrategies[i];
+                    g_copy_large = kCopyStrategies[i].fn;
+                }
+                /* Named but unsupported: keep the default (scalar). */
+                return;
+            }
+        }
+    }
+    g_copy_active = &kCopyStrategies[0];
+    g_copy_large = kCopyStrategies[0].fn;
+}
+
+static void datarouter_copy(void *dst, const void *src, size_t n) {
+    if (n >= 64) {
+        pthread_once(&g_copy_once, copy_init);
+        g_copy_large(dst, src, n);
+    } else {
+        memcpy(dst, src, n);
+    }
+}
+
+const char *datarouter_copy_strategy(void) {
+    pthread_once(&g_copy_once, copy_init);
+    return g_copy_active->name;
+}
 
 static uint32_t ring_masked(uint32_t value) {
-    return value % (uint32_t)DATAROUTER_RING_CAPACITY;
+    return value & (DATAROUTER_RING_CAPACITY - 1U);
 }
 
 void datarouter_ring_reset(datarouter_channel *channel) {
@@ -53,9 +159,9 @@ static void ring_copy_in(datarouter_channel *channel, uint32_t head, const uint8
     if (first > len) {
         first = len;
     }
-    memcpy(&channel->data[pos], data, first);
+    datarouter_copy(&channel->data[pos], data, first);
     if (len > first) {
-        memcpy(channel->data, data + first, len - first);
+        datarouter_copy(channel->data, data + first, len - first);
     }
 }
 
@@ -68,9 +174,9 @@ static void ring_copy_out(const datarouter_channel *channel, uint32_t tail, uint
     if (first > len) {
         first = len;
     }
-    memcpy(data, &channel->data[pos], first);
+    datarouter_copy(data, &channel->data[pos], first);
     if (len > first) {
-        memcpy(data + first, channel->data, len - first);
+        datarouter_copy(data + first, channel->data, len - first);
     }
 }
 
@@ -204,7 +310,7 @@ static void ring_copy_between(
         if (chunk > len) {
             chunk = len;
         }
-        memcpy(&target->data[target_pos], &source->data[source_pos], chunk);
+        datarouter_copy(&target->data[target_pos], &source->data[source_pos], chunk);
         source_index += (uint32_t)chunk;
         target_index += (uint32_t)chunk;
         len -= chunk;

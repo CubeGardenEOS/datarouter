@@ -296,6 +296,11 @@ void datarouter_registry_clear_entry(datarouter_registry_entry *entry, uint32_t 
         memory_order_relaxed
     );
     atomic_store_explicit(&entry->last_active_ns, 0ULL, memory_order_release);
+    atomic_store_explicit(&entry->io_users, 0U, memory_order_seq_cst);
+    atomic_store_explicit(&entry->direct_writers, 0U, memory_order_seq_cst);
+    atomic_store_explicit(&entry->direct_writer_pid, 0, memory_order_relaxed);
+    atomic_store_explicit(&entry->direct_writer_uid, 0U, memory_order_relaxed);
+    atomic_store_explicit(&entry->direct_writer_start_id, 0ULL, memory_order_relaxed);
     atomic_store_explicit(&entry->state, DATAROUTER_PORT_EMPTY, memory_order_seq_cst);
 }
 
@@ -310,10 +315,53 @@ static int force_dead_owner_pin_release(datarouter_registry_entry *entry) {
     return 1;
 }
 
+/* Wait for an in-flight direct (unsafe) data-plane writer to finish.
+ *
+ * direct_writers is pinned by live writer processes, so unlike owner pins it
+ * must NEVER be zeroed while the writer is still alive: doing so would reset
+ * the rings underneath its memcpy and corrupt the next occupant's RX channel
+ * (and its later unpin would underflow the counter). Instead we wait out the
+ * bounded write, and only force-release when the recorded writer process is
+ * provably dead (crashed mid-write). An alive-but-preempted writer simply
+ * defers the finalize; the switch's cleanup loop retries. */
+static int direct_writers_drain(datarouter_registry_entry *entry) {
+    uint64_t started = datarouter_now_ns();
+    for (;;) {
+        if (atomic_load_explicit(&entry->direct_writers, memory_order_seq_cst) == 0U) {
+            return 1;
+        }
+        int32_t pid = atomic_load_explicit(&entry->direct_writer_pid, memory_order_relaxed);
+        uint32_t uid = atomic_load_explicit(&entry->direct_writer_uid, memory_order_relaxed);
+        uint64_t start_id = atomic_load_explicit(
+            &entry->direct_writer_start_id,
+            memory_order_relaxed
+        );
+        if (pid <= 0 ||
+            !datarouter_process_identity_matches((pid_t)pid, uid, start_id)) {
+            /* The writer died before unpinning; its memcpy never completed and
+             * nothing will ever decrement the counter. Clear the stale pin. */
+            atomic_store_explicit(&entry->direct_writers, 0U, memory_order_seq_cst);
+            atomic_store_explicit(&entry->direct_writer_pid, 0, memory_order_relaxed);
+            atomic_store_explicit(&entry->direct_writer_uid, 0U, memory_order_relaxed);
+            atomic_store_explicit(&entry->direct_writer_start_id, 0ULL, memory_order_relaxed);
+            return 1;
+        }
+        if (datarouter_now_ns() - started >= DATAROUTER_DIRECT_WRITER_WAIT_NS) {
+            /* Writer alive but still mid-write (or preempted). Defer the
+             * release; the cleanup loop retries finalize_release. */
+            return 0;
+        }
+        datarouter_sleep_us(100U);
+    }
+}
+
 static int finalize_release(datarouter_shared_memory *shm, uint32_t slot_index) {
     datarouter_registry_entry *entry = &shm->control.registry[slot_index];
     if (atomic_load_explicit(&entry->io_users, memory_order_seq_cst) != 0U &&
         !force_dead_owner_pin_release(entry)) {
+        return 0;
+    }
+    if (!direct_writers_drain(entry)) {
         return 0;
     }
     datarouter_scheduler_forget_slot(shm, slot_index);

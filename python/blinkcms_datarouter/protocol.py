@@ -28,10 +28,11 @@ TAG_STEP_ID: int = 0x14
 TAG_ACTOR_UUID: int = 0x15
 TAG_TRACE_ID: int = 0x16
 
-# The ring officially uses the whole 512 KiB channel. The 512 KiB ring minus
-# the 8-byte ring header and 8-byte frame header gives the largest single-
-# frame payload. The legacy 60 KiB cap is disabled.
-MAX_APP_PAYLOAD: int = (512 * 1024) - 16
+# The ring officially uses the whole 512 KiB channel: the power-of-two
+# 512 KiB data region (ring capacity, mask-indexed) minus the 8-byte frame
+# header gives the largest single-frame payload. The legacy 60 KiB cap is
+# disabled.
+MAX_APP_PAYLOAD: int = (512 * 1024) - 8
 
 # Message types
 MSG_BUSINESS_REQUEST: int = 0x07

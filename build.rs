@@ -164,6 +164,7 @@ fn compile_c(
         cmd.arg("/nologo")
             .arg("/c")
             .arg("/std:c11")
+            .arg("/O2")
             .arg("/D_CRT_SECURE_NO_WARNINGS")
             .arg(format!("/DDATAROUTER_CHANNEL_SIZE={channel_size}U"))
             .arg("/Iinclude")
@@ -178,6 +179,8 @@ fn compile_c(
         let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
         let mut cmd = Command::new(compiler);
         cmd.arg("-std=c11")
+            .arg("-O3")
+            .arg("-fno-strict-aliasing")
             .arg("-Wall")
             .arg("-Wextra")
             .arg("-Wpedantic")

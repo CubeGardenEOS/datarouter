@@ -493,7 +493,7 @@ Switch 只读取 8 字节帧头，然后转发 payload 字节，不检查业务�
 - **启动顺序**：datarouter 模式下，必须先启动 `datarouter-switch`，再启动 Core、Edge Node 或 Python worker。否则 `datarouter_open` 返回 `ERR_PLATFORM`。
 - **权限与信任边界**：生产默认必须使用 `0600`，switch 与客户端由同一运行 UID 启动。更宽的 `--mode` 会输出醒目告警，只应用于受控调试。本加固边界把同一 UID 下的进程视为可信，不宣称能阻止同 UID 恶意进程直接改写 shared memory。
 
-Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024`、总重组内存为 `128MiB`，并按 `chunk_ttl_ms`（默认 30 秒）回收不完整消息。分块 ACK 会绑定预期来源；最后一块只有在完整消息成功进入应用队列后才确认。**`MAX_APP_PAYLOAD` 已正式采用整条 `512KiB` ring**（约 `512KiB - 16B`），旧的 `60KiB` 上限被禁用：≤512KiB 的消息直接作为单帧传输，只有更大消息才进入分块+逐片 ACK 路径。
+Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024`、总重组内存为 `128MiB`，并按 `chunk_ttl_ms`（默认 30 秒）回收不完整消息。分块 ACK 会绑定预期来源；最后一块只有在完整消息成功进入应用队列后才确认。**`MAX_APP_PAYLOAD` 已正式采用整条 `512KiB` ring**（`512KiB - 8B`），旧的 `60KiB` 上限被禁用：≤512KiB 的消息直接作为单帧传输，只有更大消息才进入分块+逐片 ACK 路径。
 
 ### 拷贝预算（全链路 4 次）
 
@@ -533,7 +533,16 @@ let info = core.unsafe_recv(&mut buf, 1000)?;   // 直接读自己的 RX ring
 3600，后台有 Gradle daemon 噪声）：pingpong 64B/1KiB 往返 p50 ≈ 3.1µs（约 10–20×），
 300KiB 单程吞吐 17.8 GiB/s（约 9.9×），32KiB/64KiB 单程 1.5–2.7×；小帧单程因 bench
 单线程交替 send/recv、unsafe 路径无 reader 预取而与正常路径持平（±10% 噪声内）。
-详见 `docs/benchmark-unsafe-2026-08.md`。
+详见 `docs/benchmark-unsafe-2026-08.md`。后续三模式对比（safe / unsafe / unsafe-avx2，
+含 ring 容量 mask 化与手写 AVX2 拷贝的评估结论）见
+`docs/benchmark-modes-2026-08.md`。
+
+直接数据面审计加固（layout 11）：直写者改用独立 `direct_writers` pin 计数器并记录写者
+进程身份，槽位释放（含目标 owner 崩溃后回收）只在写者进程存活时等待其收尾、写者已死
+才清零，杜绝旧实现 `io_users` 被误清后环形重置与在途 memcpy 竞态（以及随之而来的计数
+下溢）；接收侧新增进程内 `rx_mutex`，直接模式多线程并发 `unsafe_recv` 不再撕裂 SPSC
+ring；`unsafe_recv` 遇到 `PAYLOAD_TOO_LARGE` 时保留帧并返回错误（配合
+`Frontend::frame_len` 预取长度），不再被吞成超时。
 
 ## Port 行为
 
@@ -547,7 +556,14 @@ Port 库是应用面对的 ABI。它打开 switch-owned shared memory，调用 `
 
 ### 布局升级
 
-当前 shared-memory layout 10（控制面新增 `auth_fingerprint`）、8 字节帧头、26 位 route generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和 switch，替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，再整体启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；旧 frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
+当前 shared-memory layout 12（控制面 `auth_fingerprint`；registry 槽位直写 pin 计数器
+`direct_writers` 与写者身份；ring 数据容量 = 2 的幂 `DATAROUTER_CHANNEL_SIZE`（默认
+2^19），channel 磁盘布局 = 8B 头 + 数据，环形回绕用掩码）、8 字节帧头、26 位 route
+generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和 switch，
+替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，再整体
+启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；旧
+frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct
+size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
 
 ### 启动顺序
 

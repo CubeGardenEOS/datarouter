@@ -21,9 +21,12 @@ static void test_layout(uint32_t ports) {
     require_int(shm->control.max_ports == ports, "configured ports");
     require_int(shm->control.channel_count == ports * 2U, "configured channels");
     require_int(shm->control.total_size == size, "computed total size");
-    require_int(sizeof(datarouter_channel) == DATAROUTER_CHANNEL_SIZE, "channel is exactly 512KiB");
     require_int(
-        size == sizeof(datarouter_control_plane) + ((size_t)ports * 2U * DATAROUTER_CHANNEL_SIZE),
+        sizeof(datarouter_channel) == DATAROUTER_CHANNEL_SIZE + DATAROUTER_RING_HEADER_SIZE,
+        "channel is 8-byte header plus power-of-two data capacity"
+    );
+    require_int(
+        size == sizeof(datarouter_control_plane) + ((size_t)ports * 2U * sizeof(datarouter_channel)),
         "data plane matches channel count"
     );
 
@@ -34,13 +37,13 @@ static void test_layout(uint32_t ports) {
 
         uint8_t *rx = (uint8_t *)datarouter_rx_channel(shm, i);
         uint8_t *tx = (uint8_t *)datarouter_tx_channel(shm, i);
-        require_int((size_t)(tx - rx) == DATAROUTER_CHANNEL_SIZE, "rx/tx pair contiguous");
+        require_int((size_t)(tx - rx) == sizeof(datarouter_channel), "rx/tx pair contiguous");
     }
 
     uint8_t *base = (uint8_t *)shm + shm->control.data_offset;
-    uint8_t *last = base + ((size_t)shm->control.channel_count - 1U) * DATAROUTER_CHANNEL_SIZE;
+    uint8_t *last = base + ((size_t)shm->control.channel_count - 1U) * sizeof(datarouter_channel);
     require_int(
-        (size_t)(last - base) == ((size_t)ports * 2U - 1U) * DATAROUTER_CHANNEL_SIZE,
+        (size_t)(last - base) == ((size_t)ports * 2U - 1U) * sizeof(datarouter_channel),
         "all channels contiguous"
     );
     require_int(datarouter_rx_channel(shm, ports) == NULL, "slot past configured ports is invalid");

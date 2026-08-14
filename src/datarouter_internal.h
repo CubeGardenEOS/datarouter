@@ -30,7 +30,7 @@ typedef pthread_mutex_t datarouter_mutex;
 
 #define DATAROUTER_VERSION "0.2.0"
 #define DATAROUTER_MAGIC 0x534D4342U
-#define DATAROUTER_LAYOUT_VERSION 10U
+#define DATAROUTER_LAYOUT_VERSION 12U
 #define DATAROUTER_ROUTE_SLOT_BITS 6U
 #define DATAROUTER_ROUTE_SLOT_MASK ((1U << DATAROUTER_ROUTE_SLOT_BITS) - 1U)
 #define DATAROUTER_ROUTE_GENERATION_MASK 0x03ffffffU
@@ -49,6 +49,10 @@ typedef pthread_mutex_t datarouter_mutex;
 #define DATAROUTER_SWITCH_ROUTE_MAX_FRAMES 1024U
 #define DATAROUTER_REGISTRATION_REQUEST_SLOTS 64U
 #define DATAROUTER_SWITCH_IDENTITY_CACHE_NS 10000000ULL
+/* Upper bound a slot release waits for an in-flight direct writer to finish
+ * (write-pin drain). A direct write is a bounded memcpy (microseconds); this
+ * budget only binds the rare case where the target owner dies mid-write. */
+#define DATAROUTER_DIRECT_WRITER_WAIT_NS 500000ULL
 #ifndef DATAROUTER_SWITCH_SPIN_BUDGET_US
 #define DATAROUTER_SWITCH_SPIN_BUDGET_US 200U
 #endif
@@ -87,6 +91,12 @@ typedef struct {
 } datarouter_ring_header;
 
 _Static_assert(sizeof(datarouter_ring_header) == DATAROUTER_RING_HEADER_SIZE, "ring header size mismatch");
+/* The ring index wrap is a mask, so the data capacity must be a power of two.
+ * Default DATAROUTER_CHANNEL_SIZE=524288 (2^19) satisfies this. */
+_Static_assert(
+    (DATAROUTER_RING_CAPACITY & (DATAROUTER_RING_CAPACITY - 1U)) == 0U,
+    "DATAROUTER_RING_CAPACITY must be a power of two for masked indexing"
+);
 
 typedef struct {
     datarouter_ring_header header;
@@ -101,7 +111,20 @@ typedef struct {
     atomic_int pid;
     atomic_uint uid;
     atomic_ullong process_start_id;
+    /* Owner-thread pin counter (recv/touch/drain from the slot owner). The
+     * switch's finalize_release handshake zeroes it only when the owner is
+     * dead, because a dead owner's threads can never unpin. */
     atomic_uint io_users;
+    /* Direct (unsafe) data-plane writer pin counter + last-writer identity.
+     * Kept separate from io_users so a live foreign direct writer is never
+     * mistaken for a stale owner pin: finalize_release drains this counter
+     * while the writer is alive, and only force-zeroes it when the recorded
+     * writer process is dead (crashed mid-write). The one-logical-writer
+     * constraint makes the single identity triplet sufficient. */
+    atomic_uint direct_writers;
+    atomic_int direct_writer_pid;
+    atomic_uint direct_writer_uid;
+    atomic_ullong direct_writer_start_id;
     atomic_ullong last_active_ns;
     atomic_uchar service_name[DATAROUTER_SERVICE_NAME_MAX + 1U];
 } datarouter_registry_entry;
@@ -188,6 +211,10 @@ struct datarouter_port {
     atomic_ullong last_switch_identity_check_ns;
     atomic_uint switch_dead;
     datarouter_mutex tx_mutex;
+    /* Serializes concurrent ring reads in the direct (unsafe) data plane,
+     * where multiple application threads may call datarouter_recv on the
+     * same SPSC RX ring without a reader thread. Process-local. */
+    datarouter_mutex rx_mutex;
     uint8_t *drain_buffer;
     size_t drain_buffer_capacity;
 };
@@ -234,6 +261,10 @@ int datarouter_init_shared_memory_full(
 uint64_t datarouter_auth_fingerprint(const char *token);
 int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_t map_size);
 size_t datarouter_shared_memory_size(uint32_t max_ports);
+/* Process-global data-plane copy strategy ("scalar" or "avx2"), selected once
+ * from DATAROUTER_COPY=scalar|avx2 (default scalar = libc memcpy; avx2 is a
+ * benchmark-only hand-rolled 256-bit loop that measured slower). */
+const char *datarouter_copy_strategy(void);
 uint32_t datarouter_active_max_ports(const datarouter_shared_memory *shm);
 
 void datarouter_ring_reset(datarouter_channel *channel);
