@@ -594,6 +594,10 @@ Python wheel 稳定性：`setup.py` 强制平台 wheel 标签（`py3-none-linux_
 无关但平台相关。验证：`pip wheel ./python` → 全新 venv 安装 → 中性目录跑通
 `pack → send → recv → unpack → stats` 全链路（见 `docs/todo-unsafe-default.md`）。
 
+C# 接入见 `docs/csharp.md`：低层 port API（`datarouter.h`，纯 C 共享库、无需 Rust，
+直接数据面 2 次拷贝）与 frontend API（`datarouter_frontend.h`，Rust staticlib、全功能
+分块/ACK）两条路径的构建配方与 P/Invoke 声明（struct 布局已与 C 核对）。
+
 ### 启动顺序
 
 datarouter 模式下，**必须先启动 `datarouter-switch`**，再启动 Core、Edge Node 或 Python worker。否则 `datarouter_open` 返回 `ERR_PLATFORM`。
