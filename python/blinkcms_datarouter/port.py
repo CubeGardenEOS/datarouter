@@ -110,10 +110,22 @@ class Port:
 
     def _send_fn(self) -> object:
         self._bind_lib()
+        if self._send is None:
+            raise DatarouterError(
+                DATAROUTER_ERR_INTERNAL,
+                "loaded library does not provide datarouter_frontend_send "
+                "(wrong library, or a test fake missing the function)",
+            )
         return self._send
 
     def _recv_fn(self) -> object:
         self._bind_lib()
+        if self._recv is None:
+            raise DatarouterError(
+                DATAROUTER_ERR_INTERNAL,
+                "loaded library does not provide datarouter_frontend_recv "
+                "(wrong library, or a test fake missing the function)",
+            )
         return self._recv
 
     @classmethod

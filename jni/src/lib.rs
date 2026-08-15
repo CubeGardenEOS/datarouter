@@ -50,6 +50,7 @@ struct CachedMethods {
     f_message_type: jfieldID,
     f_flags: jfieldID,
     f_var_data: jfieldID,
+    f_body: jfieldID,
     m_body_unsafe: jmethodID,
     msg_ctor_nocopy: jmethodID,
     msg_ctor_zerocopy: jmethodID,
@@ -99,13 +100,14 @@ fn init_methods(env: &mut JNIEnv) -> Result<CachedMethods, c_int> {
         f_message_type: fid(env, &msg_class, "messageType", "I")?,
         f_flags: fid(env, &msg_class, "flags", "I")?,
         f_var_data: fid(env, &msg_class, "varData", "[B")?,
+        f_body: fid(env, &msg_class, "body", "[B")?,
         m_body_unsafe: mid(env, &msg_class, "bodyUnsafe", "()[B")?,
         msg_ctor_nocopy: mid(env, &msg_class, "<init>", "(II[B[BZ)V")?,
         msg_ctor_zerocopy: mid(
             env,
             &msg_class,
             "<init>",
-            "(II[BLjava/nio/ByteBuffer;)V",
+            "(II[BLjava/nio/ByteBuffer;J)V",
         )?,
         received_ctor: mid(
             env,
@@ -378,6 +380,15 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeOpen
 thread_local! {
     static SEND_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECV_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    // Monotonic per-thread counter of receive-buffer-mutating events (a
+    // consumed frame, or a resize that may have reallocated the buffer).
+    // Zero-copy received messages record the value at receive time; body
+    // access on a mismatching value means the buffer has been overwritten
+    // (or the message is being touched from another thread / after the
+    // receiving thread exited), and `DataRouterMessage#bodyUnsafe` fails
+    // loudly instead of returning the next frame's bytes or dereferencing
+    // a reallocated/freed buffer.
+    static RECV_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[unsafe(no_mangle)]
@@ -396,10 +407,17 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeSend
         let message_type = get_int_field(env, &message, methods.f_message_type)? as u8;
         let flags = get_int_field(env, &message, methods.f_flags)? as u8;
         let vd_object = get_obj_field(env, &message, methods.f_var_data)?;
-        // body goes through the bodyUnsafe() method rather than a raw field
-        // read: a zero-copy received message keeps its body in a direct
-        // ByteBuffer and materializes it on first access.
-        let body_object = call_bytes(env, &message, methods.m_body_unsafe)?;
+        // Fast path: most messages already carry a materialized body array,
+        // so read the backing field directly. Only an unmaterialized
+        // zero-copy message (body == null) goes through bodyUnsafe(), which
+        // materializes it (and fails loudly if the receive buffer has since
+        // been overwritten / the message crossed threads).
+        let body_object = get_obj_field(env, &message, methods.f_body)?;
+        let body_object = if body_object.is_null() {
+            call_bytes(env, &message, methods.m_body_unsafe)?
+        } else {
+            body_object
+        };
         let vd_array = JByteArray::from(vd_object);
         let body_array = JByteArray::from(body_object);
         let vd_len = env
@@ -457,9 +475,13 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeSend
 // Repeatedly receiving from the same peer (the overwhelmingly common
 // single-peer case) then reuses the identical java.lang.String object and
 // skips both the Rust-side name conversion and a JVM string allocation +
-// UTF-8→UTF-16 transcode on every message.
+// UTF-8→UTF-16 transcode on every message. The raw NUL-terminated name is
+// cached alongside it so the hit check is a plain array comparison (no
+// per-receive Vec allocation).
 thread_local! {
-    static SOURCE_CACHE: RefCell<Option<(Vec<u8>, GlobalRef)>> = const { RefCell::new(None) };
+    static SOURCE_CACHE: RefCell<
+        Option<([i8; blinkcms_datarouter::DATAROUTER_SERVICE_NAME_MAX + 1], GlobalRef)>,
+    > = const { RefCell::new(None) };
 }
 
 /// Return a JVM `String` for `info.source`, reusing the cached object when
@@ -468,17 +490,17 @@ fn source_string(
     env: &mut JNIEnv,
     source: &[i8; blinkcms_datarouter::DATAROUTER_SERVICE_NAME_MAX + 1],
 ) -> Result<jobject, c_int> {
+    if let Some((cached_raw, global)) = SOURCE_CACHE.with(|cell| cell.borrow().clone()) {
+        if cached_raw == *source {
+            return Ok(global.as_obj().as_raw());
+        }
+    }
     let bytes: Vec<u8> = source
         .iter()
         .copied()
         .take_while(|byte| *byte != 0)
         .map(|byte| byte as u8)
         .collect();
-    if let Some(cached) = SOURCE_CACHE.with(|cell| cell.borrow().clone()) {
-        if cached.0 == bytes {
-            return Ok(cached.1.as_obj().as_raw());
-        }
-    }
     let java = env
         .new_string(String::from_utf8_lossy(&bytes))
         .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
@@ -486,7 +508,7 @@ fn source_string(
     let global = env
         .new_global_ref(&java)
         .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-    SOURCE_CACHE.with(|cell| *cell.borrow_mut() = Some((bytes, global)));
+    SOURCE_CACHE.with(|cell| *cell.borrow_mut() = Some((*source, global)));
     Ok(raw)
 }
 
@@ -512,9 +534,19 @@ fn receive_impl(
         // buffer reports the required size and keeps the frame for retry.
         let info = loop {
             match lease.frontend.recv_packed(&mut buf, timeout_ms) {
-                Ok(info) => break info,
+                Ok(info) => {
+                    // The frame was copied over the reusable buffer; any
+                    // zero-copy message received earlier on this thread is
+                    // now invalidated.
+                    RECV_EPOCH.with(|cell| cell.set(cell.get() + 1));
+                    break info;
+                }
                 Err(RecvPackedError::BufferTooSmall { required }) => {
                     buf.resize(required, 0);
+                    // The resize may have reallocated the buffer, so even
+                    // without a consumed frame the earlier messages' direct
+                    // views can no longer be trusted. Bump conservatively.
+                    RECV_EPOCH.with(|cell| cell.set(cell.get() + 1));
                 }
                 Err(RecvPackedError::Code(code))
                     if allow_empty == JNI_TRUE
@@ -530,6 +562,7 @@ fn receive_impl(
         if len < protocol::HEADER_SIZE || len > buf.len() {
             return Err(blinkcms_datarouter::DATAROUTER_ERR_PROTOCOL);
         }
+        let epoch = RECV_EPOCH.with(|cell| cell.get());
         let packed = &buf[..len];
         let message_type = packed[0];
         let flags = packed[1];
@@ -562,6 +595,7 @@ fn receive_impl(
                 jvalue { i: flags as jint },
                 jvalue { l: var_data.as_raw() },
                 jvalue { l: body_direct.as_raw() },
+                jvalue { j: epoch as jlong },
             ];
             unsafe {
                 env.new_object_unchecked(
@@ -571,6 +605,8 @@ fn receive_impl(
                 )
             }
             .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?
+            // The message carries `epoch`; bodyUnsafe() compares it against
+            // nativeCurrentReceiveEpoch() when materializing.
         } else {
             let body = env
                 .byte_array_from_slice(&packed[protocol::HEADER_SIZE + vd_len..])
@@ -634,6 +670,19 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeRece
 ) -> jobject {
     run(&mut env, |env| receive_impl(env, id, timeout_millis, allow_empty, true))
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Return the calling thread's current receive-buffer epoch (see
+/// `RECV_EPOCH`). Zero-copy messages record the epoch at receive time and
+/// `DataRouterMessage#bodyUnsafe` compares against this value when
+/// materializing: a mismatch means the receive buffer has since been
+/// overwritten, the message crossed threads, or the receiving thread exited.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterMessage_nativeCurrentReceiveEpoch(
+    mut _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    RECV_EPOCH.with(|cell| cell.get() as jlong)
 }
 
 fn java_stats(env: &mut JNIEnv, id: jlong) -> Result<jobject, c_int> {

@@ -33,13 +33,17 @@ public final class DataRouterFrontend implements AutoCloseable {
 
     /**
      * Zero-copy receive: identical to {@link #receive} except the message
-     * body is a DirectByteBuffer view over the native receive buffer instead
-     * of a freshly allocated byte[]. The view is valid only until the next
-     * receive on the same thread; {@code message.body()} / {@code message
-     * .bodyUnsafe()} materialize the payload into an owned byte[] on first
-     * access. Use this on hot paths that consume the payload before the next
-     * receive (the same contract as the C# binding's preallocated receive
-     * buffer) to avoid a JVM heap allocation per large message.
+     * body is a read-only DirectByteBuffer view over the native receive
+     * buffer instead of a freshly allocated byte[]. The view is valid only
+     * until the next receive on the same thread; {@code message.body()} /
+     * {@code message.bodyUnsafe()} materialize the payload into an owned
+     * byte[] on first access. Accessing the body after the next receive on
+     * the receiving thread (or from a different thread) throws
+     * {@link IllegalStateException} instead of returning stale data. Use this
+     * on hot paths that consume the payload before the next receive (the
+     * same contract as the C# binding's preallocated receive buffer) to
+     * avoid a JVM heap allocation per large message; use {@link #receive}
+     * when messages are queued for later processing.
      */
     public ReceivedDataRouterMessage receiveZeroCopy(Duration timeout) {
         return nativeReceiveZeroCopy(requireHandle(), timeoutMillis(timeout), false);
