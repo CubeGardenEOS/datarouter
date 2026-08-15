@@ -161,7 +161,7 @@ def _configure(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.datarouter_frontend_send.argtypes = [
         ctypes.c_void_p,
         ctypes.c_char_p,
-        ctypes.c_void_p,
+        ctypes.c_char_p,
         ctypes.c_size_t,
         ctypes.c_uint32,
     ]
@@ -169,7 +169,7 @@ def _configure(lib: ctypes.CDLL) -> ctypes.CDLL:
 
     lib.datarouter_frontend_recv.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
         ctypes.POINTER(datarouter_message_info),
         ctypes.c_uint32,

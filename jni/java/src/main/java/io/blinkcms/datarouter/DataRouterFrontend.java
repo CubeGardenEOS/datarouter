@@ -31,6 +31,20 @@ public final class DataRouterFrontend implements AutoCloseable {
         return nativeReceive(requireHandle(), timeoutMillis(timeout), false);
     }
 
+    /**
+     * Zero-copy receive: identical to {@link #receive} except the message
+     * body is a DirectByteBuffer view over the native receive buffer instead
+     * of a freshly allocated byte[]. The view is valid only until the next
+     * receive on the same thread; {@code message.body()} / {@code message
+     * .bodyUnsafe()} materialize the payload into an owned byte[] on first
+     * access. Use this on hot paths that consume the payload before the next
+     * receive (the same contract as the C# binding's preallocated receive
+     * buffer) to avoid a JVM heap allocation per large message.
+     */
+    public ReceivedDataRouterMessage receiveZeroCopy(Duration timeout) {
+        return nativeReceiveZeroCopy(requireHandle(), timeoutMillis(timeout), false);
+    }
+
     public Optional<ReceivedDataRouterMessage> tryReceive() {
         return Optional.ofNullable(nativeReceive(requireHandle(), 1, true));
     }
@@ -70,6 +84,7 @@ public final class DataRouterFrontend implements AutoCloseable {
     private static native long nativeOpen(FrontendOptions options);
     private static native void nativeSend(long handle, String targetService, DataRouterMessage message, long timeoutMillis);
     private static native ReceivedDataRouterMessage nativeReceive(long handle, long timeoutMillis, boolean allowEmpty);
+    private static native ReceivedDataRouterMessage nativeReceiveZeroCopy(long handle, long timeoutMillis, boolean allowEmpty);
     private static native DataRouterStats nativeStats(long handle);
     private static native RegistrySnapshot nativeRegistrySnapshot(long handle);
     private static native DataRouterCompatibility nativeCompatibility();

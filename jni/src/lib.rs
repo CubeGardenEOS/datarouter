@@ -13,10 +13,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use blinkcms_datarouter::frontend::{Frontend, FrontendOptions, RecvPackedError};
 use blinkcms_datarouter::protocol;
-use jni::objects::{JByteArray, JClass, JMethodID, JObject, JString, JValue, ReleaseMode};
+use jni::objects::{GlobalRef, JByteArray, JClass, JFieldID, JMethodID, JObject, JString, JValue, ReleaseMode};
 use jni::signature::{Primitive, ReturnType};
-use jni::sys::{jboolean, jint, jlong, jobject, jvalue, jmethodID, JNI_TRUE};
+use jni::sys::{jboolean, jfieldID, jint, jlong, jobject, jvalue, jmethodID, JNI_TRUE};
 use jni::JNIEnv;
+use std::cell::RefCell;
 
 const JNI_ABI_VERSION: jint = 1;
 const LAYOUT_VERSION: jint = 9;
@@ -25,27 +26,40 @@ const ABI_FINGERPRINT: &str = "9805e860b0e73cda067a1b8b1b64904ab60d3800d6567308b
 const JAVA_EXCEPTION: &str = "io/blinkcms/datarouter/DataRouterException";
 const MAX_TIMEOUT_MILLIS: jlong = i32::MAX as jlong;
 
-/// Resolved-once JNI method IDs for the hot-path message accessors and
-/// constructors.
+/// Resolved-once JNI field/method IDs and class references for the hot-path
+/// message accessors and constructors.
 ///
-/// The `jni` crate's checked `call_method`/`new_object` parse the JVM type
-/// signature with a parser-combinator on EVERY call (~34 µs/call, measured),
-/// which dominates the Java binding's per-message latency and turns large
-/// payloads into a "latency avalanche". Resolving the method IDs once and
-/// calling the unchecked variants drops the per-call cost to the raw JNI
-/// `Call*Method`/`NewObject` price (~0.3 µs). Method IDs stay valid as long
-/// as the referencing class is loaded, which is guaranteed for the lifetime
-/// of the JNI library.
+/// Two kinds of per-call overhead are eliminated here:
+///
+/// 1. The `jni` crate's checked `call_method`/`new_object`/`find_class` parse
+///    the JVM type signature / look up classes on EVERY call (measured
+///    ~34 µs for a signature parse, and `FindClass` on every `new_object`
+///    with a string class name). Resolving the IDs and class references
+///    once and calling the unchecked variants drops each call to the raw
+///    JNI `Get*Field`/`Call*Method`/`NewObject` price.
+/// 2. The send path reads `messageType`/`flags`/`varData` straight from
+///    their backing fields (2×`GetIntField` + 1×`GetObjectField`) instead
+///    of 4 virtual method calls; only the body goes through the
+///    `bodyUnsafe()` method because a zero-copy received message
+///    materializes its body on first access.
+///
+/// Field/method IDs and global class refs stay valid as long as the
+/// referencing classes are loaded, which is guaranteed for the lifetime of
+/// the JNI library.
 struct CachedMethods {
-    msg_message_type: jmethodID,
-    msg_flags: jmethodID,
-    msg_var_data: jmethodID,
-    msg_body: jmethodID,
+    f_message_type: jfieldID,
+    f_flags: jfieldID,
+    f_var_data: jfieldID,
+    m_body_unsafe: jmethodID,
     msg_ctor_nocopy: jmethodID,
+    msg_ctor_zerocopy: jmethodID,
     received_ctor: jmethodID,
+    msg_class: GlobalRef,
+    received_class: GlobalRef,
 }
-// jmethodIDs are plain pointers valid for the JVM's lifetime once resolved;
-// the values are never mutated, so sharing them across threads is safe.
+// jfieldIDs/jmethodIDs are plain pointers valid for the JVM's lifetime once
+// resolved; the values are never mutated. GlobalRef is Send+Sync (Arc over a
+// JVM global ref). Sharing the resolved set across threads is safe.
 unsafe impl Send for CachedMethods {}
 unsafe impl Sync for CachedMethods {}
 
@@ -65,26 +79,42 @@ fn init_methods(env: &mut JNIEnv) -> Result<CachedMethods, c_int> {
     let received_class = env
         .find_class("io/blinkcms/datarouter/ReceivedDataRouterMessage")
         .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-    let mut id = |class: &JClass, name: &str, sig: &str| {
+    fn fid(env: &mut JNIEnv, class: &JClass, name: &str, sig: &str) -> Result<jfieldID, c_int> {
+        env.get_field_id(class, name, sig)
+            .map(|field| field.into_raw())
+            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)
+    }
+    fn mid(env: &mut JNIEnv, class: &JClass, name: &str, sig: &str) -> Result<jmethodID, c_int> {
         env.get_method_id(class, name, sig)
             .map(|method| method.into_raw())
             .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)
-    };
+    }
+    let msg_class_ref = env
+        .new_global_ref(&msg_class)
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+    let received_class_ref = env
+        .new_global_ref(&received_class)
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
     Ok(CachedMethods {
-        msg_message_type: id(&msg_class, "messageType", "()I")?,
-        msg_flags: id(&msg_class, "flags", "()I")?,
-        msg_var_data: id(&msg_class, "varDataUnsafe", "()[B")?,
-        msg_body: id(&msg_class, "bodyUnsafe", "()[B")?,
-        msg_ctor_nocopy: id(
+        f_message_type: fid(env, &msg_class, "messageType", "I")?,
+        f_flags: fid(env, &msg_class, "flags", "I")?,
+        f_var_data: fid(env, &msg_class, "varData", "[B")?,
+        m_body_unsafe: mid(env, &msg_class, "bodyUnsafe", "()[B")?,
+        msg_ctor_nocopy: mid(env, &msg_class, "<init>", "(II[B[BZ)V")?,
+        msg_ctor_zerocopy: mid(
+            env,
             &msg_class,
             "<init>",
-            "(II[B[BZ)V",
+            "(II[BLjava/nio/ByteBuffer;)V",
         )?,
-        received_ctor: id(
+        received_ctor: mid(
+            env,
             &received_class,
             "<init>",
             "(Ljava/lang/String;Lio/blinkcms/datarouter/DataRouterMessage;)V",
         )?,
+        msg_class: msg_class_ref,
+        received_class: received_class_ref,
     })
 }
 
@@ -93,19 +123,6 @@ fn mid(raw: jmethodID) -> Result<JMethodID, c_int> {
         return Err(blinkcms_datarouter::DATAROUTER_ERR_INTERNAL);
     }
     Ok(unsafe { JMethodID::from_raw(raw) })
-}
-
-fn call_int(env: &mut JNIEnv, object: &JObject, raw: jmethodID) -> Result<jint, c_int> {
-    let result = unsafe {
-        env.call_method_unchecked(
-            object,
-            mid(raw)?,
-            ReturnType::Primitive(Primitive::Int),
-            &[],
-        )
-    }
-    .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)?;
-    result.i().map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)
 }
 
 fn call_bytes<'local>(
@@ -124,6 +141,30 @@ fn call_bytes<'local>(
     .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)?
     .l()
     .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)
+}
+
+fn get_int_field(env: &mut JNIEnv, object: &JObject, raw: jfieldID) -> Result<jint, c_int> {
+    if raw.is_null() {
+        return Err(blinkcms_datarouter::DATAROUTER_ERR_INTERNAL);
+    }
+    unsafe { env.get_field_unchecked(object, JFieldID::from_raw(raw), ReturnType::Primitive(Primitive::Int)) }
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)?
+        .i()
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)
+}
+
+fn get_obj_field<'local>(
+    env: &mut JNIEnv<'local>,
+    object: &JObject,
+    raw: jfieldID,
+) -> Result<JObject<'local>, c_int> {
+    if raw.is_null() {
+        return Err(blinkcms_datarouter::DATAROUTER_ERR_INTERNAL);
+    }
+    unsafe { env.get_field_unchecked(object, JFieldID::from_raw(raw), ReturnType::Array) }
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)?
+        .l()
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)
 }
 
 struct Lifecycle {
@@ -352,10 +393,13 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeSend
         let lease = lease(id)?;
         let target = get_string(env, JObject::from(target))?;
         let methods = methods(env)?;
-        let message_type = call_int(env, &message, methods.msg_message_type)? as u8;
-        let flags = call_int(env, &message, methods.msg_flags)? as u8;
-        let vd_object = call_bytes(env, &message, methods.msg_var_data)?;
-        let body_object = call_bytes(env, &message, methods.msg_body)?;
+        let message_type = get_int_field(env, &message, methods.f_message_type)? as u8;
+        let flags = get_int_field(env, &message, methods.f_flags)? as u8;
+        let vd_object = get_obj_field(env, &message, methods.f_var_data)?;
+        // body goes through the bodyUnsafe() method rather than a raw field
+        // read: a zero-copy received message keeps its body in a direct
+        // ByteBuffer and materializes it on first access.
+        let body_object = call_bytes(env, &message, methods.m_body_unsafe)?;
         let vd_array = JByteArray::from(vd_object);
         let body_array = JByteArray::from(body_object);
         let vd_len = env
@@ -409,6 +453,161 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeSend
     });
 }
 
+// Per-thread cache of the last seen source service name as a JVM String.
+// Repeatedly receiving from the same peer (the overwhelmingly common
+// single-peer case) then reuses the identical java.lang.String object and
+// skips both the Rust-side name conversion and a JVM string allocation +
+// UTF-8→UTF-16 transcode on every message.
+thread_local! {
+    static SOURCE_CACHE: RefCell<Option<(Vec<u8>, GlobalRef)>> = const { RefCell::new(None) };
+}
+
+/// Return a JVM `String` for `info.source`, reusing the cached object when
+/// the name matches the previous receive on this thread.
+fn source_string(
+    env: &mut JNIEnv,
+    source: &[i8; blinkcms_datarouter::DATAROUTER_SERVICE_NAME_MAX + 1],
+) -> Result<jobject, c_int> {
+    let bytes: Vec<u8> = source
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .map(|byte| byte as u8)
+        .collect();
+    if let Some(cached) = SOURCE_CACHE.with(|cell| cell.borrow().clone()) {
+        if cached.0 == bytes {
+            return Ok(cached.1.as_obj().as_raw());
+        }
+    }
+    let java = env
+        .new_string(String::from_utf8_lossy(&bytes))
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+    let raw = java.as_raw();
+    let global = env
+        .new_global_ref(&java)
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+    SOURCE_CACHE.with(|cell| *cell.borrow_mut() = Some((bytes, global)));
+    Ok(raw)
+}
+
+fn receive_impl(
+    env: &mut JNIEnv,
+    id: jlong,
+    timeout_millis: jlong,
+    allow_empty: jboolean,
+    zero_copy: bool,
+) -> Result<jobject, c_int> {
+    let lease = lease(id)?;
+    let _receive = lease
+        .owner
+        .receive_lock
+        .lock()
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+    let timeout_ms = duration_millis(timeout_millis)?;
+    let methods = methods(env)?;
+    RECV_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        // recv_packed copies the RX frame straight into `buf` (no
+        // per-message Vec materialization / protocol::unpack); a short
+        // buffer reports the required size and keeps the frame for retry.
+        let info = loop {
+            match lease.frontend.recv_packed(&mut buf, timeout_ms) {
+                Ok(info) => break info,
+                Err(RecvPackedError::BufferTooSmall { required }) => {
+                    buf.resize(required, 0);
+                }
+                Err(RecvPackedError::Code(code))
+                    if allow_empty == JNI_TRUE
+                        && (code == blinkcms_datarouter::DATAROUTER_ERR_TIMEOUT
+                            || code == blinkcms_datarouter::DATAROUTER_ERR_AGAIN) =>
+                {
+                    return Ok(std::ptr::null_mut());
+                }
+                Err(RecvPackedError::Code(code)) => return Err(code),
+            }
+        };
+        let len = info.len;
+        if len < protocol::HEADER_SIZE || len > buf.len() {
+            return Err(blinkcms_datarouter::DATAROUTER_ERR_PROTOCOL);
+        }
+        let packed = &buf[..len];
+        let message_type = packed[0];
+        let flags = packed[1];
+        let vd_len = u16::from_le_bytes([packed[2], packed[3]]) as usize;
+        let b_len = u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]) as usize;
+        if protocol::HEADER_SIZE + vd_len + b_len != len {
+            return Err(blinkcms_datarouter::DATAROUTER_ERR_PROTOCOL);
+        }
+        let source = source_string(env, &info.source)?;
+        let var_data = env
+            .byte_array_from_slice(
+                &packed[protocol::HEADER_SIZE..protocol::HEADER_SIZE + vd_len],
+            )
+            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+        let var_data = JObject::from(var_data);
+        let message = if zero_copy {
+            // Zero-copy body: wrap the tail of the reusable receive buffer in
+            // a DirectByteBuffer. The returned message materializes a byte[]
+            // on first body access; the direct buffer is only valid until
+            // the next receive on this thread (the same contract as C#'s
+            // preallocated receive buffer). No JVM heap array is allocated
+            // for the payload, so large transfers stop paying the JVM's
+            // array zeroing + copy on every receive.
+            let body_ptr = unsafe { buf.as_ptr().add(protocol::HEADER_SIZE + vd_len) } as *mut u8;
+            let body_direct = unsafe { env.new_direct_byte_buffer(body_ptr, b_len) }
+                .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+            let body_direct = JObject::from(body_direct);
+            let args = [
+                jvalue { i: message_type as jint },
+                jvalue { i: flags as jint },
+                jvalue { l: var_data.as_raw() },
+                jvalue { l: body_direct.as_raw() },
+            ];
+            unsafe {
+                env.new_object_unchecked(
+                    &methods.msg_class,
+                    mid(methods.msg_ctor_zerocopy)?,
+                    &args,
+                )
+            }
+            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?
+        } else {
+            let body = env
+                .byte_array_from_slice(&packed[protocol::HEADER_SIZE + vd_len..])
+                .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
+            let body = JObject::from(body);
+            let args = [
+                jvalue { i: message_type as jint },
+                jvalue { i: flags as jint },
+                jvalue { l: var_data.as_raw() },
+                jvalue { l: body.as_raw() },
+                jvalue { z: JNI_TRUE },
+            ];
+            unsafe {
+                env.new_object_unchecked(
+                    &methods.msg_class,
+                    mid(methods.msg_ctor_nocopy)?,
+                    &args,
+                )
+            }
+            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?
+        };
+        let args = [
+            jvalue { l: source },
+            jvalue { l: message.as_raw() },
+        ];
+        unsafe {
+            env.new_object_unchecked(
+                &methods.received_class,
+                mid(methods.received_ctor)?,
+                &args,
+            )
+        }
+        .map(JObject::into_raw)
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeReceive(
     mut env: JNIEnv,
@@ -417,93 +616,24 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeRece
     timeout_millis: jlong,
     allow_empty: jboolean,
 ) -> jobject {
-    run(&mut env, |env| {
-        let lease = lease(id)?;
-        let _receive = lease
-            .owner
-            .receive_lock
-            .lock()
-            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-        let timeout_ms = duration_millis(timeout_millis)?;
-        let methods = methods(env)?;
-        RECV_BUF.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            // recv_packed copies the RX frame straight into `buf` (no
-            // per-message Vec materialization / protocol::unpack); a short
-            // buffer reports the required size and keeps the frame for retry.
-            let info = loop {
-                match lease.frontend.recv_packed(&mut buf, timeout_ms) {
-                    Ok(info) => break info,
-                    Err(RecvPackedError::BufferTooSmall { required }) => {
-                        buf.resize(required, 0);
-                    }
-                    Err(RecvPackedError::Code(code))
-                        if allow_empty == JNI_TRUE
-                            && (code == blinkcms_datarouter::DATAROUTER_ERR_TIMEOUT
-                                || code == blinkcms_datarouter::DATAROUTER_ERR_AGAIN) =>
-                    {
-                        return Ok(std::ptr::null_mut());
-                    }
-                    Err(RecvPackedError::Code(code)) => return Err(code),
-                }
-            };
-            let len = info.len;
-            if len < protocol::HEADER_SIZE || len > buf.len() {
-                return Err(blinkcms_datarouter::DATAROUTER_ERR_PROTOCOL);
-            }
-            let packed = &buf[..len];
-            let message_type = packed[0];
-            let flags = packed[1];
-            let vd_len = u16::from_le_bytes([packed[2], packed[3]]) as usize;
-            let b_len = u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]) as usize;
-            if protocol::HEADER_SIZE + vd_len + b_len != len {
-                return Err(blinkcms_datarouter::DATAROUTER_ERR_PROTOCOL);
-            }
-            let source = source_name(&info.source);
-            let var_data = env
-                .byte_array_from_slice(
-                    &packed[protocol::HEADER_SIZE..protocol::HEADER_SIZE + vd_len],
-                )
-                .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-            let body = env
-                .byte_array_from_slice(&packed[protocol::HEADER_SIZE + vd_len..])
-                .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-            let var_data = JObject::from(var_data);
-            let body = JObject::from(body);
-            let args = [
-                JValue::Int(message_type as jint),
-                JValue::Int(flags as jint),
-                JValue::Object(&var_data),
-                JValue::Object(&body),
-                JValue::Bool(JNI_TRUE),
-            ];
-            let jargs: Vec<jvalue> = args.iter().map(|value| value.as_jni()).collect();
-            let message = unsafe {
-                env.new_object_unchecked(
-                    "io/blinkcms/datarouter/DataRouterMessage",
-                    mid(methods.msg_ctor_nocopy)?,
-                    &jargs,
-                )
-            }
-            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-            let source = env
-                .new_string(source)
-                .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)?;
-            let source = JObject::from(source);
-            let args = [JValue::Object(&source), JValue::Object(&message)];
-            let jargs: Vec<jvalue> = args.iter().map(|value| value.as_jni()).collect();
-            unsafe {
-                env.new_object_unchecked(
-                    "io/blinkcms/datarouter/ReceivedDataRouterMessage",
-                    mid(methods.received_ctor)?,
-                    &jargs,
-                )
-            }
-            .map(JObject::into_raw)
-            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INTERNAL)
-        })
-    })
-    .unwrap_or(std::ptr::null_mut())
+    run(&mut env, |env| receive_impl(env, id, timeout_millis, allow_empty, false))
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Zero-copy receive: like [`Java_io_blinkcms_datarouter_DataRouterFrontend_nativeReceive`]
+/// but the message body is a DirectByteBuffer view over the reusable receive
+/// buffer (valid until the next receive on the same thread; materialized into
+/// a byte[] on first access). See `DataRouterFrontend#receiveZeroCopy`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeReceiveZeroCopy(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+    timeout_millis: jlong,
+    allow_empty: jboolean,
+) -> jobject {
+    run(&mut env, |env| receive_impl(env, id, timeout_millis, allow_empty, true))
+        .unwrap_or(std::ptr::null_mut())
 }
 
 fn java_stats(env: &mut JNIEnv, id: jlong) -> Result<jobject, c_int> {

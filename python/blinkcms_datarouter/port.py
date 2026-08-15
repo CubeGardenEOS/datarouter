@@ -87,6 +87,34 @@ class Port:
         # safe.
         self._recv_buf: ctypes.Array[ctypes.c_uint8] | None = None
         self._recv_capacity = 0
+        # Cache the shared library object and its bound function pointers,
+        # re-binding whenever load_library() returns a different object (tests
+        # patch load_library to inject fakes). The identity check is ~50 ns on
+        # the hot path; the per-call ctypes.cast/slice overhead it removes is
+        # ~1 µs per call. Plus a reusable message-info struct for recv.
+        self._lib: object | None = None
+        self._send: object | None = None
+        self._recv: object | None = None
+        self._info = datarouter_message_info()
+
+    def _bind_lib(self) -> None:
+        """Re-bind both hot-path functions whenever load_library() hands back a
+        different object (tests patch it with fakes). getattr with a None
+        default keeps fakes that only implement one of the two functions
+        working."""
+        lib = load_library()
+        if lib is not self._lib:
+            self._lib = lib
+            self._send = getattr(lib, "datarouter_frontend_send", None)
+            self._recv = getattr(lib, "datarouter_frontend_recv", None)
+
+    def _send_fn(self) -> object:
+        self._bind_lib()
+        return self._send
+
+    def _recv_fn(self) -> object:
+        self._bind_lib()
+        return self._recv
 
     @classmethod
     def open(
@@ -138,16 +166,13 @@ class Port:
         """
         with self._lock:
             self._require_open()
-            lib = load_library()
-            # Zero-copy: c_char_p references the bytes' internal buffer, so
-            # no per-send ctypes copy is made (from_buffer_copy would copy
-            # the whole payload on every call). `data` stays alive for the
-            # duration of the call.
-            buf = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p)
-            rc = lib.datarouter_frontend_send(
+            # Zero-copy: the c_char_p argument type makes ctypes hand the
+            # bytes' internal buffer pointer straight to C (no cast, no
+            # per-send copy). `data` stays alive for the duration of the call.
+            rc = self._send_fn()(
                 self._handle,
                 target.encode("utf-8"),
-                buf,
+                data,
                 len(data),
                 0,  # timeout_ms: 0 = use default (2000ms)
             )
@@ -164,7 +189,6 @@ class Port:
             return self._recv_with_timeout(self.timeout_ms if timeout_ms is None else timeout_ms)
 
     def _recv_with_timeout(self, timeout_ms: int) -> tuple[bytes, str]:
-        lib = load_library()
         capacity = self._recv_capacity
         while True:
             if capacity < _INITIAL_RECV_BUF_SIZE:
@@ -175,10 +199,10 @@ class Port:
                 self._recv_buf = (ctypes.c_uint8 * capacity)()
                 self._recv_capacity = capacity
             out_buf = self._recv_buf
-            info = datarouter_message_info()
-            rc = lib.datarouter_frontend_recv(
+            info = self._info
+            rc = self._recv_fn()(
                 self._handle,
-                ctypes.cast(out_buf, ctypes.c_void_p),
+                out_buf,
                 capacity,
                 ctypes.byref(info),
                 timeout_ms,
