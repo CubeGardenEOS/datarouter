@@ -646,12 +646,40 @@ impl FrontendInner {
     }
 
     pub fn send_frame(&self, target_service: &str, packed: &[u8]) -> Result<(), c_int> {
-        match self.with_port(|port| port.send(target_service, packed))? {
-            Ok(()) => Ok(()),
-            Err(crate::DATAROUTER_ERR_NOT_FOUND) => {
-                self.recover_not_found_and_retry(target_service, packed)
+        // Bounded transient retry: a peer that is mid-registration (its entry
+        // is not yet ACTIVE) or a briefly unavailable port handle would
+        // otherwise surface as a phantom hard error to the caller. ERR_FULL
+        // (ring backpressure) is deliberately NOT retried here - callers are
+        // expected to drain and re-send.
+        let mut transient_retries = 0u32;
+        loop {
+            match self.with_port(|port| port.send(target_service, packed)) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(crate::DATAROUTER_ERR_FULL)) => {
+                    return Err(crate::DATAROUTER_ERR_FULL);
+                }
+                Ok(Err(crate::DATAROUTER_ERR_NOT_FOUND)) => {
+                    match self.recover_not_found_and_retry(target_service, packed) {
+                        Ok(()) => return Ok(()),
+                        Err(crate::DATAROUTER_ERR_NOT_FOUND)
+                            if transient_retries < SEND_TRANSIENT_RETRIES =>
+                        {
+                            transient_retries += 1;
+                            thread::sleep(SEND_TRANSIENT_BACKOFF);
+                        }
+                        Err(code) => return Err(code),
+                    }
+                }
+                Err(_) if transient_retries < SEND_TRANSIENT_RETRIES => {
+                    // Port lock poisoned or handle missing: reopen and retry.
+                    transient_retries += 1;
+                    if self.recover_self_port().is_err() {
+                        thread::sleep(SEND_TRANSIENT_BACKOFF);
+                    }
+                }
+                Ok(Err(code)) => return Err(code),
+                Err(_) => return Err(crate::DATAROUTER_ERR_INTERNAL),
             }
-            Err(code) => Err(code),
         }
     }
 
@@ -668,12 +696,40 @@ impl FrontendInner {
     /// a re-register + retry, while a missing target stays NOT_FOUND.
     #[cfg(feature = "unsafe")]
     pub fn unsafe_send_frame(&self, target_service: &str, data: &[u8]) -> Result<(), c_int> {
-        match self.with_port(|port| port.unsafe_send(target_service, data))? {
-            Ok(()) => Ok(()),
-            Err(crate::DATAROUTER_ERR_NOT_FOUND) => {
-                self.unsafe_recover_not_found_and_retry(target_service, data)
+        // Bounded transient retry, mirroring send_frame: a peer that is
+        // mid-registration (entry not yet ACTIVE) or a briefly unavailable
+        // port handle self-heals instead of surfacing as a phantom hard error
+        // (observed as frame loss when a binding treats a burst of failures
+        // as successful sends). ERR_FULL stays backpressure, never retried.
+        let mut transient_retries = 0u32;
+        loop {
+            match self.with_port(|port| port.unsafe_send(target_service, data)) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(crate::DATAROUTER_ERR_FULL)) => {
+                    return Err(crate::DATAROUTER_ERR_FULL);
+                }
+                Ok(Err(crate::DATAROUTER_ERR_NOT_FOUND)) => {
+                    match self.unsafe_recover_not_found_and_retry(target_service, data) {
+                        Ok(()) => return Ok(()),
+                        Err(crate::DATAROUTER_ERR_NOT_FOUND)
+                            if transient_retries < SEND_TRANSIENT_RETRIES =>
+                        {
+                            transient_retries += 1;
+                            thread::sleep(SEND_TRANSIENT_BACKOFF);
+                        }
+                        Err(code) => return Err(code),
+                    }
+                }
+                Err(_) if transient_retries < SEND_TRANSIENT_RETRIES => {
+                    // Port lock poisoned or handle missing: reopen and retry.
+                    transient_retries += 1;
+                    if self.recover_self_port().is_err() {
+                        thread::sleep(SEND_TRANSIENT_BACKOFF);
+                    }
+                }
+                Ok(Err(code)) => return Err(code),
+                Err(_) => return Err(crate::DATAROUTER_ERR_INTERNAL),
             }
-            Err(code) => Err(code),
         }
     }
 
@@ -839,6 +895,11 @@ impl Drop for Frontend {
 
 const RECOVERY_RETRY_SLEEP: Duration = Duration::from_millis(250);
 const RECOVERY_LOG_INTERVAL_NS: u64 = 5_000_000_000;
+/* Bounded transient-send retry for both data planes: covers the peer
+ * mid-registration window (entry not yet ACTIVE) and transient port-handle
+ * failures. 2000 x 1ms = 2s window; ERR_FULL is never retried here. */
+const SEND_TRANSIENT_RETRIES: u32 = 2000;
+const SEND_TRANSIENT_BACKOFF: Duration = Duration::from_millis(1);
 
 fn spawn_keepalive(inner: Arc<FrontendInner>) -> JoinHandle<()> {
     thread::spawn(move || {

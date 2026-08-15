@@ -1094,8 +1094,21 @@ int datarouter_wait(datarouter_port *port, uint32_t timeout_ms) {
         }
         touch_self(port);
         if (rc != DATAROUTER_OK) {
+            /* The signal wait elapsed (up to 100ms) without a wakeup. Poll
+             * once for a frame that raced the signal (the sender publishes
+             * head before posting the signal, so a poll after a lost signal
+             * still observes the frame), then CONTINUE waiting for the
+             * remaining budget. Returning here would turn a caller's long
+             * timeout (e.g. 5000ms) into a ~100ms false timeout, starving
+             * receivers whose peer starts slowly (observed as phantom frame
+             * loss / registration teardown in cross-process benchmarks). The
+             * next iteration's elapsed check returns TIMEOUT only once the
+             * full timeout has passed. */
             int final_rc = datarouter_poll(port);
-            return final_rc == DATAROUTER_ERR_AGAIN ? rc : final_rc;
+            if (final_rc != DATAROUTER_ERR_AGAIN) {
+                return final_rc;
+            }
+            continue;
         }
     }
 }

@@ -260,6 +260,26 @@ lib/datarouter/build-ipcbench-512k/bench_ipc_multichannel_512k \
 - 4GiB RSS 下，`524288` in-flight 仍严格稳定，但吞吐没有继续随并发增加，说明系统已经进入 CPU/调度平台期。
 - `65536` 和 `131072` 出现极少量 ws send error，错误率远低于 `5%`，按业务口径可接受，但不是无损稳定档。
 
+## 跨进程修复记录（2026-08）
+
+benchmark（`datarouter-benchmark` 仓库）在真实双进程布局下发现并修复了两个
+direct（unsafe）数据面的边角问题：
+
+1. **`datarouter_wait` 假超时**（`src/port.c`）：`datarouter_wait` 在单个
+   ~100ms signal-wait 周期超时后直接返回，把调用方请求的长超时（如 5000ms）
+   变成了 ~100ms 的假超时。对端启动慢时，接收方会提前 bail 并注销自己的 slot，
+   随后 slot 被回收、与后来的注册冲突（表现为跨进程基准里的"丢帧"与
+   NOT_FOUND 级联）。修复：signal-wait 超时后 poll 一次（捕获与信号竞争的帧），
+   若无帧则继续等待剩余预算，只有完整超时才返回 `DATAROUTER_ERR_TIMEOUT`。
+2. **frontend 发送瞬态失败自愈**（`src/frontend.rs`）：`send_frame` /
+   `unsafe_send_frame` 现在对有界次数内的 `NOT_FOUND`（对端注册尚未 ACTIVE）
+   与 port 句柄瞬态故障做内部重试（1ms 退避，上限 2s），而不是暴露为幻影硬错误；
+   `ERR_FULL` 保持背压语义不重试。
+
+回归测试：`cargo test --features unsafe --test direct_plane_multiprocess`
+（真实 switch + portal + core 双进程，错峰启动 + 2000×32KiB 窗口化 one-way，
+无应用侧预热/重试）。
+
 ## Cargo 包
 
 Port 库也可以作为 Cargo 包编译、测试和打包。Cargo 会把 C Port 源码编译为静态 native library，再链接到 Rust crate。

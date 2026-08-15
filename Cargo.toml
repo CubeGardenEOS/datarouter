@@ -80,3 +80,9 @@ harness = false
 name = "ipc_unsafe"
 harness = false
 required-features = ["unsafe"]
+
+[[test]]
+name = "direct_plane_multiprocess"
+path = "tests/direct_plane_multiprocess.rs"
+harness = false
+required-features = ["unsafe"]
