@@ -10,6 +10,31 @@ extern "C" {
 typedef struct datarouter_frontend datarouter_frontend;
 
 #define DATAROUTER_FRONTEND_ABI_VERSION 2U
+#define DATAROUTER_FRONTEND_ABI_VERSION_V3 3U
+#define DATAROUTER_FRONTEND_DATA_PLANE_DIRECT 0U
+#define DATAROUTER_FRONTEND_DATA_PLANE_ROUTED 1U
+
+/* v3 options: v2 fields + auth_token + data_plane. open_v3 validates
+ * options_size == sizeof(datarouter_frontend_options_v3) and abi_version ==
+ * DATAROUTER_FRONTEND_ABI_VERSION_V3. data_plane defaults to DIRECT (the
+ * same direct data plane open_v2 uses); set ROUTED for the switch-routed
+ * plane (reader thread + queue + chunking/ACK/reassembly). */
+typedef struct datarouter_frontend_options_v3 {
+    const char *shm_name;
+    const char *service_name;
+    uint32_t connect_timeout_ms;
+    uint32_t recv_timeout_ms;
+    uint32_t ack_timeout_ms;
+    uint32_t reader_wait_ms;
+    size_t app_queue_capacity;
+    size_t max_message_bytes;
+    size_t max_pending_acks;
+    uint32_t chunk_ttl_ms;
+    size_t max_reassembly_groups;
+    size_t max_reassembly_bytes;
+    const char *auth_token;
+    uint8_t data_plane;
+} datarouter_frontend_options_v3;
 
 typedef struct datarouter_frontend_options {
     const char *shm_name;
@@ -80,7 +105,25 @@ int datarouter_frontend_open_v2(
 );
 /* options_size must equal sizeof(datarouter_frontend_options) and abi_version
  * must equal DATAROUTER_FRONTEND_ABI_VERSION. A mismatch returns
- * DATAROUTER_ERR_PROTOCOL before options is dereferenced. */
+ * DATAROUTER_ERR_PROTOCOL before options is dereferenced.
+ * open_v2 opens the **direct (unsafe) data plane by default** (single-frame
+ * messages ≤ MAX_APP_PAYLOAD, 2 copies); use open_v3 with data_plane ROUTED
+ * for the switch-routed plane. */
+
+int datarouter_frontend_open_v3(
+    const datarouter_frontend_options_v3 *options,
+    size_t options_size,
+    uint32_t abi_version,
+    datarouter_frontend **out
+);
+
+int datarouter_frontend_frame_len(
+    datarouter_frontend *frontend,
+    size_t *out_len
+);
+/* Peek the next RX frame's payload length without consuming it; returns
+ * DATAROUTER_ERR_AGAIN when the RX ring is empty. Use it to size a
+ * datarouter_frontend_recv buffer (direct data plane). */
 
 int datarouter_frontend_send(
     datarouter_frontend *frontend,

@@ -508,13 +508,19 @@ Frontend 默认限制单条完整消息为 `64MiB`、同时重组组数为 `1024
 
 ### unsafe 直接数据面（缺省开启；safe 拷贝模式保留，可用 `--no-default-features` 回退）
 
-crate 缺省开启 `unsafe` Cargo feature（直接指针数据面）：`Frontend::connect_unsafe`
-照常通过 switch 控制面注册，但数据交换不再经过 switch 路由——发送端像 port.c 一样直接对
+crate 缺省开启 `unsafe` Cargo feature（直接指针数据面），**frontend 也缺省使用直接数据面**：
+`Frontend::connect`（Rust）/ `datarouter_frontend_open_v2`（C ABI）即直接面，无需
+`connect_unsafe`（保留为别名）。发送端像 port.c 一样直接对
 共享内存做指针操作，把帧 append 到目标 RX ring 并直接 post 目标 `rx_signal`；switch 仅保留
 控制面（注册/注销/TTL/死进程回收）与控制请求中断。全链路 payload 拷贝从 4 次降到 **2 次**：
 
 1. 发送端 packed 字节 → 目标 RX ring（`datarouter_unsafe_send`）；
 2. RX ring → 接收端应用 buffer（直接 `datarouter_recv`，无 reader 线程、无队列）。
+
+直接面约束：单帧 ≤ `MAX_APP_PAYLOAD`（`send` 超限返回 `PAYLOAD_TOO_LARGE`，无分块/ACK）。
+需要 switch 路由面（>512KiB 分块/ACK/重组/队列）时显式切换：Rust
+`Frontend::connect_routed`，C ABI `datarouter_frontend_open_v3` 的
+`data_plane=ROUTED`（`data_plane=DIRECT` 为缺省）。
 
 ```toml
 # Cargo.toml 使用方（缺省即 unsafe；无需显式 feature）
@@ -594,11 +600,14 @@ Python wheel 稳定性：`setup.py` 强制平台 wheel 标签（`py3-none-linux_
 无关但平台相关。验证：`pip wheel ./python` → 全新 venv 安装 → 中性目录跑通
 `pack → send → recv → unpack → stats` 全链路（见 `docs/todo-unsafe-default.md`）。
 
-C# / C++ 接入见 `docs/csharp.md`：默认用 Rust frontend ABI（`datarouter_frontend.h`，
-分块/ACK/重组/队列/自动 keepalive，与 Python/Java 一致）；低层 port API
-（`datarouter.h`，纯 C 共享库、无需 Rust）是**维护中的可选项**，不建议作为首选，
-仅当明确需要直接数据面（2 次拷贝）性能并接受约束时使用。P/Invoke 实测：边界开销
-~13ns/次可忽略，frontend 路由面比直接面慢 3–11×（差异在数据面本身，非语言绑定），
+C# / C++ / Go 接入见 `docs/csharp.md`（C++ RAII 包装 `include/datarouter_frontend.hpp`
++ `tests/test_frontend_cpp.cpp`；Go 包 `go/datarouter/` + 集成测试）：frontend ABI
+（`datarouter_frontend.h`，Rust staticlib）**缺省即直接数据面**（2 次拷贝 + 自动
+keepalive/NOT_FOUND 恢复/`frame_len` 预取，实测比裸 port API 还快）；需要 switch
+路由面（>512KiB 分块/ACK/重组/队列）时用 `open_v3 data_plane=ROUTED`。低层 port API
+（`datarouter.h`，纯 C 共享库、无需 Rust）是**维护中的可选项**，不建议作为首选。
+P/Invoke 实测：边界开销 ~12ns/次可忽略；frontend 路由面是直接面的 ~8×（差异在数据面
+本身，非语言绑定），
 详见 `docs/benchmark-csharp-2026-08.md`。
 
 ### 启动顺序

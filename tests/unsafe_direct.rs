@@ -67,7 +67,7 @@ fn connect_unsafe(sw: &TestSwitch, service: &str) -> Frontend {
 }
 
 fn connect_normal(sw: &TestSwitch, service: &str) -> Frontend {
-    Frontend::connect(FrontendOptions {
+    Frontend::connect_routed(FrontendOptions {
         shm_name: sw.name.clone(),
         service_name: service.to_owned(),
         connect_timeout_ms: 1000,
@@ -272,4 +272,118 @@ fn unsafe_recv_oversized_frame_is_retained_for_a_larger_buffer() {
         .expect("frame still present");
     assert_eq!(info.len, packed.len());
     assert_eq!(&large[..info.len], &packed[..]);
+}
+
+// ── Frontend 缺省即直接数据面 ────────────────────────────────────────────────
+// `Frontend::connect`（无后缀）自 0.2.x 起缺省为直接（unsafe）数据面：
+// send/recv/recv_packed 直接读写 RX ring（2 次拷贝），路由面需显式
+// `Frontend::connect_routed`。
+
+fn options(sw: &TestSwitch, service: &str) -> FrontendOptions {
+    FrontendOptions {
+        shm_name: sw.name.clone(),
+        service_name: service.to_owned(),
+        connect_timeout_ms: 1000,
+        recv_timeout_ms: 2000,
+        reader_wait_ms: 10,
+        ..FrontendOptions::default()
+    }
+}
+
+#[test]
+fn frontend_connect_defaults_to_direct_plane_round_trip() {
+    let sw = start_switch("frontend-direct");
+    let core = Frontend::connect(options(&sw, "core")).expect("connect core (direct)");
+    let portal = Frontend::connect(options(&sw, "portal")).expect("connect portal (direct)");
+
+    let body = b"frontend direct default".to_vec();
+    let packed = pack_request(&body);
+    portal
+        .send("core", &packed, 2000)
+        .expect("direct send succeeds");
+
+    let mut buf = vec![0u8; 1 << 20];
+    let info = core
+        .recv_packed(&mut buf, 2000)
+        .expect("direct recv_packed");
+    assert_eq!(info.len, packed.len());
+    assert_eq!(&buf[..info.len], &packed[..]);
+    assert_eq!(c_source(&info.source), "portal");
+}
+
+#[test]
+fn frontend_direct_recv_unpacks_into_message() {
+    let sw = start_switch("frontend-direct-recv");
+    let core = Frontend::connect(options(&sw, "core")).expect("connect core (direct)");
+    let portal = Frontend::connect(options(&sw, "portal")).expect("connect portal (direct)");
+
+    let body = b"unpacked via recv()".to_vec();
+    portal
+        .send("core", &pack_request(&body), 2000)
+        .expect("direct send");
+    let message = core.recv(2000).expect("direct recv");
+    assert_eq!(message.source, "portal");
+    assert_eq!(message.message.body, body);
+}
+
+#[test]
+fn frontend_direct_send_rejects_oversized_single_frame() {
+    let sw = start_switch("frontend-direct-oversize");
+    let portal = Frontend::connect(options(&sw, "portal")).expect("connect portal (direct)");
+
+    // > MAX_APP_PAYLOAD（2^19 - 8）在直接数据面没有分块路径：必须报
+    // PAYLOAD_TOO_LARGE，而不是进入路由面。
+    let oversized = pack_request(&vec![0xD1u8; (512 * 1024) + 8]);
+    let rc = portal.send("core", &oversized, 2000);
+    assert!(
+        matches!(rc, Err(blinkcms_datarouter::DATAROUTER_ERR_PAYLOAD_TOO_LARGE)),
+        "direct send must reject > MAX_APP_PAYLOAD, got {rc:?}"
+    );
+}
+
+#[test]
+fn frontend_direct_recv_packed_small_buffer_keeps_frame() {
+    let sw = start_switch("frontend-direct-smallbuf");
+    let core = Frontend::connect(options(&sw, "core")).expect("connect core (direct)");
+    let portal = Frontend::connect(options(&sw, "portal")).expect("connect portal (direct)");
+
+    let packed = pack_request(&vec![0xE2u8; 200 * 1024]);
+    portal.send("core", &packed, 2000).expect("direct send");
+
+    let mut small = vec![0u8; 1024];
+    let rc = core.recv_packed(&mut small, 2000);
+    assert!(
+        matches!(
+            rc,
+            Err(blinkcms_datarouter::frontend::RecvPackedError::BufferTooSmall { required })
+                if required == packed.len()
+        ),
+        "short buffer must report BufferTooSmall with the required length, got {rc:?}"
+    );
+
+    // 帧未被消费：换大缓冲重收成功。
+    let mut large = vec![0u8; 1 << 20];
+    let info = core
+        .recv_packed(&mut large, 2000)
+        .expect("retry with larger buffer");
+    assert_eq!(info.len, packed.len());
+    assert_eq!(&large[..info.len], &packed[..]);
+}
+
+#[test]
+fn frontend_direct_frame_len_peeks_without_consuming() {
+    let sw = start_switch("frontend-direct-frame-len");
+    let core = Frontend::connect(options(&sw, "core")).expect("connect core (direct)");
+    let portal = Frontend::connect(options(&sw, "portal")).expect("connect portal (direct)");
+
+    assert_eq!(core.frame_len().expect("empty peek"), None);
+
+    let packed = pack_request(&vec![0xF4u8; 4096]);
+    portal.send("core", &packed, 2000).expect("direct send");
+    assert_eq!(core.frame_len().expect("peek"), Some(packed.len()));
+
+    let mut buf = vec![0u8; 1 << 20];
+    let info = core.recv_packed(&mut buf, 2000).expect("direct recv");
+    assert_eq!(info.len, packed.len());
+    assert_eq!(core.frame_len().expect("empty after recv"), None);
 }

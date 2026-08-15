@@ -6,6 +6,8 @@ import ctypes
 import threading
 from dataclasses import dataclass
 
+from . import _lib
+
 from ._lib import (
     DATAROUTER_ERR_FULL,
     DATAROUTER_ERR_PAYLOAD_TOO_LARGE,
@@ -15,7 +17,6 @@ from ._lib import (
     _check,
     datarouter_frontend_stats,
     datarouter_message_info,
-    datarouter_options,
     datarouter_registry_snapshot_entry,
     load_library,
 )
@@ -86,10 +87,17 @@ class Port:
         service_name: str,
         shm_name: str = _DEFAULT_SHM.decode(),
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+        data_plane: int = _lib.DATAROUTER_FRONTEND_DATA_PLANE_DIRECT,
+        auth_token: str | None = None,
     ) -> Port:
-        """Open a frontend and log on with the given service name."""
+        """Open a frontend and log on with the given service name.
+
+        `data_plane` selects the direct (unsafe, default, 2 copies) or the
+        routed (safe, switch-routed, 4 copies) plane; `auth_token` is
+        required when the switch runs with `--token`.
+        """
         lib = load_library()
-        opts = datarouter_options(
+        opts = _lib.datarouter_frontend_options_v3(
             shm_name=shm_name.encode("utf-8"),
             service_name=service_name.encode("utf-8"),
             connect_timeout_ms=timeout_ms,
@@ -102,12 +110,14 @@ class Port:
             chunk_ttl_ms=0,
             max_reassembly_groups=0,
             max_reassembly_bytes=0,
+            auth_token=auth_token.encode("utf-8") if auth_token else None,
+            data_plane=data_plane,
         )
         handle = ctypes.c_void_p()
-        rc = lib.datarouter_frontend_open_v2(
+        rc = lib.datarouter_frontend_open_v3(
             ctypes.byref(opts),
             ctypes.sizeof(opts),
-            DATAROUTER_FRONTEND_ABI_VERSION,
+            _lib.DATAROUTER_FRONTEND_ABI_VERSION_V3,
             ctypes.byref(handle),
         )
         _check(rc)

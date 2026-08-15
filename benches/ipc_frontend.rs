@@ -64,7 +64,7 @@ fn connect(name: &str, service: &str) -> Frontend {
             reader_wait_ms: 10,
             ..FrontendOptions::default()
         };
-        match Frontend::connect(options) {
+        match Frontend::connect_routed(options) {
             Ok(frontend) => return frontend,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Err(code) => panic!("connect {service} failed: {code}"),

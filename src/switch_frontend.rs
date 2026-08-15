@@ -756,10 +756,10 @@ mod tests {
             reader_wait_ms: 10,
             ..FrontendOptions::default()
         };
-        let _a = Frontend::connect(options("a")).expect("connect a");
-        let _b = Frontend::connect(options("b")).expect("connect b");
+        let _a = Frontend::connect_routed(options("a")).expect("connect a");
+        let _b = Frontend::connect_routed(options("b")).expect("connect b");
         assert!(matches!(
-            Frontend::connect(options("c")),
+            Frontend::connect_routed(options("c")),
             Err(crate::DATAROUTER_ERR_FULL)
         ));
 
@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(switch.snapshot().expect("snapshot").max_ports, 4);
 
         // A new registration now fits after the graceful capacity expansion.
-        let _c = Frontend::connect(options("c")).expect("connect c after expansion");
+        let _c = Frontend::connect_routed(options("c")).expect("connect c after expansion");
         switch.stop().expect("stop switch");
         cleanup(&name);
     }
@@ -793,7 +793,7 @@ mod tests {
             ..FrontendOptions::default()
         };
         assert_eq!(
-            Frontend::connect(missing)
+            Frontend::connect_routed(missing)
                 .err()
                 .expect("must reject missing token"),
             crate::DATAROUTER_ERR_PERMISSION
@@ -807,7 +807,7 @@ mod tests {
             reader_wait_ms: 10,
             ..FrontendOptions::default()
         };
-        let _core = Frontend::connect(with_token).expect("token opens the switch");
+        let _core = Frontend::connect_routed(with_token).expect("token opens the switch");
         switch.stop().expect("stop switch");
         cleanup(&name);
     }
@@ -831,8 +831,8 @@ mod tests {
             reader_wait_ms: 10,
             ..FrontendOptions::default()
         };
-        let core = Frontend::connect(options("core")).expect("connect core");
-        let portal = Frontend::connect(options("portal")).expect("connect portal");
+        let core = Frontend::connect_routed(options("core")).expect("connect core");
+        let portal = Frontend::connect_routed(options("portal")).expect("connect portal");
 
         // ~300 KiB: above the old 60 KiB cap, below the 512 KiB single-frame
         // limit. Must arrive as one frame (no chunking, no ack handshake).
@@ -892,8 +892,8 @@ mod tests {
             chunk_ttl_ms: 30_000,
             ..FrontendOptions::default()
         };
-        let core = Frontend::connect(options("core")).expect("connect core");
-        let portal = Frontend::connect(options("portal")).expect("connect portal");
+        let core = Frontend::connect_routed(options("core")).expect("connect core");
+        let portal = Frontend::connect_routed(options("portal")).expect("connect portal");
 
         let body_len = 2 * 1024 * 1024; // 2 MiB > 512 KiB => chunked
         let mut msg = protocol::Message::new(protocol::MSG_BUSINESS_REQUEST);
@@ -931,7 +931,7 @@ mod tests {
             ..FrontendOptions::default()
         };
         let core_port = PortFrontend::open(&core_options).expect("open raw core port");
-        let portal = Frontend::connect(FrontendOptions {
+        let portal = Frontend::connect_routed(FrontendOptions {
             shm_name: name.clone(),
             service_name: "portal".to_owned(),
             connect_timeout_ms: 1000,

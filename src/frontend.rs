@@ -31,9 +31,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::protocol;
 
 pub use ffi::{
-    datarouter_frontend, datarouter_frontend_open, datarouter_frontend_options,
-    datarouter_frontend_recv, datarouter_frontend_registry_snapshot, datarouter_frontend_send,
-    datarouter_frontend_stats, datarouter_frontend_stats_snapshot,
+    datarouter_frontend, datarouter_frontend_open, datarouter_frontend_open_v3,
+    datarouter_frontend_options, datarouter_frontend_options_v3, datarouter_frontend_recv,
+    datarouter_frontend_registry_snapshot, datarouter_frontend_send, datarouter_frontend_stats,
+    datarouter_frontend_stats_snapshot, DATAROUTER_FRONTEND_ABI_VERSION,
+    DATAROUTER_FRONTEND_ABI_VERSION_V3, DATAROUTER_FRONTEND_DATA_PLANE_DIRECT,
+    DATAROUTER_FRONTEND_DATA_PLANE_ROUTED,
 };
 pub use options::FrontendOptions;
 
@@ -80,6 +83,9 @@ pub struct FrontendStats {
 
 pub struct FrontendInner {
     port: RwLock<Option<port_frontend::PortFrontend>>,
+    /// `true` when connected in direct (unsafe) data-plane mode: no reader
+    /// thread / queue, `send`/`recv` act on the RX ring directly.
+    pub direct: bool,
     pub options: FrontendOptions,
     pub closing: AtomicBool,
     pub ack_waiters: outbound::AckWaiters,
@@ -116,11 +122,49 @@ pub struct Frontend {
 }
 
 impl Frontend {
+    /// Connect with the **direct (unsafe) data plane by default**: the port
+    /// logs on through the switch's control plane as usual, but **no reader
+    /// thread is spawned** and the data path runs directly against the RX
+    /// ring (2 copies per direction, the switch never touches payload
+    /// bytes). `send`/`recv`/`recv_packed`/`frame_len` work on the direct
+    /// plane for single frames (≤ `MAX_APP_PAYLOAD`); larger messages are
+    /// rejected with `PAYLOAD_TOO_LARGE` (no chunking/ACK on this path).
+    /// The keepalive thread still runs so the registration survives TTL.
+    /// Use [`Frontend::connect_routed`] for the switch-routed data plane
+    /// (reader thread + queue + chunking/ACK/reassembly).
     pub fn connect(options: FrontendOptions) -> Result<Self, c_int> {
+        #[cfg(feature = "unsafe")]
+        {
+            Self::connect_inner(options, true)
+        }
+        #[cfg(not(feature = "unsafe"))]
+        {
+            Self::connect_routed(options)
+        }
+    }
+
+    /// Connect with the routed (switch-copy) data plane: a reader thread
+    /// drains the RX ring into a queue, and `send`/`recv` gain chunking,
+    /// per-chunk ACKs, reassembly, and queue-based flow control (4 copies,
+    /// "safe mode"). Use this when messages can exceed `MAX_APP_PAYLOAD` or
+    /// when the queue semantics are required.
+    pub fn connect_routed(options: FrontendOptions) -> Result<Self, c_int> {
+        Self::connect_inner(options, false)
+    }
+
+    /// Legacy alias for [`Frontend::connect`]: the direct (unsafe) data
+    /// plane is the default since 0.2.x.
+    #[cfg(feature = "unsafe")]
+    pub fn connect_unsafe(options: FrontendOptions) -> Result<Self, c_int> {
+        Self::connect(options)
+    }
+
+    fn connect_inner(options: FrontendOptions, direct: bool) -> Result<Self, c_int> {
         let options = options.normalized()?;
         let port = port_frontend::PortFrontend::open(&options)?;
         let keepalive_interval = keepalive_interval(port.ttl_ms());
         let inner = Arc::new(FrontendInner {
+            direct,
             complete_queue: queue::BoundedQueue::new(options.app_queue_capacity),
             ack_waiters: outbound::AckWaiters::new(options.max_pending_acks),
             buffer_pool: Mutex::new(std::collections::VecDeque::new()),
@@ -134,8 +178,16 @@ impl Frontend {
             ipc_timings: Mutex::new(HashMap::new()),
             options,
         });
-        let reader = inbound::spawn_reader(Arc::clone(&inner));
         let keepalive = spawn_keepalive(Arc::clone(&inner));
+        #[cfg(feature = "unsafe")]
+        if direct {
+            return Ok(Self {
+                inner,
+                reader: Mutex::new(None),
+                keepalive: Mutex::new(Some(keepalive)),
+            });
+        }
+        let reader = inbound::spawn_reader(Arc::clone(&inner));
         Ok(Self {
             inner,
             reader: Mutex::new(Some(reader)),
@@ -143,47 +195,19 @@ impl Frontend {
         })
     }
 
-    /// Connect in direct (unsafe) data-plane mode (default feature; build
-    /// with `--no-default-features` for the safe copy mode). The port logs on through the switch's control plane as
-    /// usual, but **no reader thread is spawned** and the data path uses
-    /// [`unsafe_send`](Self::unsafe_send)/[`unsafe_recv`](Self::unsafe_recv):
-    /// the sender writes straight into the target's RX ring, so the switch
-    /// never touches payload bytes and the full chain costs two copies
-    /// (app -> target RX ring, RX ring -> app buffer). The switch keeps only
-    /// control-plane duties (register/unregister, TTL/dead reaping) plus
-    /// control-request interrupts.
-    ///
-    /// The keepalive thread still runs so the registration survives TTL.
-    /// [`recv`](Self::recv)/[`recv_packed`](Self::recv_packed) are unusable
-    /// here (no queue); use the direct methods below.
-    #[cfg(feature = "unsafe")]
-    pub fn connect_unsafe(options: FrontendOptions) -> Result<Self, c_int> {
-        let options = options.normalized()?;
-        let port = port_frontend::PortFrontend::open(&options)?;
-        let keepalive_interval = keepalive_interval(port.ttl_ms());
-        let inner = Arc::new(FrontendInner {
-            complete_queue: queue::BoundedQueue::new(options.app_queue_capacity),
-            ack_waiters: outbound::AckWaiters::new(options.max_pending_acks),
-            buffer_pool: Mutex::new(std::collections::VecDeque::new()),
-            closing: AtomicBool::new(false),
-            stats: FrontendStats::default(),
-            port: RwLock::new(Some(port)),
-            keepalive_interval,
-            keepalive_wait: Condvar::new(),
-            keepalive_wait_state: Mutex::new(()),
-            #[cfg(debug_assertions)]
-            ipc_timings: Mutex::new(HashMap::new()),
-            options,
-        });
-        let keepalive = spawn_keepalive(Arc::clone(&inner));
-        Ok(Self {
-            inner,
-            reader: Mutex::new(None),
-            keepalive: Mutex::new(Some(keepalive)),
-        })
-    }
-
     pub fn send(&self, target_service: &str, packed: &[u8], timeout_ms: u32) -> Result<(), c_int> {
+        #[cfg(feature = "unsafe")]
+        if self.inner.direct {
+            // Direct data plane: single-frame only, straight into the target
+            // RX ring (2 copies). No chunking/ACK on this path.
+            if packed.is_empty() {
+                return Err(crate::DATAROUTER_ERR_INVALID_ARGUMENT);
+            }
+            if packed.len() > protocol::MAX_APP_PAYLOAD {
+                return Err(crate::DATAROUTER_ERR_PAYLOAD_TOO_LARGE);
+            }
+            return self.unsafe_send(target_service, packed);
+        }
         #[cfg(debug_assertions)]
         let tracked_request_id = self.track_ipc_request_timing(target_service, packed);
         let result = outbound::send(&self.inner, target_service, packed, timeout_ms);
@@ -296,8 +320,53 @@ impl Frontend {
         self.inner.with_port(|port| port.frame_len())?
     }
 
+    /// Direct data plane: read one complete frame straight out of the RX
+    /// ring into `out_buf`, honoring `timeout_ms` (returns `Err(TIMEOUT)` on
+    /// deadline with no frame). `Ok(Err(required))` reports a frame larger
+    /// than `out_buf`: it is **not consumed** — grow the buffer and retry.
+    #[cfg(feature = "unsafe")]
+    fn recv_direct_packed(
+        &self,
+        out_buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<Result<crate::datarouter_message_info, usize>, c_int> {
+        match self.unsafe_recv(out_buf, timeout_ms) {
+            Ok(Some(info)) => Ok(Ok(info)),
+            Ok(None) => Err(crate::DATAROUTER_ERR_TIMEOUT),
+            Err(crate::DATAROUTER_ERR_PAYLOAD_TOO_LARGE) => {
+                let required = self
+                    .frame_len()?
+                    .ok_or(crate::DATAROUTER_ERR_AGAIN)?;
+                Ok(Err(required))
+            }
+            Err(code) => Err(code),
+        }
+    }
+
     pub fn recv(&self, timeout_ms: u32) -> Result<FrontendMessage, c_int> {
         let timeout_ms = options::normalize_timeout(timeout_ms, self.inner.options.recv_timeout_ms);
+        #[cfg(feature = "unsafe")]
+        if self.inner.direct {
+            let mut buf = vec![0u8; 64 * 1024];
+            let (packed, source) = loop {
+                match self.recv_direct_packed(&mut buf, timeout_ms)? {
+                    Ok(info) => break (buf[..info.len].to_vec(), info.source),
+                    Err(required) => {
+                        if required <= buf.len() {
+                            return Err(crate::DATAROUTER_ERR_PROTOCOL);
+                        }
+                        buf.resize(required, 0);
+                    }
+                }
+            };
+            let message = protocol::unpack(&packed)
+                .map_err(|_| crate::DATAROUTER_ERR_PROTOCOL)?;
+            self.report_ipc_response_timing(&message);
+            return Ok(FrontendMessage {
+                source: c_source_to_string(&source),
+                message,
+            });
+        }
         let queued = self.inner.complete_queue.recv(timeout_ms)?;
         let message =
             protocol::unpack(&queued.packed).map_err(|_| crate::DATAROUTER_ERR_PROTOCOL)?;
@@ -315,6 +384,17 @@ impl Frontend {
         timeout_ms: u32,
     ) -> Result<crate::datarouter_message_info, RecvPackedError> {
         let timeout_ms = options::normalize_timeout(timeout_ms, self.inner.options.recv_timeout_ms);
+        #[cfg(feature = "unsafe")]
+        if self.inner.direct {
+            // Direct data plane: read the RX ring straight into the caller's
+            // buffer; a short buffer keeps the frame and reports the required
+            // size (same contract as the queue path).
+            match self.recv_direct_packed(out_buf, timeout_ms) {
+                Ok(Ok(info)) => return Ok(info),
+                Ok(Err(required)) => return Err(RecvPackedError::BufferTooSmall { required }),
+                Err(code) => return Err(RecvPackedError::Code(code)),
+            }
+        }
         let queued = match self
             .inner
             .complete_queue
@@ -965,7 +1045,7 @@ mod tests {
             return;
         };
         let shm_name = switch.shm_name.clone();
-        let _core = Frontend::connect(FrontendOptions {
+        let _core = Frontend::connect_routed(FrontendOptions {
             shm_name: shm_name.clone(),
             service_name: "core".to_owned(),
             connect_timeout_ms: 1000,
@@ -973,7 +1053,7 @@ mod tests {
             ..FrontendOptions::default()
         })
         .expect("connect core frontend");
-        let local = Frontend::connect(FrontendOptions {
+        let local = Frontend::connect_routed(FrontendOptions {
             shm_name,
             service_name: "portal".to_owned(),
             connect_timeout_ms: 1000,
@@ -994,7 +1074,7 @@ mod tests {
                 .with_port(|port| port.test_release_self_slot())
                 .expect("access local port")
                 .expect("release local slot");
-            let occupant = Frontend::connect(FrontendOptions {
+            let occupant = Frontend::connect_routed(FrontendOptions {
                 shm_name: switch.shm_name.clone(),
                 service_name: "occupant".to_owned(),
                 connect_timeout_ms: 1000,
@@ -1039,7 +1119,7 @@ mod tests {
             return;
         };
         let shm_name = switch.shm_name.clone();
-        let core = Frontend::connect(FrontendOptions {
+        let core = Frontend::connect_routed(FrontendOptions {
             shm_name: shm_name.clone(),
             service_name: "core".to_owned(),
             connect_timeout_ms: 1000,
@@ -1047,7 +1127,7 @@ mod tests {
             ..FrontendOptions::default()
         })
         .expect("connect core frontend");
-        let local = Frontend::connect(FrontendOptions {
+        let local = Frontend::connect_routed(FrontendOptions {
             shm_name,
             service_name: "portal".to_owned(),
             connect_timeout_ms: 1000,
@@ -1061,7 +1141,7 @@ mod tests {
             .with_port(|port| port.test_release_self_slot())
             .expect("access local port")
             .expect("release local slot");
-        let _occupant = Frontend::connect(FrontendOptions {
+        let _occupant = Frontend::connect_routed(FrontendOptions {
             shm_name: switch.shm_name.clone(),
             service_name: "occupant".to_owned(),
             connect_timeout_ms: 1000,
@@ -1091,7 +1171,7 @@ mod tests {
             return;
         };
         let shm_name = switch.shm_name.clone();
-        let core = Frontend::connect(FrontendOptions {
+        let core = Frontend::connect_routed(FrontendOptions {
             shm_name: shm_name.clone(),
             service_name: "core".to_owned(),
             connect_timeout_ms: 1000,
@@ -1099,7 +1179,7 @@ mod tests {
             ..FrontendOptions::default()
         })
         .expect("connect core frontend");
-        let local = Frontend::connect(FrontendOptions {
+        let local = Frontend::connect_routed(FrontendOptions {
             shm_name,
             service_name: "portal".to_owned(),
             connect_timeout_ms: 1000,
@@ -1114,7 +1194,7 @@ mod tests {
             .with_port(|port| port.test_release_self_slot())
             .expect("access local port")
             .expect("release local slot");
-        let _occupant = Frontend::connect(FrontendOptions {
+        let _occupant = Frontend::connect_routed(FrontendOptions {
             shm_name: switch.shm_name.clone(),
             service_name: "occupant".to_owned(),
             connect_timeout_ms: 1000,
@@ -1164,8 +1244,8 @@ mod tests {
             reader_wait_ms: 10,
             ..FrontendOptions::default()
         };
-        let core = Frontend::connect(options("core")).expect("connect core frontend");
-        let local = Frontend::connect(options("portal")).expect("connect portal frontend");
+        let core = Frontend::connect_routed(options("core")).expect("connect core frontend");
+        let local = Frontend::connect_routed(options("portal")).expect("connect portal frontend");
 
         switch.restart();
 

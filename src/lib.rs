@@ -11,12 +11,14 @@
 //! # Data plane: `unsafe` direct mode (default) vs safe copy mode
 //!
 //! The crate's default build enables the direct pointer data plane (the
-//! `unsafe` feature, default-on since 0.2.x): `Frontend::connect_unsafe`
-//! registers through the switch's control plane as usual, but
-//! `unsafe_send`/`unsafe_recv` move payload bytes straight between the
+//! `unsafe` feature, default-on since 0.2.x) **and the frontend uses it by
+//! default**: `Frontend::connect` / `datarouter_frontend_open_v2` open the
+//! direct plane, where `send`/`recv` move payload bytes straight between the
 //! application and the target RX ring (2 copies per direction) without
 //! routing them through the switch. The switch keeps only control-plane
 //! duties (register/unregister, TTL/dead reaping).
+//! `Frontend::connect_routed` / `open_v3(data_plane=ROUTED)` select the
+//! switch-routed plane (queue + chunking/ACK/reassembly).
 //! See `docs/benchmark-unsafe-2026-08.md`.
 //!
 //! The legacy switch-routed copy mode (4 copies, "safe mode") is retained

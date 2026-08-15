@@ -22,6 +22,23 @@ class _FakeLib:
         self.recv_timeout_ms: int | None = None
         self.open_options: _lib.datarouter_frontend_options | None = None
 
+    def datarouter_frontend_open_v3(
+        self,
+        _options: object,
+        options_size: int,
+        abi_version: int,
+        _out: object,
+    ) -> int:
+        assert options_size == ctypes.sizeof(_lib.datarouter_frontend_options_v3)
+        assert abi_version == _lib.DATAROUTER_FRONTEND_ABI_VERSION_V3
+        self.open_options = _lib.datarouter_frontend_options_v3.from_buffer_copy(
+            ctypes.string_at(
+                _options,
+                ctypes.sizeof(_lib.datarouter_frontend_options_v3),
+            )
+        )
+        return _lib.DATAROUTER_ERR_BUSY
+
     def datarouter_frontend_open_v2(
         self,
         _options: object,

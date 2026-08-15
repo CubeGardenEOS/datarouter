@@ -14,6 +14,7 @@ include = [
     "build.rs",
     "include/datarouter.h",
     "include/datarouter_frontend.h",
+    "include/datarouter_frontend.hpp",
     "include/datarouter_protocol.h",
     "src/lib.rs",
     "src/logging.rs",

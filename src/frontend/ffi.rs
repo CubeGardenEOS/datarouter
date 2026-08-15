@@ -8,6 +8,14 @@ use super::{Frontend, RecvPackedError};
 
 pub const DATAROUTER_FRONTEND_ABI_VERSION: u32 = 2;
 
+/// ABI version of the v3 options struct ([`datarouter_frontend_options_v3`]).
+pub const DATAROUTER_FRONTEND_ABI_VERSION_V3: u32 = 3;
+
+/// Direct (unsafe) data plane: 2 copies, single-frame messages.
+pub const DATAROUTER_FRONTEND_DATA_PLANE_DIRECT: u8 = 0;
+/// Routed (safe) data plane: switch-routed, queue + chunking/ACK/reassembly.
+pub const DATAROUTER_FRONTEND_DATA_PLANE_ROUTED: u8 = 1;
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct datarouter_frontend_options {
@@ -23,6 +31,28 @@ pub struct datarouter_frontend_options {
     pub chunk_ttl_ms: u32,
     pub max_reassembly_groups: usize,
     pub max_reassembly_bytes: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct datarouter_frontend_options_v3 {
+    pub shm_name: *const c_char,
+    pub service_name: *const c_char,
+    pub connect_timeout_ms: u32,
+    pub recv_timeout_ms: u32,
+    pub ack_timeout_ms: u32,
+    pub reader_wait_ms: u32,
+    pub app_queue_capacity: usize,
+    pub max_message_bytes: usize,
+    pub max_pending_acks: usize,
+    pub chunk_ttl_ms: u32,
+    pub max_reassembly_groups: usize,
+    pub max_reassembly_bytes: usize,
+    /// Optional shared secret; required when the switch runs with `--token`.
+    pub auth_token: *const c_char,
+    /// [`DATAROUTER_FRONTEND_DATA_PLANE_DIRECT`] (default) or
+    /// [`DATAROUTER_FRONTEND_DATA_PLANE_ROUTED`].
+    pub data_plane: u8,
 }
 
 #[repr(C)]
@@ -121,6 +151,79 @@ pub unsafe extern "C" fn datarouter_frontend_open_v2(
                 unsafe { *out = Box::into_raw(handle) };
                 crate::DATAROUTER_OK
             }
+            Err(code) => code,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Open a frontend with the v3 options struct: adds `auth_token` and an
+/// explicit `data_plane` selection (direct is the default, matching v2's
+/// semantics).
+///
+/// # Safety
+/// `out` must be writable. When the size and ABI version match, `options` must
+/// point to a complete readable `datarouter_frontend_options_v3`, and its
+/// strings must be NUL-terminated for this call. `*out` is cleared on every
+/// failure.
+pub unsafe extern "C" fn datarouter_frontend_open_v3(
+    options: *const datarouter_frontend_options_v3,
+    options_size: usize,
+    abi_version: u32,
+    out: *mut *mut datarouter_frontend,
+) -> c_int {
+    ffi_status(|| {
+        if out.is_null() {
+            return crate::DATAROUTER_ERR_INVALID_ARGUMENT;
+        }
+        unsafe { *out = ptr::null_mut() };
+        if options.is_null()
+            || options_size != std::mem::size_of::<datarouter_frontend_options_v3>()
+            || abi_version != DATAROUTER_FRONTEND_ABI_VERSION_V3
+        {
+            return crate::DATAROUTER_ERR_PROTOCOL;
+        }
+        let options = match unsafe { frontend_options_from_c_v3(options) } {
+            Ok(options) => options,
+            Err(code) => return code,
+        };
+        let frontend = match options.1 {
+            DATAROUTER_FRONTEND_DATA_PLANE_DIRECT => Frontend::connect(options.0),
+            DATAROUTER_FRONTEND_DATA_PLANE_ROUTED => Frontend::connect_routed(options.0),
+            _ => return crate::DATAROUTER_ERR_INVALID_ARGUMENT,
+        };
+        match frontend {
+            Ok(frontend) => {
+                let handle = Box::new(datarouter_frontend { frontend });
+                unsafe { *out = Box::into_raw(handle) };
+                crate::DATAROUTER_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Peek the next RX frame's payload length without consuming it.
+/// Returns `DATAROUTER_ERR_AGAIN` when the RX ring is empty. Useful to size a
+/// `datarouter_frontend_recv` buffer before receiving (direct data plane).
+///
+/// # Safety
+/// `frontend` and `out_len` must be valid. Close must not run concurrently.
+pub unsafe extern "C" fn datarouter_frontend_frame_len(
+    frontend: *mut datarouter_frontend,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        if frontend.is_null() || out_len.is_null() {
+            return crate::DATAROUTER_ERR_INVALID_ARGUMENT;
+        }
+        match unsafe { &*frontend }.frontend.frame_len() {
+            Ok(Some(len)) => {
+                unsafe { *out_len = len };
+                crate::DATAROUTER_OK
+            }
+            Ok(None) => crate::DATAROUTER_ERR_AGAIN,
             Err(code) => code,
         }
     })
@@ -318,6 +421,34 @@ unsafe fn frontend_options_from_c(
         max_reassembly_groups: options.max_reassembly_groups,
         max_reassembly_bytes: options.max_reassembly_bytes,
     })
+}
+
+/// `(options, data_plane)` from the v3 struct.
+unsafe fn frontend_options_from_c_v3(
+    options: *const datarouter_frontend_options_v3,
+) -> Result<(FrontendOptions, u8), c_int> {
+    let options = unsafe { *options };
+    let auth_token = unsafe { read_c_string(options.auth_token)? };
+    let base = FrontendOptions {
+        shm_name: unsafe { read_c_string(options.shm_name)? },
+        service_name: unsafe { read_c_string(options.service_name)? },
+        auth_token: if auth_token.is_empty() {
+            None
+        } else {
+            Some(auth_token)
+        },
+        connect_timeout_ms: options.connect_timeout_ms,
+        recv_timeout_ms: options.recv_timeout_ms,
+        ack_timeout_ms: options.ack_timeout_ms,
+        reader_wait_ms: options.reader_wait_ms,
+        app_queue_capacity: options.app_queue_capacity,
+        max_message_bytes: options.max_message_bytes,
+        max_pending_acks: options.max_pending_acks,
+        chunk_ttl_ms: options.chunk_ttl_ms,
+        max_reassembly_groups: options.max_reassembly_groups,
+        max_reassembly_bytes: options.max_reassembly_bytes,
+    };
+    Ok((base, options.data_plane))
 }
 
 #[cfg(test)]

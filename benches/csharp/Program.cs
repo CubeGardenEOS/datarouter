@@ -56,6 +56,18 @@ internal static class Native
         public UIntPtr MaxReassemblyBytes;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FrontendOptionsV3 // size=96 (x86-64): v2 + auth_token(8) + data_plane(1)+pad
+    {
+        public FrontendOptions Base;
+        public IntPtr AuthToken;
+        public byte DataPlane;
+    }
+
+    public const uint FrontendAbiVersionV3 = 3;
+    public const byte DataPlaneDirect = 0;
+    public const byte DataPlaneRouted = 1;
+
     [DllImport("__datarouter", EntryPoint = "datarouter_version", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr datarouter_version();
 
@@ -93,6 +105,10 @@ internal static class Native
 
     [DllImport("__datarouter", EntryPoint = "datarouter_frontend_open_v2", CallingConvention = CallingConvention.Cdecl)]
     public static extern int datarouter_frontend_open_v2(ref FrontendOptions options,
+        UIntPtr optionsSize, uint abiVersion, out IntPtr frontend);
+
+    [DllImport("__datarouter", EntryPoint = "datarouter_frontend_open_v3", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int datarouter_frontend_open_v3(ref FrontendOptionsV3 options,
         UIntPtr optionsSize, uint abiVersion, out IntPtr frontend);
 
     [DllImport("__datarouter", EntryPoint = "datarouter_frontend_send", CallingConvention = CallingConvention.Cdecl)]
@@ -157,10 +173,16 @@ internal static class Program
             a.Run();
         }
         Console.WriteLine();
-        Console.WriteLine("=== Rust frontend ABI（switch 路由，4 次拷贝 + reader/队列）===");
-        using (var b = new FrontendBench(shm, sizes, iters, warmup))
+        Console.WriteLine("=== Rust frontend ABI（直接数据面，缺省；open_v2/v3-direct）===");
+        using (var b = new FrontendBench(shm, sizes, iters, warmup, Native.DataPlaneDirect))
         {
             b.Run();
+        }
+        Console.WriteLine();
+        Console.WriteLine("=== Rust frontend ABI（路由数据面，open_v3 data_plane=ROUTED）===");
+        using (var b2 = new FrontendBench(shm, sizes, iters, warmup, Native.DataPlaneRouted))
+        {
+            b2.Run();
         }
 
         switchProc.Kill();
@@ -309,44 +331,68 @@ internal sealed class PortApiBench : IDisposable
     }
 }
 
-// 路径 B：Rust frontend ABI —— frontend_open_v2 + frontend_send/recv（reader 线程 + 队列）。
+// 路径 B：Rust frontend ABI —— data_plane 直接（缺省）或路由（v3 opt-in）。
 internal sealed class FrontendBench : IDisposable
 {
     private readonly string _shm;
     private readonly int[] _sizes;
     private readonly int[] _iters;
     private readonly int _warmup;
+    private readonly byte _dataPlane;
     private readonly IntPtr _sender, _receiver;
     private readonly byte[] _recvBuf = new byte[1024 * 1024];
 
-    public FrontendBench(string shm, int[] sizes, int[] iters, int warmup)
+    public FrontendBench(string shm, int[] sizes, int[] iters, int warmup, byte dataPlane)
     {
-        _shm = shm; _sizes = sizes; _iters = iters; _warmup = warmup;
+        _shm = shm; _sizes = sizes; _iters = iters; _warmup = warmup; _dataPlane = dataPlane;
         _sender = Open("bench_sender");
         _receiver = Open("bench_receiver");
     }
 
     private IntPtr Open(string service)
     {
-        var opts = new Native.FrontendOptions();
-        var shmPtr = Marshal.StringToCoTaskMemUTF8(_shm);
-        var svcPtr = Marshal.StringToCoTaskMemUTF8(service);
+        if (_dataPlane == Native.DataPlaneDirect)
+        {
+            var opts = new Native.FrontendOptions();
+            var shmPtr = Marshal.StringToCoTaskMemUTF8(_shm);
+            var svcPtr = Marshal.StringToCoTaskMemUTF8(service);
+            try
+            {
+                opts.ShmName = shmPtr;
+                opts.ServiceName = svcPtr;
+                opts.ConnectTimeoutMs = 5000;
+                opts.RecvTimeoutMs = 5000;
+                Program.Check(Native.datarouter_frontend_open_v2(ref opts,
+                    (UIntPtr)Marshal.SizeOf<Native.FrontendOptions>(),
+                    Native.FrontendAbiVersion, out var frontend));
+                return frontend;
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(shmPtr);
+                Marshal.FreeCoTaskMem(svcPtr);
+            }
+        }
+        var v3 = new Native.FrontendOptionsV3();
+        var shmPtr3 = Marshal.StringToCoTaskMemUTF8(_shm);
+        var svcPtr3 = Marshal.StringToCoTaskMemUTF8(service);
         try
         {
-            opts.ShmName = shmPtr;
-            opts.ServiceName = svcPtr;
-            opts.ConnectTimeoutMs = 5000;
-            opts.RecvTimeoutMs = 5000;
-            // 其余 0 -> frontend 内部归一化为缺省（max_message_bytes=64MiB 等）
-            Program.Check(Native.datarouter_frontend_open_v2(ref opts,
-                (UIntPtr)Marshal.SizeOf<Native.FrontendOptions>(),
-                Native.FrontendAbiVersion, out var frontend));
+            v3.Base.ShmName = shmPtr3;
+            v3.Base.ServiceName = svcPtr3;
+            v3.Base.ConnectTimeoutMs = 5000;
+            v3.Base.RecvTimeoutMs = 5000;
+            v3.AuthToken = IntPtr.Zero;
+            v3.DataPlane = _dataPlane;
+            Program.Check(Native.datarouter_frontend_open_v3(ref v3,
+                (UIntPtr)Marshal.SizeOf<Native.FrontendOptionsV3>(),
+                Native.FrontendAbiVersionV3, out var frontend));
             return frontend;
         }
         finally
         {
-            Marshal.FreeCoTaskMem(shmPtr);
-            Marshal.FreeCoTaskMem(svcPtr);
+            Marshal.FreeCoTaskMem(shmPtr3);
+            Marshal.FreeCoTaskMem(svcPtr3);
         }
     }
 

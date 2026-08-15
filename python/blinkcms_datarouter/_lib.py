@@ -51,6 +51,30 @@ class datarouter_frontend_options(ctypes.Structure):
 datarouter_options = datarouter_frontend_options
 
 
+class datarouter_frontend_options_v3(ctypes.Structure):
+    _fields_ = [
+        ("shm_name", ctypes.c_char_p),
+        ("service_name", ctypes.c_char_p),
+        ("connect_timeout_ms", ctypes.c_uint32),
+        ("recv_timeout_ms", ctypes.c_uint32),
+        ("ack_timeout_ms", ctypes.c_uint32),
+        ("reader_wait_ms", ctypes.c_uint32),
+        ("app_queue_capacity", ctypes.c_size_t),
+        ("max_message_bytes", ctypes.c_size_t),
+        ("max_pending_acks", ctypes.c_size_t),
+        ("chunk_ttl_ms", ctypes.c_uint32),
+        ("max_reassembly_groups", ctypes.c_size_t),
+        ("max_reassembly_bytes", ctypes.c_size_t),
+        ("auth_token", ctypes.c_char_p),
+        ("data_plane", ctypes.c_uint8),
+    ]
+
+
+DATAROUTER_FRONTEND_ABI_VERSION_V3 = 3
+DATAROUTER_FRONTEND_DATA_PLANE_DIRECT = 0
+DATAROUTER_FRONTEND_DATA_PLANE_ROUTED = 1
+
+
 class datarouter_message_info(ctypes.Structure):
     _fields_ = [
         ("source", ctypes.c_char * 32),
@@ -122,6 +146,17 @@ def _configure(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     lib.datarouter_frontend_open_v2.restype = ctypes.c_int
+
+    lib.datarouter_frontend_open_v3.argtypes = [
+        ctypes.POINTER(datarouter_frontend_options_v3),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.datarouter_frontend_open_v3.restype = ctypes.c_int
+
+    lib.datarouter_frontend_frame_len.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    lib.datarouter_frontend_frame_len.restype = ctypes.c_int
 
     lib.datarouter_frontend_send.argtypes = [
         ctypes.c_void_p,

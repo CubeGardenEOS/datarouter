@@ -76,7 +76,7 @@ fn connect_once(options: &FrontendOptions, unsafe_mode: bool) -> Result<Frontend
     if unsafe_mode {
         Frontend::connect_unsafe(options.clone())
     } else {
-        Frontend::connect(options.clone())
+        Frontend::connect_routed(options.clone())
     }
 }
 
@@ -85,7 +85,7 @@ fn connect_once(options: &FrontendOptions, unsafe_mode: bool) -> Result<Frontend
     if unsafe_mode {
         panic!("unsafe mode requires --features unsafe");
     }
-    Frontend::connect(options.clone())
+    Frontend::connect_routed(options.clone())
 }
 
 fn pack_message(payload: &[u8]) -> Vec<u8> {
