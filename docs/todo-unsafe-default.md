@@ -161,6 +161,13 @@ AVX-512 机器（Zen 4/Intel）上评估，只需新增 `copy_avx512` 内核
   构建 wheel 后在全新 venv 安装并跑通全链路。
 - **已知残余**：运行时 per-shm 模式强制（§1 layout 13）、§2 排他写者规则、§6 可观测性
   仍未实现（本清单后续阶段）。
+- **C#/C++ 基准（2026-08）**：新增 `benches/csharp/`（dotnet 8 P/Invoke 基准：低层
+  port API vs Rust frontend ABI）+ `docs/benchmark-csharp-2026-08.md`。实测 P/Invoke
+  边界 ~13ns/次可忽略；frontend 路由面比直接面慢 3–11×（数据面本身，非语言绑定）。
+  选型建议：默认 Rust frontend ABI，低层 port API 为维护中的可选项（已写入
+  `docs/csharp.md` §选型建议/§6，含 C++）。**已知缺口**：`Frontend::connect_unsafe`
+  无 C ABI 导出——后续可为 frontend 增加 unsafe 直接面 C 导出（frontend ABI v3），
+  让 C#/C++/Python 兼得直接面性能与 frontend 正确性（keepalive/恢复/校验）。
 
 ## 已知的既有问题（非本次引入，未修）
 

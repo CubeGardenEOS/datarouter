@@ -8,3 +8,5 @@
 **/__pycache__/
 /python/build/
 *.egg-info/
+/benches/csharp/bin/
+/benches/csharp/obj/

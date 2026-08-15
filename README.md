@@ -594,9 +594,12 @@ Python wheel 稳定性：`setup.py` 强制平台 wheel 标签（`py3-none-linux_
 无关但平台相关。验证：`pip wheel ./python` → 全新 venv 安装 → 中性目录跑通
 `pack → send → recv → unpack → stats` 全链路（见 `docs/todo-unsafe-default.md`）。
 
-C# 接入见 `docs/csharp.md`：低层 port API（`datarouter.h`，纯 C 共享库、无需 Rust，
-直接数据面 2 次拷贝）与 frontend API（`datarouter_frontend.h`，Rust staticlib、全功能
-分块/ACK）两条路径的构建配方与 P/Invoke 声明（struct 布局已与 C 核对）。
+C# / C++ 接入见 `docs/csharp.md`：默认用 Rust frontend ABI（`datarouter_frontend.h`，
+分块/ACK/重组/队列/自动 keepalive，与 Python/Java 一致）；低层 port API
+（`datarouter.h`，纯 C 共享库、无需 Rust）是**维护中的可选项**，不建议作为首选，
+仅当明确需要直接数据面（2 次拷贝）性能并接受约束时使用。P/Invoke 实测：边界开销
+~13ns/次可忽略，frontend 路由面比直接面慢 3–11×（差异在数据面本身，非语言绑定），
+详见 `docs/benchmark-csharp-2026-08.md`。
 
 ### 启动顺序
 

@@ -17,7 +17,27 @@ ABI v2），直接数据面只是**多导出** `datarouter_unsafe_send` 符号�
 | 路径 | 数据面 | 拷贝数 | 需要 Rust？ | 功能 |
 |---|---|---|---|---|
 | A. 低层 port API（`datarouter.h`） | 直接（unsafe） | 2 | **否**（纯 C） | 单帧 ≤ 512KiB，无分块/ACK；发送端自己 keepalive |
-| B. frontend API（`datarouter_frontend.h`） | switch 路由 | 4 | 是（Rust staticlib） | 分块+逐片 ACK、重组、队列、自动 keepalive |
+| B. frontend API（`datarouter_frontend.h`） | switch 路由 | 4 | 是（Rust staticlib） | 分块+逐片 ACK、重组、队列、自动 keepalive、NOT_FOUND 恢复 |
+
+### 选型建议（重要）
+
+**默认使用路径 B（Rust frontend ABI）**，与 Python/Java/Rust 绑定行为一致。
+**不建议直接使用低层 port API（路径 A）作为首选**——它是维护中的可选项，
+保留给明确需要直接数据面（2 拷贝）性能并接受其约束的场景。理由：
+
+- 无分块/ACK、无重组、无应用队列：>512KiB 消息无法传输，ring 满直接 `ERR_FULL`；
+- **无自动 keepalive**：必须自行周期调用 `datarouter_touch`，否则 TTL 后 slot 被回收；
+- 无 NOT_FOUND/注册恢复逻辑（Rust frontend 内建自愈）；
+- SPSC 单写者约束：同一目标 ring 只能有一个逻辑写者，混用 `datarouter_send` 与
+  `datarouter_unsafe_send` 即双写者竞态；
+- 无协议校验：`unsafe_send` 原样写帧，错误 wire 数据直接进对方 RX ring。
+
+性能实测（同 harness 对比，`docs/benchmark-csharp-2026-08.md`）：frontend（路由面）
+比 port API（直接面）慢 3–11×，但差异**来自数据面本身**（4 次拷贝 + reader 线程/队列），
+不是语言边界——P/Invoke 开销仅 ~13ns/次，Rust 原生 safe vs unsafe 同样是 7× 量级。
+若最终选择路径 A，用 blittable P/Invoke 结构体（见 §5）并自行实现 keepalive。
+
+C++ 接入同一套 C ABI：默认同样用路径 B（Rust frontend），低层 port API 的警告同上。
 
 ## 1. 构建 C# 要链接的共享库
 
@@ -216,3 +236,31 @@ static class Program
 9. **布局升级**：layout/ABI 变更（layout 13+）时，C# 侧 `Options`/`MessageInfo` 等
    P/Invoke 结构体必须与 C 头文件同步；用 `tests/abi_compat.rs` /
    `python/tests/test_native_abi.py` 相同的思路在 C# 侧钉扎 struct size。
+
+## 5. 性能：P/Invoke 边界与数据面选型
+
+实测见 `docs/benchmark-csharp-2026-08.md`（同 harness 对比，可复现）。要点：
+
+- **P/Invoke 边界 ≈ 13ns/次**，相对 µs 级消息处理可忽略。
+- 直接面（路径 A）vs 路由面（路径 B）：64B p50 6.9µs vs 24.0µs；300KiB 32.8µs vs
+  292.6µs（3–11×）。差距来自数据面（拷贝数 + reader 线程/队列），不是语言绑定——
+  Rust 原生 safe vs unsafe 也是 7× 量级。
+- C# vs 原生 Rust：带宽受限（大帧）≈ 1.1×，几乎无差；延迟受限（小帧）≈ 2×。
+- **blittable 结构体**：`datarouter_message_info` 用 `fixed byte Source[32]` 代替
+  `byte[]` 字段（`[MarshalAs(UnmanagedType.ByValArray)]` 会让结构体非 blittable，
+  每次调用额外拷贝）。已核对布局一致（40B），可安全替换；`benches/csharp/Program.cs`
+  即 blittable 版。
+
+## 6. C++ 支持
+
+C++ 与 C# 消费同一 C ABI：`#include "datarouter_frontend.h"` 直接链共享库即可
+（`extern "C"` 已包装）。选型与警告同 C#：**默认用 Rust frontend ABI**（路径 B），
+低层 port API（路径 A）是维护中的可选项，不建议作为首选（无 keepalive/分块/ACK/队列/
+恢复，SPSC 单写者约束）。C++ 侧直接用 `datarouter_frontend_open_v2` 返回的不透明
+句柄；struct 布局见 §2（`datarouter_frontend_options` 80B、`datarouter_message_info`
+40B，x86-64，可直接 `reinterpret_cast` 对齐）。
+
+> 已知缺口：Rust 侧 `Frontend::connect_unsafe`（直接面 + frontend 正确性兼得）目前
+> 没有 C ABI 导出；C#/C++/Python 要直接面只能走低层 port API。后续可给 frontend
+> 增加 `open_v2_unsafe`/`unsafe_send`/`unsafe_recv`/`frame_len` 的 C 导出（frontend
+> ABI v3，向后兼容），让所有绑定都能拿到「直接面 + 自动 keepalive/恢复/校验」。
