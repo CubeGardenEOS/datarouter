@@ -122,7 +122,7 @@ def tlv_read_bytes(var_data: bytes, tag: int) -> Optional[bytes]:
         )
         if rc != DATAROUTER_OK:
             return None
-        return bytes(buf[: out_len.value])
+        return ctypes.string_at(ctypes.addressof(buf), out_len.value)
     finally:
         lib.datarouter_msg_free(cmsg)
 
@@ -165,14 +165,16 @@ def _msg_to_python(cmsg: ctypes.c_void_p, lib: ctypes.CDLL) -> Message:
     if vd_len > 0:
         vd_ptr = lib.datarouter_msg_var_data(cmsg)
         if vd_ptr:
-            var_data = bytes(vd_ptr[:vd_len])
+            # string_at, not vd_ptr[:vd_len] (ctypes pointer slicing is a
+            # Python-level per-element copy, ~24 ns/byte).
+            var_data = ctypes.string_at(vd_ptr, vd_len)
 
     b_len = lib.datarouter_msg_body_len(cmsg)
     body = b""
     if b_len > 0:
         b_ptr = lib.datarouter_msg_body(cmsg)
         if b_ptr:
-            body = bytes(b_ptr[:b_len])
+            body = ctypes.string_at(b_ptr, b_len)
 
     return Message(message_type=msg_type, flags=flags, var_data=var_data, body=body)
 
@@ -205,7 +207,9 @@ def pack(msg: Message) -> bytes:
             ctypes.byref(out_len),
         )
         _check(rc)
-        return bytes(out_buf[: out_len.value])
+        # string_at, not bytes(out_buf[:out_len]): ctypes array slicing is a
+        # per-element Python loop (~24 ns/byte).
+        return ctypes.string_at(ctypes.addressof(out_buf), out_len.value)
     finally:
         lib.datarouter_msg_free(cmsg)
 
@@ -359,4 +363,6 @@ def _pack_cmsg(cmsg: ctypes.c_void_p, lib: ctypes.CDLL) -> bytes:
         ctypes.byref(out_len),
     )
     _check(rc)
-    return bytes(out_buf[: out_len.value])
+    # string_at, not bytes(out_buf[:out_len]): ctypes array slicing is a
+    # per-element Python loop (~24 ns/byte).
+    return ctypes.string_at(ctypes.addressof(out_buf), out_len.value)

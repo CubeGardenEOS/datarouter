@@ -80,6 +80,13 @@ class Port:
         self.timeout_ms = timeout_ms
         self._closed = False
         self._lock = threading.RLock()
+        # Reusable receive buffer: grown on demand and retained across recv
+        # calls so steady-state reception performs no per-message allocation
+        # (a fresh ctypes array is zeroed on every call, which is expensive
+        # for large payloads). Guarded by _lock, so one buffer per Port is
+        # safe.
+        self._recv_buf: ctypes.Array[ctypes.c_uint8] | None = None
+        self._recv_capacity = 0
 
     @classmethod
     def open(
@@ -132,11 +139,15 @@ class Port:
         with self._lock:
             self._require_open()
             lib = load_library()
-            buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+            # Zero-copy: c_char_p references the bytes' internal buffer, so
+            # no per-send ctypes copy is made (from_buffer_copy would copy
+            # the whole payload on every call). `data` stays alive for the
+            # duration of the call.
+            buf = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p)
             rc = lib.datarouter_frontend_send(
                 self._handle,
                 target.encode("utf-8"),
-                ctypes.cast(buf, ctypes.c_void_p),
+                buf,
                 len(data),
                 0,  # timeout_ms: 0 = use default (2000ms)
             )
@@ -154,9 +165,16 @@ class Port:
 
     def _recv_with_timeout(self, timeout_ms: int) -> tuple[bytes, str]:
         lib = load_library()
-        capacity = _INITIAL_RECV_BUF_SIZE
+        capacity = self._recv_capacity
         while True:
-            out_buf = (ctypes.c_uint8 * capacity)()
+            if capacity < _INITIAL_RECV_BUF_SIZE:
+                capacity = _INITIAL_RECV_BUF_SIZE
+            if self._recv_buf is None or capacity > self._recv_capacity:
+                # Grow the cached buffer (zeroed allocation) only when a
+                # larger message is seen; steady-state recv reuses it.
+                self._recv_buf = (ctypes.c_uint8 * capacity)()
+                self._recv_capacity = capacity
+            out_buf = self._recv_buf
             info = datarouter_message_info()
             rc = lib.datarouter_frontend_recv(
                 self._handle,
@@ -181,7 +199,10 @@ class Port:
                     "received length exceeds buffer capacity",
                 )
             source = info.source.decode("utf-8", "replace").rstrip("\x00")
-            return bytes(out_buf[:length]), source
+            # C-speed copy: bytes(buf[:length]) would slice the ctypes array
+            # element-by-element in Python (~24 ns/byte -> ~8 ms for a 300
+            # KiB frame). string_at memcpy's at C speed.
+            return ctypes.string_at(ctypes.addressof(out_buf), length), source
 
     def registry_snapshot(self) -> list[RegistryEntry]:
         """Return the frontend-managed datarouter registry snapshot."""
