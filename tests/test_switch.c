@@ -81,12 +81,15 @@ static void write_config(const char *path, const char *allow_port) {
     fclose(file);
 }
 
-static pid_t start_switch_config(const char *name, uint32_t ttl_ms, const char *config_path) {
+static pid_t start_switch_config(const char *name, uint32_t ttl_ms, uint32_t max_ports,
+                                 const char *config_path) {
     pid_t pid = fork();
     require_int(pid >= 0, "fork switch config");
     if (pid == 0) {
         char ttl[32];
+        char max_ports_arg[32];
         snprintf(ttl, sizeof(ttl), "%u", ttl_ms);
+        snprintf(max_ports_arg, sizeof(max_ports_arg), "%u", max_ports);
         execl(
             "./build/datarouter-switch",
             "datarouter-switch",
@@ -94,6 +97,8 @@ static pid_t start_switch_config(const char *name, uint32_t ttl_ms, const char *
             name,
             "--ttl-ms",
             ttl,
+            "--max-ports",
+            max_ports_arg,
             "--config",
             config_path,
             (char *)NULL
@@ -927,7 +932,7 @@ static void test_config_allowlist_and_capacity(void) {
     const char *config_path = "build/switch-config.ini";
     unlink_shm(name);
     write_config(config_path, "Core,MLHelper,ERP,CMS,Audit");
-    pid_t sw = start_switch_config(name, 5000U, config_path);
+    pid_t sw = start_switch_config(name, 5000U, 5U, config_path);
 
     datarouter_mapping mapping;
     require_int(datarouter_platform_open(name, 0U, &mapping) == DATAROUTER_OK, "open config shm mapping");
@@ -971,7 +976,7 @@ static void test_config_is_startup_only(void) {
     const char *config_path = "build/switch-startup-config.ini";
     unlink_shm(name);
     write_config(config_path, "Core,MLHelper");
-    pid_t sw = start_switch_config(name, 5000U, config_path);
+    pid_t sw = start_switch_config(name, 5000U, 2U, config_path);
     write_config(config_path, "Core,MLHelper,Extra");
 
     datarouter_options opts = {0};
