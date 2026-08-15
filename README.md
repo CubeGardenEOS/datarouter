@@ -66,6 +66,27 @@ DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head
   cargo bench --bench ipc_frontend
 ```
 
+### Java JNI / Python 绑定热路径（2026-08）
+
+跨语言 benchmark（`datarouter-benchmark`，pingpong/oneway/business 三种模式，见
+`docs/benchmark-unsafe-2026-08.md`）驱动出的两处绑定级瓶颈与修复：
+
+- **Java JNI 接收物化成本**：大负载每帧 `NewByteArray(300KB)+SetByteArrayRegion`
+  （JVM heap 分配+拷贝+GC）占 300KB pingpong 延迟的大头。新增零拷贝接收
+  `DataRouterFrontend#receiveZeroCopy`：body 用 `DirectByteBuffer` 包住可复用接收
+  缓冲（语义与 C# 预分配缓冲一致，直到同线程下一次 receive 前有效），首次访问
+  `body()`/`bodyUnsafe()` 时才物化。热路径同步改为字段直读（缓存
+  `jfieldID`/`jmethodID`/`GlobalRef`，去掉每帧 `FindClass` 与虚拟方法调用），
+  source 名按线程缓存复用同一 Java String。
+- **Python ctypes 每调用开销**：send 数据参数 `c_void_p`→`c_char_p` 直接传 bytes
+  （去掉 `ctypes.cast` ~1µs/次），recv 缓冲参数直传数组，`message_info` 与库函数
+  指针按 `load_library()` 身份校验后缓存（兼容测试的 fake 注入）。
+
+修复后 `java↔java` 64B pingpong p50 `69µs→10µs`、300KB pingpong p50 `928µs→58µs`
+（约 16×），oneway 300KB `3.3k→31k msg/s`；`python↔python` 300KB pingpong p50
+`312µs→70µs`、oneway 300KB `18.8k→31.6k msg/s`。基准细节与逐项对比见
+`datarouter-benchmark/results/<最新时间戳>/comparison.md`。
+
 ### 默认基准
 
 默认 `build/main.py datarouter bench` 使用主构建产物；所有构建的 channel size 均为 `512KiB`：
