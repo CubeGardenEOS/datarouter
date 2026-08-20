@@ -171,7 +171,10 @@ static datarouter_keep_slot *slot_find(
                 return s;
             }
         }
-        i = (i + 1u) % cap;
+        i++;
+        if (i >= cap) {
+            i = 0u;
+        }
     }
     return NULL;
 }
@@ -193,7 +196,10 @@ static datarouter_keep_slot *slot_find_off(
         if (s->key_offset == off) {
             return s;
         }
-        i = (i + 1u) % cap;
+        i++;
+        if (i >= cap) {
+            i = 0u;
+        }
     }
     return NULL;
 }
@@ -211,13 +217,12 @@ static int slot_live(const datarouter_keep_slot *s) {
 
 /* 原位压实：在写锁 + seqlock（generation 奇）下重建哈希表，清除全部墓碑。
  * 存活槽位引用 arena 偏移仍有效；仅槽位位置变化，读方经两段校验重试。 */
-static void keep_rehash(datarouter_keep_header *h) {
-    uint32_t cap = h->slot_capacity;
-    datarouter_keep_slot *slots = keep_slots(h);
-    datarouter_keep_slot *tmp = (datarouter_keep_slot *)malloc((size_t)cap * sizeof(datarouter_keep_slot));
+static void keep_rehash(datarouter_keep_header *h, datarouter_keep_slot *tmp) {
     if (!tmp) {
         return;
     }
+    uint32_t cap = h->slot_capacity;
+    datarouter_keep_slot *slots = keep_slots(h);
     uint32_t n = 0u;
     for (uint32_t i = 0u; i < cap; i++) {
         if (slot_live(&slots[i])) {
@@ -231,18 +236,20 @@ static void keep_rehash(datarouter_keep_header *h) {
         datarouter_keep_slot *s = &tmp[i];
         uint32_t pos = (uint32_t)(s->key_hash % cap);
         while (slots[pos].key_offset != KEEP_EMPTY) {
-            pos = (pos + 1u) % cap;
+            pos++;
+            if (pos >= cap) {
+                pos = 0u;
+            }
         }
         slots[pos] = *s;
     }
-    free(tmp);
     h->tombstones = 0u;
 }
 
 /* 均匀地每隔 N 次写入检查一次墓碑密度；超过阈值即压实。 */
-static void keep_compact_if_needed(datarouter_keep_header *h) {
-    if (h->tombstones > (h->slot_capacity / 4u)) {
-        keep_rehash(h);
+static void keep_compact_if_needed(datarouter_keep_header *h, datarouter_keep_slot *tmp) {
+    if (tmp && h->tombstones > (h->slot_capacity / 4u)) {
+        keep_rehash(h, tmp);
     }
 }
 
@@ -269,7 +276,10 @@ static int slot_insert(
             s->age = age;
             return DATAROUTER_OK;
         }
-        i = (i + 1u) % cap;
+        i++;
+        if (i >= cap) {
+            i = 0u;
+        }
     }
     return DATAROUTER_ERR_FULL; /* 表已满：防御 */
 }
@@ -532,11 +542,23 @@ int datarouter_keep_put(
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
+    
+    if (value_len > h->capacity ||
+        sizeof(datarouter_keep_entry_hdr) + key_len + value_len > h->capacity) {
+        return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
+    }
+    
+    datarouter_keep_slot *rehash_tmp = NULL;
+    if (h->tombstones > h->slot_capacity / 4u) {
+        rehash_tmp = (datarouter_keep_slot *)malloc((size_t)h->slot_capacity * sizeof(datarouter_keep_slot));
+    }
+    
     int rc = keep_writer_acquire(h);
     if (rc != DATAROUTER_OK) {
+        free(rehash_tmp);
         return rc;
     }
-    keep_compact_if_needed(h);
+    keep_compact_if_needed(h, rehash_tmp);
     uint32_t need = KEEP_ALIGN4(sizeof(datarouter_keep_entry_hdr) + (uint32_t)key_len + (uint32_t)value_len);
     uint64_t now = datarouter_now_ns();
     uint64_t expires = ttl_ns == 0ULL ? 0ULL : (now + ttl_ns);
@@ -558,6 +580,7 @@ int datarouter_keep_put(
     rc = keep_arena_alloc(h, arena, need, now, &off);
     if (rc != DATAROUTER_OK) {
         keep_writer_release(h);
+        free(rehash_tmp);
         return rc;
     }
     datarouter_keep_entry_hdr *eh = (datarouter_keep_entry_hdr *)(arena + off);
@@ -576,10 +599,12 @@ int datarouter_keep_put(
                 (uint32_t)value_len, 1u);
     if (ir != DATAROUTER_OK) {
         keep_writer_release(h);
+        free(rehash_tmp);
         return ir;
     }
     h->entry_count++;
     keep_writer_release(h);
+    free(rehash_tmp);
     result = DATAROUTER_OK;
     return result;
 }
