@@ -5,6 +5,7 @@ use std::process::Command;
 
 const C_SOURCES: &[&str] = &[
     "src/common.c",
+    "src/keep.c",
     "src/port.c",
     "src/registry.c",
     "src/router.c",
@@ -32,6 +33,7 @@ const HEADERS: &[&str] = &[
     "src/validation.rs",
     "src/validation.c",
     "src/tlv.c",
+    "src/keep.c",
     "src/datarouter_internal.h",
     "src/datarouter_registry.h",
     "src/datarouter_router.h",

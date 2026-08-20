@@ -13,6 +13,7 @@
 
 pub mod ffi;
 pub mod inbound;
+pub mod keep;
 pub mod options;
 pub mod outbound;
 pub mod port_frontend;
@@ -550,6 +551,66 @@ impl Frontend {
 
     pub fn is_closing(&self) -> bool {
         self.inner.closing.load(Ordering::Acquire)
+    }
+
+    /// KEEP 拷贝式读（1 次 memcpy）。成功后返回写入 out 的长度。未命中返回
+    /// `keep::KeepStatus::NotFound`；未授权写方或区域关闭亦返回对应状态。
+    pub fn keep_get(&self, key: &[u8], out: &mut [u8]) -> Result<usize, keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_get(p, key, out))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    /// KEEP 两段式零拷贝读。调用方在复制/交付 value 后必须调用
+    /// [`Self::keep_verify_ref`]（data 可能被并发写撕裂）。返回的指针仅在本调用
+    /// 期间有效，严禁跨异保存续。
+    ///
+    /// # Safety
+    /// 见 `keep::keep_get_ref`——返回的裸指针指向共享内存，交付前必须复检。
+    pub unsafe fn keep_get_ref(&self, key: &[u8]) -> Result<(*const u8, usize, u64), keep::KeepStatus> {
+        self.inner
+            .with_port(|p| unsafe { keep::keep_get_ref(p, key) })
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    pub fn keep_verify_ref(&self, seq: u64) -> Result<(), keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_verify_ref(p, seq))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    /// 写入（需本服务被授权为 KEEP 写方）。`ttl_ns == 0` 永不过期。
+    pub fn keep_put(&self, key: &[u8], value: &[u8], ttl_ns: u64) -> Result<(), keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_put(p, key, value, ttl_ns))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    pub fn keep_invalidate(&self, key: &[u8]) -> Result<(), keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_invalidate(p, key))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    /// 前缀失效；返回 `Again` 表示部分完成（分片语义），调用方应继续用剩余前缀重试。
+    pub fn keep_invalidate_prefix(&self, prefix: &[u8]) -> Result<(), keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_invalidate_prefix(p, prefix))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    /// KEEP 统计快照。
+    pub fn keep_stats(&self) -> Result<crate::datarouter_keep_stats_t, keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_stats(p))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    /// core-only：授权另一已注册服务写 KEEP（经 switch 控制面）。
+    pub fn keep_grant(&self, service_name: &str) -> Result<(), keep::KeepStatus> {
+        self.inner
+            .with_port(|p| keep::keep_grant(p, service_name))
+            .map_err(keep::KeepStatus::from_code)?
     }
 
     #[cfg(debug_assertions)]

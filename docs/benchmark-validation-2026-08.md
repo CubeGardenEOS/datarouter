@@ -92,6 +92,19 @@ Rust `protocol.rs` 相应经 FFI 委托（`src/validation.rs`），删除 Rust �
   - org 套件（`results/20260820-124910/`）无系统性回归（~1–2% 噪声带），err=0。
   - `cargo test` 76 通过（含 append/find/next 与截断码 FFI 语义测试）。
 
+## M2 补充（KEEP 区域，layout 13）
+
+- 新增 `benches/keep_region.rs`（直连 KEEP 命中/写入路径）：
+  - `keep_get`（拷贝式，1 memcpy）命中：~78.8 ns/op（约 12.7 Mop/s）。
+  - `keep_get_ref` + `keep_verify_ref`（零拷贝两段式）：~65.3 ns/op。
+  - `keep_put`（含环形打满 evict + 墓碑压实）：~729 ns/op，256B 值 ≈ 335 MiB/s。
+  - 稳态 `entries≈22469`（= 8MiB arena 容量），`evictions` 正常增长，无槽位泄漏/假命中。
+- 布局升级回归（决定性子门）：
+  - `protocol_hot_path` 无回归：64k direct 2.41–2.47ms / 512k direct 3.49–3.55ms（对照基线 2.40–2.44 / 3.49–3.52）。
+  - `ipc_unsafe` 数据面持平：64B pingpong p50 ≈ 3.62µs（对照 3.47–3.56）、300KiB ≈ 19 GB/s 量级。
+- org 套件：`rust↔rust` 跨进程在既有 ±30–60% 噪声带内（p50 1024B 4.14→5.67µs、64B 4.64→5.39µs，同向但带内）；等价 same/C 因机负载波动未取做判据。java/go/csharp 跨绑定需在 datarouter 的 JNI/绑定仓库重新生成二进制（本仓库 `build.sh` 无法从源码重建已提交的 JNI `.so`），属环境/绑定发布项，非 KEEP 缺陷。
+- `cargo test`：76 lib + 8 keep_region + 4 + 11 全绿；C 侧 `test_layout/test_switch/test_config` 全绿。
+
 ## 3. 验收结论
 
 - 确定性基准（被改路径的直接度量）无回归 → 满足“±5%”硬门槛。

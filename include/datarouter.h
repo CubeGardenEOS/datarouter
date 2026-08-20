@@ -44,6 +44,10 @@ extern "C" {
 #define DATAROUTER_SHM_NAME_MAX 120
 #define DATAROUTER_DEFAULT_TIMEOUT_MS 3000U
 
+/* ---- KEEP 区域（layout 13） ---- */
+#define DATAROUTER_KEEP_DEFAULT_SIZE (8u * 1024u * 1024u) /* 8 MiB */
+#define DATAROUTER_KEEP_KEY_MAX 256u
+
 typedef struct datarouter_port datarouter_port;
 
 typedef struct {
@@ -147,6 +151,42 @@ int datarouter_transport_stats_snapshot(
     datarouter_port *port,
     datarouter_transport_stats *out
 );
+typedef struct {
+    uint32_t capacity;
+    uint32_t entry_count;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t expired;
+    uint64_t evictions;
+    uint64_t generation;
+    uint32_t recovery_seq;
+    uint32_t slot_capacity;
+} datarouter_keep_stats_t;
+
+/* KEEP 直通读/写缓存（仅供 core 与 core 授权的服务写）。命中路径不经 Ring Buffer、
+ * 不经 switch 路由；get_ref 为零拷贝两段式 seqlock（交付前必须 verify_ref）。 */
+int datarouter_keep_get(
+    datarouter_port *port,
+    const void *key, size_t key_len,
+    void *out, size_t out_cap, size_t *out_len);
+int datarouter_keep_get_ref(
+    datarouter_port *port,
+    const void *key, size_t key_len,
+    const void **value_out, size_t *value_len_out,
+    uint64_t *seq_out);
+int datarouter_keep_verify_ref(datarouter_port *port, uint64_t seq);
+int datarouter_keep_put(
+    datarouter_port *port,
+    const void *key, size_t key_len,
+    const void *value, size_t value_len,
+    uint64_t ttl_ns);
+int datarouter_keep_invalidate(datarouter_port *port, const void *key, size_t key_len);
+int datarouter_keep_invalidate_prefix(
+    datarouter_port *port, const void *prefix, size_t prefix_len);
+int datarouter_keep_stats(datarouter_port *port, datarouter_keep_stats_t *out);
+/* core-only：授权另一已注册服务写 KEEP（经 switch 控制面，switch 校验请求者是 core）。 */
+int datarouter_keep_grant(datarouter_port *port, const char *service_name);
+
 void datarouter_close(datarouter_port *port);
 
 #ifdef __cplusplus

@@ -96,6 +96,11 @@ pub struct SwitchConfig {
     pub token: Option<String>,
     /// Reap registrations whose owning process is confirmed dead.
     pub reap_dead_processes: bool,
+    /// KEEP region size (`"8m"`, `"0"` disables). `None` uses the switch
+    /// default (8 MiB, enabled).
+    pub keep_size: Option<String>,
+    /// Static KEEP write-allow list (e.g. `["core", "database"]`).
+    pub keep_write_allow: Vec<String>,
     /// Switch log level.
     pub log_level: LogLevel,
     /// Explicit path to the `datarouter-switch` binary. When `None`, the
@@ -121,6 +126,8 @@ impl Default for SwitchConfig {
             allow_any: false,
             token: None,
             reap_dead_processes: false,
+            keep_size: None,
+            keep_write_allow: Vec::new(),
             log_level: LogLevel::Info,
             binary: None,
             log_file: None,
@@ -193,6 +200,14 @@ impl SwitchConfig {
         }
         if self.reap_dead_processes {
             args.push("--reap-dead-processes".to_owned());
+        }
+        if let Some(size) = &self.keep_size {
+            args.push("--keep-size".to_owned());
+            args.push(size.clone());
+        }
+        if !self.keep_write_allow.is_empty() {
+            args.push("--keep-write-allow".to_owned());
+            args.push(self.keep_write_allow.join(","));
         }
         args.push("--log-level".to_owned());
         args.push(self.log_level.as_str().to_owned());

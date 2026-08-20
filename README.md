@@ -609,14 +609,28 @@ Port 库是应用面对的 ABI。它打开 switch-owned shared memory，调用 `
 
 ### 布局升级
 
-当前 shared-memory layout 12（控制面 `auth_fingerprint`；registry 槽位直写 pin 计数器
-`direct_writers` 与写者身份；ring 数据容量 = 2 的幂 `DATAROUTER_CHANNEL_SIZE`（默认
-2^19），channel 磁盘布局 = 8B 头 + 数据，环形回绕用掩码）、8 字节帧头、26 位 route
-generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和 switch，
-替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，再整体
-启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；旧
-frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct
+当前 shared-memory layout **13**（在 layout 12 基础上：控制面新增 `keep_offset` /
+`keep_size` / `keep_write_allow_bitmap`，并新增 KEEP 区域——见下节；registry 槽位直写 pin
+计数器 `direct_writers` 与写者身份；ring 数据容量 = 2 的幂 `DATAROUTER_CHANNEL_SIZE`
+（默认 2^19），channel 磁盘布局 = 8B 头 + 数据，环形回绕用掩码）、8 字节帧头、26 位
+route generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和
+switch，替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，
+再整体启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；
+旧 frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct
 size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
+
+### KEEP 区域（layout 13）
+
+KEEP 是 Switch 维持的**直通字节缓存**（供 core 与 core 授权的服务共享高频命中查询结果）。
+命中路径不经 Ring Buffer、不经 switch 路由：调用方直接对同一共享内存镜像完成 lookup + 读
+取（`get_ref` 零拷贝、`get` 一次 memcpy）。区域默认 8 MiB（`--keep-size <bytes|[kKmMgG]>`），
+`0` 关闭需 `--keep-disable`；写入仅对 `--keep-write-allow`（静态名单，注册即置位）或经
+`datarouter_keep_grant`（控制面，仅受信任写方）授权的服务开放。C 侧 `src/keep.c` 为单一
+事实来源：环形 log-structured arena（条目物理连续，保零拷贝 `get_ref`）+ 开放寻址哈希
+（墓碑 + 探测延续 + 阈值压实，无假性未命中）+ 跨进程 seqlock 崩溃自愈（`writer_pid` +
+接管重建）。Rust 前端 `src/frontend/keep.rs` 只做 FFI 委托。9 个 API：`datarouter_keep_get` /
+`get_ref` / `verify_ref` / `put` / `invalidate` / `invalidate_prefix` / `stats` / `grant`。
+
 
 ### ABI 兼容性测试（缺省翻转后全链路验证）
 

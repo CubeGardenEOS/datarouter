@@ -1329,3 +1329,25 @@ int datarouter_test_release_self_slot(datarouter_port *port) {
     }
     return unregister_self(port, port->timeout_ms);
 }
+
+int datarouter_keep_grant(datarouter_port *port, const char *service_name) {
+    if (!port || !port->shm || port->route_id == 0U) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    if (!datarouter_valid_service_name(service_name)) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    uint32_t assigned_slot = 0U;
+    char errbuf[128];
+    return submit_control_request(
+        port,
+        DATAROUTER_REG_OP_KEEP_GRANT,
+        service_name,
+        port->route_id,
+        port->timeout_ms,
+        &assigned_slot,
+        NULL,
+        errbuf,
+        sizeof(errbuf)
+    );
+}

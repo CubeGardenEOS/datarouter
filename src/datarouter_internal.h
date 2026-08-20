@@ -30,7 +30,21 @@ typedef pthread_mutex_t datarouter_mutex;
 
 #define DATAROUTER_VERSION "0.2.0"
 #define DATAROUTER_MAGIC 0x534D4342U
-#define DATAROUTER_LAYOUT_VERSION 12U
+#define DATAROUTER_LAYOUT_VERSION 13U
+#define DATAROUTER_KEEP_MAGIC 0x4B454550u /* "KEEP" */
+#define DATAROUTER_KEEP_LAYOUT_VERSION 2u
+#define DATAROUTER_KEEP_HEADER_SIZE 128u
+#define DATAROUTER_KEEP_SLOT_SIZE 32u
+#define DATAROUTER_KEEP_SLOTS_PER_ENTRY 2u /* 开放寻址负载 <50% */
+#define DATAROUTER_KEEP_EVICT_PER_PUT 64u
+#define DATAROUTER_KEEP_PREFIX_SCAN_LIMIT 4096u
+#define DATAROUTER_KEEP_LOCK_SPIN_LIMIT 50000u
+#define DATAROUTER_KEEP_SEQLOCK_RETRY 64u
+#define DATAROUTER_KEEP_MIN_SIZE 4096u
+#define KEEP_EMPTY 0xFFFFFFFFu
+#define KEEP_TOMBSTONE 0xFFFFFFFEu
+#define KEEP_WRITE_LOCK_FREE 0U
+#define KEEP_WRITE_LOCK_HELD 1U
 #define DATAROUTER_ROUTE_SLOT_BITS 6U
 #define DATAROUTER_ROUTE_SLOT_MASK ((1U << DATAROUTER_ROUTE_SLOT_BITS) - 1U)
 #define DATAROUTER_ROUTE_GENERATION_MASK 0x03ffffffU
@@ -82,7 +96,8 @@ typedef enum {
 typedef enum {
     DATAROUTER_REG_OP_NONE = 0,
     DATAROUTER_REG_OP_REGISTER = 1,
-    DATAROUTER_REG_OP_UNREGISTER = 2
+    DATAROUTER_REG_OP_UNREGISTER = 2,
+    DATAROUTER_REG_OP_KEEP_GRANT = 3
 } datarouter_reg_operation;
 
 typedef struct {
@@ -128,6 +143,47 @@ typedef struct {
     atomic_ullong last_active_ns;
     atomic_uchar service_name[DATAROUTER_SERVICE_NAME_MAX + 1U];
 } datarouter_registry_entry;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t layout_version;
+    uint32_t capacity;        /* arena 有效字节数 */
+    uint32_t slot_capacity;   /* 哈希槽数 */
+    uint32_t entry_count;     /* 存活条目 */
+    uint32_t used;            /* 当前占用 arena 字节数 */
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t expired;
+    uint64_t evictions;
+    _Atomic uint64_t generation;   /* seqlock：写开始置奇、写结束置偶、单调递增 */
+    atomic_uint writer_lock;      /* 写方串行化（CAS spin）+ 崩溃自愈 */
+    int32_t writer_pid;           /* 持锁写方 pid；0 = 无写方 */
+    atomic_uint recovery_seq;     /* 自愈后递增的幂等恢复计数 */
+    uint32_t write_head;          /* arena 环形写锚 */
+    uint32_t evict_head;          /* arena 环形淘汰锚 */
+    uint32_t tombstones;          /* 墓碑数（触发 rehash 压实） */
+    uint32_t _reserved[10];       /* 补足到 128B（% 64 == 0，8 对齐） */
+} datarouter_keep_header;
+_Static_assert(sizeof(datarouter_keep_header) == 128u && sizeof(datarouter_keep_header) % 64u == 0u,
+               "datarouter_keep_header ABI mismatch");
+
+typedef struct {
+    uint64_t key_hash;      /* FNV-1a 64（槽位定位 + 删除时反向位移判定） */
+    uint64_t expires_ns;    /* 绝对纳秒；0 = 永不过期 */
+    uint32_t key_offset;    /* 指向 arena 条目区；-1U = 空槽（无墓碑） */
+    uint32_t value_offset;  /* 值在条目内的偏移（相对 arena_base） */
+    uint32_t value_len;
+    uint32_t age;
+} datarouter_keep_slot;
+_Static_assert(sizeof(datarouter_keep_slot) == 32u, "datarouter_keep_slot ABI mismatch");
+
+/* Arena 条目头（环形分配：key/value 前 16 字节头，4 字节对齐）。 */
+typedef struct {
+    uint32_t key_len;
+    uint32_t value_len;
+    uint64_t expires_ns;
+} datarouter_keep_entry_hdr;
+_Static_assert(sizeof(datarouter_keep_entry_hdr) == 16u, "datarouter_keep_entry_hdr size");
 
 typedef struct {
     atomic_uint state;
@@ -179,6 +235,12 @@ typedef struct {
     atomic_ullong registration_request_recoveries;
     atomic_ullong dead_process_reaps;
     atomic_ullong transport_generation;
+    /* KEEP 区域（layout 13）：keep_offset 指向 keep 头部（位于 channel blob 之后），
+     * keep_size==0 表示关闭。keep_write_allow_bitmap 位图仅由 Switch 在 control_lock
+     * 临界区内修改。 */
+    uint32_t keep_offset;
+    uint32_t keep_size;
+    atomic_ullong keep_write_allow_bitmap;
     atomic_uint scheduler_cursor;
     atomic_uint inflight_frames[DATAROUTER_MAX_PORTS][DATAROUTER_MAX_PORTS];
     datarouter_register_request register_requests[DATAROUTER_REGISTRATION_REQUEST_SLOTS];
@@ -258,9 +320,18 @@ int datarouter_init_shared_memory_full(
     uint32_t ttl_ms,
     uint64_t auth_fingerprint
 );
+int datarouter_init_shared_memory_with_keep(
+    datarouter_shared_memory *shm,
+    uint32_t max_ports,
+    uint32_t ttl_ms,
+    uint64_t auth_fingerprint,
+    uint32_t keep_size,
+    uint32_t keep_slot_capacity
+);
 uint64_t datarouter_auth_fingerprint(const char *token);
 int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_t map_size);
 size_t datarouter_shared_memory_size(uint32_t max_ports);
+size_t datarouter_shared_memory_size_with_keep(uint32_t max_ports, uint32_t keep_size);
 /* Process-global data-plane copy strategy ("scalar" or "avx2"), selected once
  * from DATAROUTER_COPY=scalar|avx2 (default scalar = libc memcpy; avx2 is a
  * benchmark-only hand-rolled 256-bit loop that measured slower). */
@@ -298,5 +369,29 @@ void datarouter_touch_entry(datarouter_registry_entry *entry, uint64_t now_ns);
 int datarouter_try_lock(atomic_uint *lock);
 void datarouter_unlock(atomic_uint *lock);
 void datarouter_set_error(char *errbuf, size_t errbuf_len, const char *message);
+
+/* ---- KEEP：核心结构（src/keep.c），Rust 只经 FFI 委托 ---- */
+void datarouter_keep_init(datarouter_shared_memory *shm, uint32_t slot_capacity);
+datarouter_keep_header *datarouter_keep_header_of(datarouter_shared_memory *shm);
+int datarouter_keep_get(
+    datarouter_port *port,
+    const void *key, size_t key_len,
+    void *out, size_t out_cap, size_t *out_len);
+int datarouter_keep_get_ref(
+    datarouter_port *port,
+    const void *key, size_t key_len,
+    const void **value_out, size_t *value_len_out,
+    uint64_t *seq_out);
+int datarouter_keep_verify_ref(datarouter_port *port, uint64_t seq);
+int datarouter_keep_put(
+    datarouter_port *port,
+    const void *key, size_t key_len,
+    const void *value, size_t value_len,
+    uint64_t ttl_ns);
+int datarouter_keep_invalidate(datarouter_port *port, const void *key, size_t key_len);
+int datarouter_keep_invalidate_prefix(
+    datarouter_port *port, const void *prefix, size_t prefix_len);
+int datarouter_keep_stats(datarouter_port *port, datarouter_keep_stats_t *out);
+/* 控制面保留位：datarouter_keep_grant 公开声明见 include/datarouter.h，实现在 port.c。 */
 
 #endif

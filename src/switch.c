@@ -49,6 +49,10 @@ typedef struct {
     int once;
     int reap_dead_processes;
     switch_log_level log_level;
+    /* KEEP 区域（layout 13）；keep_size==0 关闭。keep_write_allow 为静态写名单。 */
+    uint32_t keep_size;
+    char keep_write_allow[DATAROUTER_MAX_PORTS][DATAROUTER_SERVICE_NAME_MAX + 1U];
+    uint32_t keep_write_allow_len;
 } switch_options;
 
 typedef struct {
@@ -134,7 +138,8 @@ static void print_usage(const char *argv0) {
         "usage: %s [--name /datarouter] [--mode 0600] [--ttl-ms 30000] "
         "[--max-ports 4] [--token secret] "
         "(--allow Core,MLHelper | --config path.ini | --allow-any) [--once] "
-        "[--reap-dead-processes] "
+        "[--reap-dead-processes] [--keep-size 8m] [--keep-write-allow core,database] "
+        "[--keep-disable] "
         "[--log-level error|warn|info|debug|trace]\n",
         argv0
     );
@@ -200,6 +205,35 @@ static int parse_u32_strict(const char *value, uint32_t min, uint32_t max, uint3
     return DATAROUTER_OK;
 }
 
+static int parse_size_u32(const char *value, uint32_t max, uint32_t *out) {
+    if (!value || !out || value[0] == '\0' || value[0] == '-' || value[0] == '+') {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    unsigned long mult = 1UL;
+    if (end && *end != '\0') {
+        if ((*end == 'k' || *end == 'K')) {
+            mult = 1024UL;
+        } else if (*end == 'm' || *end == 'M') {
+            mult = 1024UL * 1024UL;
+        } else if (*end == 'g' || *end == 'G') {
+            mult = 1024UL * 1024UL * 1024UL;
+        } else {
+            return DATAROUTER_ERR_INVALID_ARGUMENT;
+        }
+        if (end[1] != '\0') {
+            return DATAROUTER_ERR_INVALID_ARGUMENT;
+        }
+    }
+    if (errno != 0 || end == value || parsed > (unsigned long)max / mult) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    *out = (uint32_t)(parsed * mult);
+    return DATAROUTER_OK;
+}
+
 static int parse_mode_strict(const char *value, mode_t *out) {
     if (!value || !out || value[0] == '\0' || value[0] == '-' || value[0] == '+') {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
@@ -257,6 +291,44 @@ static int parse_allowlist(switch_options *options, const char *value) {
     return DATAROUTER_OK;
 }
 
+static int keep_write_allow_contains(const switch_options *options, const char *name) {
+    for (uint32_t i = 0U; i < options->keep_write_allow_len; i++) {
+        if (strcmp(options->keep_write_allow[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int parse_keep_write_allow(switch_options *options, const char *value) {
+    if (!value || value[0] == '\0' || strlen(value) >= 512U) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", value);
+    char *cursor = buf;
+    while (*cursor) {
+        char *comma = strchr(cursor, ',');
+        if (comma) {
+            *comma = '\0';
+        }
+        if (!datarouter_valid_service_name(cursor)) {
+            return DATAROUTER_ERR_INVALID_ARGUMENT;
+        }
+        if (options->keep_write_allow_len >= DATAROUTER_MAX_PORTS) {
+            return DATAROUTER_ERR_FULL;
+        }
+        snprintf(options->keep_write_allow[options->keep_write_allow_len],
+                 sizeof(options->keep_write_allow[options->keep_write_allow_len]), "%s", cursor);
+        options->keep_write_allow_len++;
+        if (!comma) {
+            break;
+        }
+        cursor = comma + 1;
+    }
+    return DATAROUTER_OK;
+}
+
 static int service_allowed(const switch_options *options, const char *service_name) {
     if (options->allow_any) {
         return 1;
@@ -278,6 +350,7 @@ static int parse_args(int argc, char **argv, switch_options *options) {
     options->mode = 0600;
     options->ttl_ms = DATAROUTER_DEFAULT_TTL_MS;
     options->max_ports = DATAROUTER_DEFAULT_MAX_PORTS;
+    options->keep_size = DATAROUTER_KEEP_DEFAULT_SIZE;
     options->log_level = SWITCH_LOG_INFO;
     datarouter_config_init(&options->config);
 
@@ -323,6 +396,17 @@ static int parse_args(int argc, char **argv, switch_options *options) {
             options->once = 1;
         } else if (strcmp(argv[i], "--reap-dead-processes") == 0) {
             options->reap_dead_processes = 1;
+        } else if (strcmp(argv[i], "--keep-size") == 0 && i + 1 < argc) {
+            if (parse_size_u32(argv[++i], 64U * 1024U * 1024U, &options->keep_size) !=
+                DATAROUTER_OK) {
+                return DATAROUTER_ERR_INVALID_ARGUMENT;
+            }
+        } else if (strcmp(argv[i], "--keep-write-allow") == 0 && i + 1 < argc) {
+            if (parse_keep_write_allow(options, argv[++i]) != DATAROUTER_OK) {
+                return DATAROUTER_ERR_INVALID_ARGUMENT;
+            }
+        } else if (strcmp(argv[i], "--keep-disable") == 0) {
+            options->keep_size = 0U;
         } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
             if (parse_log_level(argv[++i], &options->log_level) != DATAROUTER_OK) {
                 return DATAROUTER_ERR_INVALID_ARGUMENT;
@@ -620,6 +704,13 @@ static unsigned int handle_register_request(
         return finish_request(req, DATAROUTER_REG_REJECTED, rc, "no free datarouter slots");
     }
     activate_slot(shm, req, slot_index);
+    if (keep_write_allow_contains(options, req->service_name)) {
+        atomic_fetch_or_explicit(
+            &shm->control.keep_write_allow_bitmap,
+            1ULL << slot_index,
+            memory_order_relaxed
+        );
+    }
     req->assigned_slot = slot_index;
     req->assigned_route_id = atomic_load_explicit(
         &shm->control.registry[slot_index].route_id,
@@ -652,6 +743,53 @@ static unsigned int handle_unregister_request(
     return finish_request(req, DATAROUTER_REG_ACCEPTED, DATAROUTER_OK, "ok");
 }
 
+/* 请求方（grantor）必须是已注册且已被信任（位图已置）的 KEEP 写方（core 等）。 */
+static int grant_owner_trusted(datarouter_shared_memory *shm, const datarouter_register_request *req) {
+    uint32_t max_ports = datarouter_active_max_ports(shm);
+    for (uint32_t i = 0U; i < max_ports; i++) {
+        datarouter_registry_metadata m;
+        if (!datarouter_registry_read_active(&shm->control.registry[i], &m)) {
+            continue;
+        }
+        if (m.pid == req->owner_pid && m.uid == req->owner_uid &&
+            m.process_start_id == req->owner_start_id) {
+            uint64_t bm = atomic_load_explicit(
+                &shm->control.keep_write_allow_bitmap, memory_order_relaxed);
+            if ((bm & (1ULL << i)) != 0ULL) {
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static unsigned int handle_keep_grant_request(
+    datarouter_shared_memory *shm,
+    datarouter_register_request *req
+) {
+    if (!request_identity_allowed(shm, req)) {
+        return finish_request(req, DATAROUTER_REG_REJECTED, DATAROUTER_ERR_PERMISSION, "invalid grant owner");
+    }
+    if (!datarouter_valid_service_name(req->service_name)) {
+        return finish_request(req, DATAROUTER_REG_REJECTED, DATAROUTER_ERR_INVALID_ARGUMENT, "invalid target service name");
+    }
+    if (!grant_owner_trusted(shm, req)) {
+        return finish_request(req, DATAROUTER_REG_REJECTED, DATAROUTER_ERR_PERMISSION, "grantor is not a trusted KEEP writer");
+    }
+    datarouter_registry_metadata target;
+    if (!datarouter_registry_find_active_metadata_by_name(shm, req->service_name, &target)) {
+        return finish_request(req, DATAROUTER_REG_REJECTED, DATAROUTER_ERR_NOT_FOUND, "target service is not registered");
+    }
+    atomic_fetch_or_explicit(
+        &shm->control.keep_write_allow_bitmap,
+        1ULL << target.slot_index,
+        memory_order_relaxed
+    );
+    req->assigned_slot = target.slot_index;
+    return finish_request(req, DATAROUTER_REG_ACCEPTED, DATAROUTER_OK, "ok");
+}
+
 static void handle_control_request_slot(
     datarouter_shared_memory *shm,
     const switch_options *options,
@@ -678,6 +816,8 @@ static void handle_control_request_slot(
         terminal_state = handle_register_request(shm, options, req);
     } else if (req->operation == DATAROUTER_REG_OP_UNREGISTER) {
         terminal_state = handle_unregister_request(shm, req);
+    } else if (req->operation == DATAROUTER_REG_OP_KEEP_GRANT) {
+        terminal_state = handle_keep_grant_request(shm, req);
     } else {
         terminal_state = finish_request(req, DATAROUTER_REG_REJECTED, DATAROUTER_ERR_PROTOCOL, "unknown control operation");
     }
@@ -985,7 +1125,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "datarouter-switch: invalid max_ports %u\n", max_ports);
         return 1;
     }
-    size_t map_size = datarouter_shared_memory_size(max_ports);
+    size_t map_size = datarouter_shared_memory_size_with_keep(max_ports, options.keep_size);
     rc = acquire_start_lock(options.shm_name, &start_lock);
     if (rc != DATAROUTER_OK) {
         fprintf(stderr, "datarouter-switch: acquire startup lock failed: %s\n", datarouter_strerror(rc));
@@ -998,7 +1138,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     uint64_t auth_fingerprint = datarouter_auth_fingerprint(options.auth_token);
-    rc = datarouter_init_shared_memory_full(mapping.shm, max_ports, options.ttl_ms, auth_fingerprint);
+    rc = datarouter_init_shared_memory_with_keep(
+        mapping.shm, max_ports, options.ttl_ms, auth_fingerprint,
+        options.keep_size, 0U);
     if (rc != DATAROUTER_OK) {
         fprintf(stderr, "datarouter-switch: init shm failed: %s\n", datarouter_strerror(rc));
         datarouter_platform_close(&mapping);
@@ -1014,7 +1156,8 @@ int main(int argc, char **argv) {
         &options,
         SWITCH_LOG_INFO,
         "start pid=%d start_id=%" PRIu64 " shm=%s mode=%04o ttl_ms=%u max_ports=%u "
-        "%s once=%d reap_dead_processes=%d auth=%s version=%s layout=%u channel_size=%u",
+        "%s once=%d reap_dead_processes=%d auth=%s version=%s layout=%u channel_size=%u "
+        "keep_size=%u keep_write_allow=%u",
         (int)switch_pid(),
         mapping.shm->control.switch_start_id,
         options.shm_name,
@@ -1027,7 +1170,9 @@ int main(int argc, char **argv) {
         options.auth_token ? "enabled" : "disabled",
         datarouter_version(),
         DATAROUTER_LAYOUT_VERSION,
-        DATAROUTER_CHANNEL_SIZE
+        DATAROUTER_CHANNEL_SIZE,
+        options.keep_size,
+        options.keep_write_allow_len
     );
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);

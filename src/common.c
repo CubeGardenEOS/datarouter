@@ -266,7 +266,7 @@ int datarouter_valid_shm_name(const char *name) {
     return len > 1U && len <= DATAROUTER_SHM_NAME_MAX && name[len] == '\0';
 }
 
-size_t datarouter_shared_memory_size(uint32_t max_ports) {
+size_t datarouter_shared_memory_size_with_keep(uint32_t max_ports, uint32_t keep_size) {
     if (max_ports == 0U || max_ports > DATAROUTER_MAX_PORTS) {
         return 0U;
     }
@@ -274,7 +274,18 @@ size_t datarouter_shared_memory_size(uint32_t max_ports) {
     if (channel_count > (SIZE_MAX - sizeof(datarouter_control_plane)) / sizeof(datarouter_channel)) {
         return 0U;
     }
-    return sizeof(datarouter_control_plane) + channel_count * sizeof(datarouter_channel);
+    size_t base = sizeof(datarouter_control_plane) + channel_count * sizeof(datarouter_channel);
+    if (keep_size == 0U) {
+        return base;
+    }
+    if (base > SIZE_MAX - keep_size) {
+        return 0U;
+    }
+    return base + keep_size;
+}
+
+size_t datarouter_shared_memory_size(uint32_t max_ports) {
+    return datarouter_shared_memory_size_with_keep(max_ports, 0U);
 }
 
 uint32_t datarouter_active_max_ports(const datarouter_shared_memory *shm) {
@@ -336,7 +347,7 @@ int datarouter_init_shared_memory_with_ttl(
     uint32_t max_ports,
     uint32_t ttl_ms
 ) {
-    return datarouter_init_shared_memory_full(shm, max_ports, ttl_ms, 0ULL);
+    return datarouter_init_shared_memory_with_keep(shm, max_ports, ttl_ms, 0ULL, 0U, 0U);
 }
 
 int datarouter_init_shared_memory_full(
@@ -345,7 +356,24 @@ int datarouter_init_shared_memory_full(
     uint32_t ttl_ms,
     uint64_t auth_fingerprint
 ) {
+    return datarouter_init_shared_memory_with_keep(shm, max_ports, ttl_ms, auth_fingerprint, 0U, 0U);
+}
+
+int datarouter_init_shared_memory_with_keep(
+    datarouter_shared_memory *shm,
+    uint32_t max_ports,
+    uint32_t ttl_ms,
+    uint64_t auth_fingerprint,
+    uint32_t keep_size,
+    uint32_t keep_slot_capacity
+) {
     size_t total_size = datarouter_shared_memory_size(max_ports);
+    if (keep_size > 0U) {
+        if (keep_size < DATAROUTER_KEEP_MIN_SIZE) {
+            return DATAROUTER_ERR_INVALID_ARGUMENT;
+        }
+        total_size = datarouter_shared_memory_size_with_keep(max_ports, keep_size);
+    }
     if (!shm || ttl_ms == 0U || total_size == 0U || total_size > UINT32_MAX) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
@@ -357,6 +385,12 @@ int datarouter_init_shared_memory_full(
     shm->control.channel_size = DATAROUTER_CHANNEL_SIZE;
     shm->control.control_size = (uint32_t)sizeof(datarouter_control_plane);
     shm->control.data_offset = (uint32_t)sizeof(datarouter_control_plane);
+    shm->control.keep_size = keep_size;
+    uint32_t channel_blob = max_ports * 2U * (uint32_t)sizeof(datarouter_channel);
+    shm->control.keep_offset =
+        keep_size > 0U ? (uint32_t)sizeof(datarouter_control_plane) + channel_blob : 0u;
+    atomic_store_explicit(
+        &shm->control.keep_write_allow_bitmap, 0ULL, memory_order_release);
     shm->control.total_size = (uint32_t)total_size;
     shm->control.auth_fingerprint = auth_fingerprint;
     uint32_t switch_uid = 0U;
@@ -425,6 +459,9 @@ int datarouter_init_shared_memory_full(
     for (uint32_t i = 0; i < shm->control.channel_count; i++) {
         datarouter_ring_reset(&channels[i]);
     }
+    if (shm->control.keep_size > 0U) {
+        datarouter_keep_init(shm, keep_slot_capacity);
+    }
     atomic_store_explicit(&shm->control.initialized, 1U, memory_order_release);
     return DATAROUTER_OK;
 }
@@ -451,9 +488,19 @@ int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_
         shm->control.channel_size != DATAROUTER_CHANNEL_SIZE ||
         shm->control.control_size != (uint32_t)sizeof(datarouter_control_plane) ||
         shm->control.data_offset != (uint32_t)sizeof(datarouter_control_plane) ||
-        shm->control.total_size != (uint32_t)datarouter_shared_memory_size(shm->control.max_ports) ||
+        shm->control.total_size != (uint32_t)datarouter_shared_memory_size_with_keep(
+            shm->control.max_ports, shm->control.keep_size) ||
         map_size < shm->control.total_size) {
         return DATAROUTER_ERR_PROTOCOL;
+    }
+    if (shm->control.keep_size > 0U) {
+        uint32_t expected_keep_offset =
+            (uint32_t)sizeof(datarouter_control_plane) +
+            shm->control.max_ports * 2U * (uint32_t)sizeof(datarouter_channel);
+        if (shm->control.keep_offset != expected_keep_offset ||
+            shm->control.keep_offset + shm->control.keep_size > shm->control.total_size) {
+            return DATAROUTER_ERR_PROTOCOL;
+        }
     }
     if (shm->control.switch_pid <= 0 || shm->control.switch_start_id == 0ULL ||
         shm->control.ttl_ms == 0U) {

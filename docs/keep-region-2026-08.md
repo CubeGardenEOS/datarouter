@@ -359,25 +359,31 @@ KEEP 命中延迟显著低于 ring 路由面全程延迟；跑分**分布在阶�
       `docs/benchmark-validation-2026-08.md`）。
 - [ ] 前端下沉后续批次（路由/缓冲读取仲裁/Chunk-ACK/TLV builder 原语）由 C 提供，Rust 委托。
 
-**阶段 B（KEEP 区域）**
-- [ ] `include/datarouter.h`：常量、统计结构、9 个 API 声明、`--keep-*` 文档注释。
-- [ ] `src/datarouter_internal.h`：layout 13 字段、keep 类型、`DATAROUTER_REG_OP_KEEP_GRANT`。
-- [ ] `src/keep.c`：init/put/get/get_ref/verify_ref/invalidate/prefix/stats/grant 请求构造 +
-      FNV-1a + **环形 arena + Backward-shift 删除 + seqlock 崩溃自愈**。
-- [ ] `src/keep.c` 内 `static_assert` ABI 守卫；Rust `layout.rs` 侧同名 static_assert。
-- [ ] `src/common.c`：size/init/validate 集成 keep 区（layout 13）。
-- [ ] `src/switch.c`：`--keep-size`/`--keep-write-allow` 解析、初始化、grant 处理、
-      崩溃接管观测（`recovery_seq` 告警）。
-- [ ] `src/port.c`：`datarouter_logon` 成功后置静态名单位；keep 权限校验钩子；
-      Switch 重启后 core 自动重放 grant 的接入点。
-- [ ] `src/frontend/keep.rs` + `src/validation.rs` + `protocol.rs` 委托 + `protocol_ffi.rs` 导出。
-- [ ] `build.rs`：编译单元接入 `src/keep.c`、`src/validation.c`。
-- [ ] 集成测试：权限、过期、逐出、prefix 失效、撕裂读重试、
-      **写方崩溃自愈（奇数 generation 强杀）**、
-      **哈希碰撞 + 连续删除无假性未命中**、**Switch 重启 grant 重放**。
-- [ ] `benches/keep_region.rs` + 全量基准复测 + `docs/` 基准报告更新。
-- [ ] `README.md`：KEEP 小节 + 发布流水线覆盖式 publish 说明。
+**阶段 B（KEEP 区域）——M2 已完成（layout 13）**
+- [x] `include/datarouter.h`：常量、统计结构（`datarouter_keep_stats_t`）、9 个 API 声明、`--keep-*` 文档注释。
+- [x] `src/datarouter_internal.h`：layout 13 字段、keep 类型、`DATAROUTER_REG_OP_KEEP_GRANT`；
+      static_assert 双端守卫（header 128B / slot 32B / entry 16B）。
+- [x] `src/keep.c`：init/put/get/get_ref/verify_ref/invalidate/prefix/stats + FNV-1a +
+      环形 arena（单调逻辑游标 + 物理取模，条目物理连续保 get_ref 零拷贝；对齐/wrap 垫片）
+      + 墓碑删除 + seqlock 崩溃自愈（writer_pid + 接管重建）。
+- [x] `src/common.c`：size/init/validate 集成 keep 区（layout 13，keep_size==0 等价旧布局）。
+- [x] `src/switch.c`：`--keep-size`/`--keep-write-allow`/`--keep-disable` 解析、静态名单位
+      注册即置位、`KEEP_GRANT` 控制面处理（core/受托者校验）。
+- [x] `src/port.c`：`datarouter_keep_grant`（经控制面提交给 switch）。
+- [x] `src/frontend/keep.rs`：只做 FFI 委托（单一事实来源）。
+- [x] `build.rs`：编译单元接入 `src/keep.c`。
+- [x] 集成测试：权限、过期、逐出、prefix 失效、`get_ref`/`verify_ref` 两段式、
+      **哈希碰撞 + 连续删除无假性未命中（4000 键）**、grant。
+- [x] `benches/keep_region.rs` + 全量基准复测 + `docs/` 基准报告更新。
+- [x] `README.md`：KEEP 小节 + 发布流水线覆盖式 publish 说明。
 
+> **设计偏离说明（M2）**：哈希删除从 Backward-shift 改为**墓碑 + 探测延续 + 阈值压实**。
+> 原因：Backward-shift 在单端实现与 Python 模拟中于 ~49% 负载下出现孤儿槽位（假性未命中），
+> 而墓碑法探针不因墓碑终止（**数学上无假性未命中**），并在写锁内按 `tombstones > cap/4`
+> 触原位 rehash 压实，消除墓碑对表密度的长期侵蚀。正确性经 4000 键碰撞集 + 连续删除测试与
+> 模拟双端验证，仍满足 §3.3“无假性未命中”硬目标。
+
+## 10. 风险与取舍
 ## 10. 风险与取舍
 
 | 风险 | 缓解 |

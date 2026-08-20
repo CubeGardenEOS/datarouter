@@ -22,6 +22,11 @@ pub struct PortFrontend {
 unsafe impl Send for PortFrontend {}
 
 impl PortFrontend {
+    /// Raw C port pointer (internal FFI escape hatch).
+    pub(crate) fn raw(&self) -> *mut crate::datarouter_port {
+        self.port
+    }
+
     /// Open the shared-memory mapping without logging on. Used by the switch
     /// frontend to probe liveness and snapshot capacity/registry without
     /// consuming a registration slot.

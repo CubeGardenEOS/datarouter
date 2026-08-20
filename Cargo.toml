@@ -71,6 +71,10 @@ name = "protocol_hot_path"
 harness = false
 
 [[bench]]
+name = "keep_region"
+harness = false
+
+[[bench]]
 name = "validation_c"
 harness = false
 

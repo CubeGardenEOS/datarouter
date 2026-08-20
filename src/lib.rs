@@ -199,6 +199,72 @@ unsafe extern "C" {
     pub fn datarouter_close(port: *mut datarouter_port);
 }
 
+/// KEEP 区域统计快照（layout 13）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct datarouter_keep_stats_t {
+    pub capacity: u32,
+    pub entry_count: u32,
+    pub hits: u64,
+    pub misses: u64,
+    pub expired: u64,
+    pub evictions: u64,
+    pub generation: u64,
+    pub recovery_seq: u32,
+    pub slot_capacity: u32,
+}
+impl Default for datarouter_keep_stats_t {
+    fn default() -> Self {
+        Self {
+            capacity: 0,
+            entry_count: 0,
+            hits: 0,
+            misses: 0,
+            expired: 0,
+            evictions: 0,
+            generation: 0,
+            recovery_seq: 0,
+            slot_capacity: 0,
+        }
+    }
+}
+
+unsafe extern "C" {
+    pub fn datarouter_keep_get(
+        port: *mut datarouter_port,
+        key: *const c_void,
+        key_len: usize,
+        out: *mut c_void,
+        out_cap: usize,
+        out_len: *mut usize,
+    ) -> c_int;
+    pub fn datarouter_keep_get_ref(
+        port: *mut datarouter_port,
+        key: *const c_void,
+        key_len: usize,
+        value_out: *mut *const c_void,
+        value_len_out: *mut usize,
+        seq_out: *mut u64,
+    ) -> c_int;
+    pub fn datarouter_keep_verify_ref(port: *mut datarouter_port, seq: u64) -> c_int;
+    pub fn datarouter_keep_put(
+        port: *mut datarouter_port,
+        key: *const c_void,
+        key_len: usize,
+        value: *const c_void,
+        value_len: usize,
+        ttl_ns: u64,
+    ) -> c_int;
+    pub fn datarouter_keep_invalidate(port: *mut datarouter_port, key: *const c_void, key_len: usize) -> c_int;
+    pub fn datarouter_keep_invalidate_prefix(
+        port: *mut datarouter_port,
+        prefix: *const c_void,
+        prefix_len: usize,
+    ) -> c_int;
+    pub fn datarouter_keep_stats(port: *mut datarouter_port, out: *mut datarouter_keep_stats_t) -> c_int;
+    pub fn datarouter_keep_grant(port: *mut datarouter_port, service_name: *const c_char) -> c_int;
+}
+
 /// Converts a datarouter status code to the C library's static error string.
 pub fn strerror(code: c_int) -> &'static CStr {
     unsafe {
