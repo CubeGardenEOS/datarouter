@@ -41,6 +41,8 @@ include = [
     "src/ring.c",
     "src/scheduler.c",
     "src/signal.c",
+    "src/validation.c",
+    "src/validation.rs",
     "benches/*.rs",
     "docs/*.md",
 ]
@@ -66,6 +68,10 @@ crate-type = ["staticlib", "rlib"]
 
 [[bench]]
 name = "protocol_hot_path"
+harness = false
+
+[[bench]]
+name = "validation_c"
 harness = false
 
 [[bench]]

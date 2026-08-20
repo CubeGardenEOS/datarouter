@@ -35,6 +35,7 @@ pub mod protocol;
 mod protocol_ffi;
 pub mod query;
 pub mod switch_frontend;
+mod validation;
 
 include!(concat!(env!("OUT_DIR"), "/generated_switch_bin.rs"));
 

@@ -35,16 +35,19 @@ KEEP 区域的正确性依赖三块基础能力，它们目前分散在 Rust 前
 
 ### 1.2 下沉批次清单
 
-| # | 特性 | 现状（Rust） | 目标（C） | Rust 剩余职责 |
-|---|---|---|---|---|
-| A1 | TLV 校验 | `protocol.rs::validate_tlvs` | `src/validation.c`：`datarouter_protocol_validate_tlvs` / `datarouter_protocol_validate_frame_header` | 仅 FFI 委托 + 错误码映射 |
-| A2 | 帧头解析 | `frontend.rs` 内联 | `datarouter_frame_header_parse(const uint8_t hdr[8], …)`：type/flags/长度/越界判定 | 组合与上层语义 |
-| A3 | 路由解析 | `frontend.rs::send` 内联查找 | `datarouter_route_lookup(port, service_name, out_route)`：走 registry 表 + 生成期校验 | 调用方策略（超时/重试） |
-| A4 | 缓冲读取仲裁 | `frontend.rs::recv_packed`/`PortFrontend` | `datarouter_recv_packed(port, timeout_ms, out, cap, &out_len, &src_route)`（peek 头→校验→读 body 循环） | 队列/背压/超限语义仍在上层 |
-| A5 | Chunk/ACK 编解码 | `frontend/outbound.rs` 与 message 内联 | `datarouter_chunk_id/seq/total` 编解码 + `datarouter_ack_build/parse` | ack 等待表、超时判定 |
-| A6 | TLV builder 原语 | `protocol.rs::VarDataBuilder` / `tlv_read_*` | `datarouter_tlv_put_*` / `datarouter_tlv_read_*`（C 缓冲语义） | 类型化消息门面（保持 ergonomic） |
-| A7 | 诊断快照 | `registry_diagnostic` | 复用 `datarouter_registry_snapshot`，补 `datarouter_keep_stats` 同风格标准输出 | 格式化渲染 |
+| # | 特性 | 现状（Rust） | 目标（C） | Rust 剩余职责 | 状态 |
+|---|---|---|---|---|---|
+| A1 | TLV 校验 | `protocol.rs::validate_tlvs` | `src/validation.c`：`datarouter_protocol_validate_tlvs`（已完成） | 仅 FFI 委托 + 错误码映射 | ✅ |
+| A2 | 帧头解析 | `frontend.rs`/`unpack`/`raw_frame_layout` 内联 | `src/validation.c`：`datarouter_protocol_frame_layout`（已完成，含结构） | 组合与上层语义 | ✅ |
+| A3 | 路由解析 | `frontend.rs::send` 内联查找 | `datarouter_route_lookup(port, service_name, out_route)`：走 registry 表 + 生成期校验 | 调用方策略（超时/重试） | ⏳ 后续批次 |
+| A4 | 缓冲读取仲裁 | `frontend.rs::recv_packed`/`PortFrontend` | `datarouter_recv_packed(port, timeout_ms, out, cap, &out_len, &src_route)`（peek 头→校验→读 body 循环） | 队列/背压/超限语义仍在上层 | ⏳ 后续批次 |
+| A5 | Chunk/ACK 编解码 | `frontend/outbound.rs` 与 message 内联 | `datarouter_chunk_id/seq/total` 编解码 + `datarouter_ack_build/parse` | ack 等待表、超时判定 | ⏳ 后续批次 |
+| A6 | TLV builder 原语 | `protocol.rs::VarDataBuilder` / `tlv_read_*` | 既有 C ABI（`datarouter_tlv_put_*`/`read_*`）实现下沉为 C（重构） | 类型化消息门面（保持 ergonomic） | ⏳ 后续批次 |
+| A7 | 诊断快照 | `registry_diagnostic` | 复用 `datarouter_registry_snapshot`，补 `datarouter_keep_stats` 同风格标准输出 | 格式化渲染 | ⏳ 后续批次 |
 
+> 说明：M1（第一批下沉）＝ A1 + A2（wire 校验单一事实来源，正是约束 2 的强制项），
+> 已落地并跑分（见 §1.4 与 `docs/benchmark-validation-2026-08.md`）。A3–A7 为**后续批次**，
+> 待评审后再实施。
 ### 1.3 阶段 A 落成物
 
 - `src/validation.c`、`src/frontend.c`（或并入 `port.c` 的原语组）、`include/datarouter.h` 新增
@@ -82,12 +85,13 @@ KEEP 区域的正确性依赖三块基础能力，它们目前分散在 Rust 前
 
 ## 3. 里程碑与验收
 
-| 里程碑 | 内容 | 出口条件 |
-|---|---|---|
-| M0 | 本计划评审通过 | 计划落库（本文档合入） |
-| M1 | 阶段 A 全部下沉 + 委托化 | 测试平移全绿；一次跑分对照 ≤±5% |
-| M2 | 阶段 B KEEP 代码（layout 13） | 集成测试全绿（含崩溃自愈/碰撞删除/重启重放）；跑分达标 |
-| M3 | 全量回归 + 文档（README/KEEP/基准报告） | 覆盖式发布 latest；AGENTS.md 约束保持一致 |
+| 里程碑 | 内容 | 出口条件 | 状态 |
+|---|---|---|---|
+| M0 | 本计划评审通过 | 计划落库（本文档合入） | ✅ 评审通过 |
+| M1 | 阶段 A 第一批下沉：A1 校验 + A2 帧头 → C（约束 2 强制项），Rust 委托 | 测试平移全绿；确定性跑分（`protocol_hot_path`）无回归；跨语言 org 套件在既有噪声带内 | ✅ 已落地 + 跑分 |
+| M1.5 | 阶段 A 后续批次 A3–A7 | 同 M1 出口条件（每批独立跑分） | ⏳ 待评审 |
+| M2 | 阶段 B KEEP 代码（layout 13） | 集成测试全绿（含崩溃自愈/碰撞删除/重启重放）；跑分达标 | ⏳ |
+| M3 | 全量回归 + 文档（README/KEEP/基准报告） | 覆盖式发布 latest；AGENTS.md 约束保持一致 | ⏳ |
 
 - 每个里程碑独立发布（覆盖式 latest），发布流水线不保留历史版本（约束 1）。
 - 桌面应用相关构建在本地流程完成前保持 CI 摘除（约束 3），本计划不引入任何桌面 job。

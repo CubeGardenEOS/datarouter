@@ -304,22 +304,12 @@ pub fn unpack(data: &[u8]) -> Result<Message, &'static str> {
     if data.len() < HEADER_SIZE {
         return Err("frame too short");
     }
-    let vd_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-    let b_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let expected_len = HEADER_SIZE
-        .checked_add(vd_len)
-        .and_then(|len| len.checked_add(b_len))
-        .ok_or("frame length overflow")?;
-    if data.len() < expected_len {
-        return Err("frame truncated");
-    }
-    if data.len() != expected_len {
-        return Err("frame has trailing data");
-    }
+    let (message_type, flags, vd_len, b_len) =
+        raw_frame_layout(data).ok_or("frame has trailing data")?;
     validate_tlvs(&data[HEADER_SIZE..HEADER_SIZE + vd_len])?;
     Ok(Message {
-        message_type: data[0],
-        flags: data[1],
+        message_type,
+        flags,
         var_data: data[HEADER_SIZE..HEADER_SIZE + vd_len].to_vec(),
         body: data[HEADER_SIZE + vd_len..HEADER_SIZE + vd_len + b_len].to_vec(),
     })
@@ -392,21 +382,14 @@ pub fn tlv_read_all(var_data: &[u8]) -> HashMap<u8, Vec<u8>> {
 }
 
 /// Validate that a TLV block contains only complete, exactly-sized entries.
+///
+/// Delegates to the C single source of truth (`src/validation.c`) via FFI.
 pub fn validate_tlvs(var_data: &[u8]) -> Result<(), &'static str> {
-    let mut offset = 0usize;
-    while offset < var_data.len() {
-        let header_end = offset.checked_add(3).ok_or("TLV offset overflow")?;
-        if header_end > var_data.len() {
-            return Err("truncated TLV header");
-        }
-        let len = u16::from_le_bytes([var_data[offset + 1], var_data[offset + 2]]) as usize;
-        let value_end = header_end.checked_add(len).ok_or("TLV length overflow")?;
-        if value_end > var_data.len() {
-            return Err("truncated TLV value");
-        }
-        offset = value_end;
+    if crate::validation::validate_tlvs(var_data) {
+        Ok(())
+    } else {
+        Err("malformed TLV")
     }
-    Ok(())
 }
 
 // ── VarData Builder ───────────────────────────────────────────────────────
@@ -1091,21 +1074,10 @@ pub fn ack_key(msg: &Message) -> Option<String> {
 // helpers borrow the frame bytes; only chunked frames pay the unpack cost.
 
 /// Borrowed wire header: `(message_type, flags, var_data_len, body_len)`.
-/// Returns `None` when the frame is shorter than the header or its declared
-/// lengths do not match the buffer exactly (same rules as [`unpack`]).
+///
+/// Delegates to the C single source of truth (exact buffer-length match).
 pub fn raw_frame_layout(data: &[u8]) -> Option<(u8, u8, usize, usize)> {
-    if data.len() < HEADER_SIZE {
-        return None;
-    }
-    let vd_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-    let b_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let expected_len = HEADER_SIZE
-        .checked_add(vd_len)
-        .and_then(|len| len.checked_add(b_len))?;
-    if data.len() != expected_len {
-        return None;
-    }
-    Some((data[0], data[1], vd_len, b_len))
+    crate::validation::frame_layout(data)
 }
 
 /// True when the var_data block is well-formed and carries no chunk

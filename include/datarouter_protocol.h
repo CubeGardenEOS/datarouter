@@ -79,6 +79,40 @@ extern "C" {
 #define DATAROUTER_MAX_APP_PAYLOAD \
     (DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
 
+/* ── Single Source of Truth: Wire / TLV validation ──────────────────────── */
+/* These C functions are the canonical protocol validation rules. The Rust
+ * frontend delegates to them via FFI and must not carry a second copy of the
+ * same rules. See src/validation.c for the implementation. */
+
+typedef struct {
+    uint8_t  message_type;
+    uint8_t  flags;
+    uint16_t var_data_length; /* declared length (LE, header[2..4]) */
+    uint32_t body_length;     /* declared length (LE, header[4..8]) */
+    uint32_t total_length;    /* 8 + var_data_length + body_length */
+} datarouter_frame_layout;
+
+/**
+ * Validate a TLV block (3-byte header + in-bounds value per entry, exact
+ * consumption, no length overflow).
+ * @param data  TLV bytes; may be NULL only when len is 0.
+ * @param len   Byte count.
+ * @return 1 if valid, 0 if malformed. An empty block is valid.
+ */
+int datarouter_protocol_validate_tlvs(const uint8_t *data, size_t len);
+
+/**
+ * Parse and validate an 8-byte frame header against the actual buffer length.
+ * Validation is exact (buf_len == 8 + var_data + body).
+ * @param data     Frame bytes; must be readable for buf_len bytes.
+ * @param buf_len  Actual readable frame byte count.
+ * @param out      Non-NULL writable datarouter_frame_layout.
+ * @return DATAROUTER_OK on success (fills *out), DATAROUTER_ERR_PROTOCOL on
+ * malformed/mismatched lengths, DATAROUTER_ERR_INVALID_ARGUMENT if out is NULL.
+ */
+int datarouter_protocol_frame_layout(const uint8_t *data, size_t buf_len,
+                                     datarouter_frame_layout *out);
+
 /* ── Opaque Types ───────────────────────────────────────────────────────── */
 
 typedef struct datarouter_message datarouter_message;

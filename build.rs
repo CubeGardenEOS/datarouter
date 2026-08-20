@@ -11,6 +11,7 @@ const C_SOURCES: &[&str] = &[
     "src/ring.c",
     "src/scheduler.c",
     "src/signal.c",
+    "src/validation.c",
 ];
 const SWITCH_SOURCES: &[&str] = &["src/config.c", "src/switch.c"];
 const HEADERS: &[&str] = &[
@@ -27,6 +28,8 @@ const HEADERS: &[&str] = &[
     "src/frontend/queue.rs",
     "src/protocol.rs",
     "src/protocol_ffi.rs",
+    "src/validation.rs",
+    "src/validation.c",
     "src/datarouter_internal.h",
     "src/datarouter_registry.h",
     "src/datarouter_router.h",

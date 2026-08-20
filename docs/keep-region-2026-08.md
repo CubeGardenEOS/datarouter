@@ -311,13 +311,19 @@ int datarouter_keep_grant(datarouter_port *port, const char *service_name);
 
 ## 7. 校验规则（下沉 C）
 
-`src/validation.c`（新增）：
-- `datarouter_protocol_validate_tlvs(const uint8_t *data, size_t len, char *err, size_t err_len)`
-  —— 与 `protocol.rs::validate_tlvs` 语义逐条等价：TLV 头 3 字节边界、u16 长度不越界、精确耗尽。
-- `datarouter_protocol_validate_frame_header(const uint8_t hdr[8], size_t payload_len)`
-  —— 帧头 type/flags/长度边界。
-- 规则全部在 C，Rust 不再实现第二份规则（委托 FFI），避免双实现漂移。
-- 本项是更新计划**阶段 A** 的一部分，先于 KEEP 落地（见 `docs/update-plan-2026-08.md`）。
+`src/validation.c`（已落地，M1）——**C 侧单一事实来源**，Rust 仅 FFI 委托：
+- `int datarouter_protocol_validate_tlvs(const uint8_t *data, size_t len)`
+  —— 返回 1 合法 / 0 非法；与 Rust 原 `validate_tlvs` 逐字节等价：3 字节头边界、
+  u16 长度不越界、精确耗尽、长度无溢出；空块合法。
+- `int datarouter_protocol_frame_layout(const uint8_t *data, size_t buf_len,
+                                        datarouter_frame_layout *out)`
+  —— 帧头解析 + 精确长度校验（buf_len == 8 + var_data + body），等价原
+  `raw_frame_layout`/`unpack` 的精确匹配规则；`datarouter_frame_layout` 结构见
+  `include/datarouter_protocol.h`。
+- Rust 侧 `protocol.rs::validate_tlvs` / `raw_frame_layout` / `unpack` 均改用
+  `src/validation.rs` FFI 委托（`protocol.rs::validate_tlvs` 不再有第二份实现）。
+- 本项已随更新计划**阶段 A**（先于 KEEP）落地；A3–A7（路由/缓冲读取仲裁/
+  Chunk-ACK/TLV builder 原生下沉）为后续批次，见 `docs/update-plan-2026-08.md`。
 
 ## 8. 基准与验收
 
@@ -335,9 +341,12 @@ KEEP 命中延迟显著低于 ring 路由面全程延迟；跑分**分布在阶�
 ## 9. 落地清单（修订）
 
 **阶段 A（先下沉，见 update-plan-2026-08.md）**
-- [ ] `src/validation.c`：TLV/frame 校验；`protocol.rs::validate_tlvs` 改调 FFI。
-- [ ] 前端下沉批次 1（帧头/路由解析/缓冲读取仲裁）由 C 提供，Rust 委托。
-- [ ] 阶段 A 全量基准回归（±5%）。
+- [x] `src/validation.c`：TLV/帧头校验（`datarouter_protocol_validate_tlvs` /
+      `datarouter_protocol_frame_layout`）；`protocol.rs` 相应委托、`unpack` 改调。
+- [x] 阶段 A 全量基准回归：`protocol_hot_path` 无回归；跨语言 org 套件在既有
+      ±30–60% 噪声带内。新增 `benches/validation_c.rs`（见
+      `docs/benchmark-validation-2026-08.md`）。
+- [ ] 前端下沉后续批次（路由/缓冲读取仲裁/Chunk-ACK/TLV builder 原语）由 C 提供，Rust 委托。
 
 **阶段 B（KEEP 区域）**
 - [ ] `include/datarouter.h`：常量、统计结构、9 个 API 声明、`--keep-*` 文档注释。
