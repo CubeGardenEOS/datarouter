@@ -42,15 +42,21 @@ Linux 后端通过 `shm_open`、`ftruncate`、`fchmod` 和 `mmap` 使用 POSIX s
 
 ## IPC Benchmark
 
+> 基准 harness 与全部跑分记录已迁至独立仓库 `CubeGardenEOS/datarouter-benchmark`
+> （`languages/rust/benches/`、`docs/benchmark-*.md`、`results/`）。本仓库不再维护基准代码与记录，
+> 本节仅保留实现侧结论；原始数据以 datarouter-benchmark 为准。
+
 ### unsafe 直接数据面（缺省）
 
-`benches/ipc_unsafe.rs`（`cargo bench --bench ipc_unsafe`，缺省即 unsafe；safe 模式用
-`--no-default-features`）走 unsafe 直接数据面：2 次拷贝、switch 不碰 payload。与下方正常
-路径对比见 `docs/benchmark-unsafe-2026-08.md`。
+`languages/rust/benches/ipc_unsafe.rs`（在 datarouter-benchmark 内 `cargo bench --bench ipc_unsafe`，
+缺省即 unsafe；safe 模式用 `--no-default-features`）走 unsafe 直接数据面：2 次拷贝、switch 不碰
+payload。与下方正常路径对比见 `datarouter-benchmark/docs/benchmark-unsafe-2026-08.md`。
 
 ### Rust Frontend 全链路（改造后 vs 基线）
 
-`benches/ipc_frontend.rs` 走完整 Rust Frontend（reader 线程 + 队列 + switch 路由），对比同一台机器上旧实现（reader 解包→重新打包、`MAX_APP_PAYLOAD=60KiB`）与本实现（原始字节入队、512KiB 单帧、4 次拷贝）。单程吞吐（portal→core，`recv_packed`）：
+`languages/rust/benches/ipc_frontend.rs` 走完整 Rust Frontend（reader 线程 + 队列 + switch 路由），对比
+同一台机器上旧实现（reader 解包→重新打包、`MAX_APP_PAYLOAD=60KiB`）与本实现（原始字节入队、
+512KiB 单帧、4 次拷贝）。单程吞吐（portal→core，`recv_packed`）：
 
 | payload | 旧实现 | 新实现 | 提升 |
 |---|---|---|---|
@@ -62,6 +68,7 @@ Linux 后端通过 `shm_open`、`ftruncate`、`fchmod` 和 `mmap` 使用 POSIX s
 pingpong 300KiB 往返 p50 从 `1152µs` 降到 `345µs`（3.3×）。64B/1KiB 往返 p50 基本持平（`55µs`/`72µs`）。拷贝预算从 7 次降到 4 次（`recv_packed` 全程不再 unpack/repack）。
 
 ```bash
+# 在 datarouter-benchmark 仓库内运行
 DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head -1) \
   cargo bench --bench ipc_frontend
 ```
@@ -69,7 +76,7 @@ DATAROUTER_SWITCH_BIN=$(find target/release/build -name datarouter-switch | head
 ### Java JNI / Python 绑定热路径（2026-08）
 
 跨语言 benchmark（`datarouter-benchmark`，pingpong/oneway/business 三种模式，见
-`docs/benchmark-unsafe-2026-08.md`）驱动出的两处绑定级瓶颈与修复：
+`datarouter-benchmark/docs/benchmark-unsafe-2026-08.md`）驱动出的两处绑定级瓶颈与修复：
 
 - **Java JNI 接收物化成本**：大负载每帧 `NewByteArray(300KB)+SetByteArrayRegion`
   （JVM heap 分配+拷贝+GC）占 300KB pingpong 延迟的大头。新增零拷贝接收
@@ -586,9 +593,9 @@ let info = core.unsafe_recv(&mut buf, 1000)?;   // 直接读自己的 RX ring
 3600，后台有 Gradle daemon 噪声）：pingpong 64B/1KiB 往返 p50 ≈ 3.1µs（约 10–20×），
 300KiB 单程吞吐 17.8 GiB/s（约 9.9×），32KiB/64KiB 单程 1.5–2.7×；小帧单程因 bench
 单线程交替 send/recv、unsafe 路径无 reader 预取而与正常路径持平（±10% 噪声内）。
-详见 `docs/benchmark-unsafe-2026-08.md`。后续三模式对比（safe / unsafe / unsafe-avx2，
+详见 `datarouter-benchmark/docs/benchmark-unsafe-2026-08.md`。后续三模式对比（safe / unsafe / unsafe-avx2，
 含 ring 容量 mask 化与手写 AVX2 拷贝的评估结论）见
-`docs/benchmark-modes-2026-08.md`。
+`datarouter-benchmark/docs/benchmark-modes-2026-08.md`。
 
 直接数据面审计加固（layout 11→12）：直写者改用独立 `direct_writers` pin 计数器并记录写者
 进程身份，槽位释放（含目标 owner 崩溃后回收）只在写者进程存活时等待其收尾、写者已死
@@ -666,7 +673,7 @@ keepalive/NOT_FOUND 恢复/`frame_len` 预取，实测比裸 port API 还快）�
 （`datarouter.h`，纯 C 共享库、无需 Rust）是**维护中的可选项**，不建议作为首选。
 P/Invoke 实测：边界开销 ~12ns/次可忽略；frontend 路由面是直接面的 ~8×（差异在数据面
 本身，非语言绑定），
-详见 `docs/benchmark-csharp-2026-08.md`。
+详见 `datarouter-benchmark/docs/benchmark-csharp-2026-08.md`。
 
 ### 启动顺序
 

@@ -43,7 +43,6 @@ include = [
     "src/signal.c",
     "src/validation.c",
     "src/validation.rs",
-    "benches/*.rs",
     "docs/*.md",
 ]
 
@@ -65,31 +64,6 @@ libc = "0.2"
 name = "blinkcms_datarouter"
 path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
-
-[[bench]]
-name = "protocol_hot_path"
-harness = false
-
-[[bench]]
-name = "keep_region"
-harness = false
-
-[[bench]]
-name = "validation_c"
-harness = false
-
-[[bench]]
-name = "ipc_frontend"
-harness = false
-
-[[bench]]
-name = "ipc_modes"
-harness = false
-
-[[bench]]
-name = "ipc_unsafe"
-harness = false
-required-features = ["unsafe"]
 
 [[test]]
 name = "direct_plane_multiprocess"

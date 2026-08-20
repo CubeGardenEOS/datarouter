@@ -72,7 +72,7 @@ ring 是 SPSC 设计，双写者会撕裂帧头/负载、触发 `corrupt_slot` �
 结论：**可行，但当前瓶颈不在指令选择，收益预期低；优先级低于 §2/§3 与下述
 mask 化优化**。
 
-依据（`docs/benchmark-unsafe-2026-08.md`）：
+依据（`datarouter-benchmark/docs/benchmark-unsafe-2026-08.md`）：
 
 - 300KiB 单程已 18.2 GiB/s，接近该机 memcpy 带宽上限，属于带宽受限；汇编换指令
   换不来带宽。
@@ -89,14 +89,14 @@ mask 化优化**。
    `ring_masked` 的 `% 524280`（真除法/libcall）变为 `& (CAP-1)`（单条 `and`，
    反汇编确认）；channel 磁盘布局为 8B 头 + 524288B 数据；同时给 C 库补上
    `-O3 -fno-strict-aliasing`（此前整个 C 库是 `-O0`）。
-2. **AVX2 已实测，结论：不采用**。详见 `docs/benchmark-modes-2026-08.md`：
+2. **AVX2 已实测，结论：不采用**。详见 `datarouter-benchmark/docs/benchmark-modes-2026-08.md`：
    手写 256-bit loadu/storeu 循环在 cache 热微基准里比 glibc memcpy 慢 19%，
    端到端 32KiB/64KiB 稳定落后，300KiB 持平；glibc 的 `__memmove_avx_unaligned_erms`
    本身即 AVX2 调优实现（scalar 模式下占 97% 周期）。`DATAROUTER_COPY=avx2`
    保留为实验开关，默认 scalar（libc memcpy）。
 3. **-march=native / 手写 asm：不做**。大帧是内存带宽受限（cache 热 50 GiB/s
    vs 端到端 ~18.6 GiB/s），换指令选型无收益；小帧瓶颈在流水线深度与原子/信号
-   开销。perf 剖面见 `docs/benchmark-modes-2026-08.md`。
+   开销。perf 剖面见 `datarouter-benchmark/docs/benchmark-modes-2026-08.md`。
 
 **AVX-512 升级路径（已预留）**：ring.c 的拷贝分派已是策略表
 （`kCopyStrategies`：scalar/avx2 + 每项 name/fn/supported 谓词）。未来若在
@@ -162,7 +162,7 @@ AVX-512 机器（Zen 4/Intel）上评估，只需新增 `copy_avx512` 内核
 - **已知残余**：运行时 per-shm 模式强制（§1 layout 13）、§2 排他写者规则、§6 可观测性
   仍未实现（本清单后续阶段）。
 - **C#/C++/Go 基准与绑定（2026-08）**：新增 `benches/csharp/`（dotnet 8 P/Invoke
-  基准）+ `docs/benchmark-csharp-2026-08.md`；Go 包 `go/datarouter/`、C++ RAII
+  基准）+ `datarouter-benchmark/docs/benchmark-csharp-2026-08.md`；Go 包 `go/datarouter/`、C++ RAII
   `include/datarouter_frontend.hpp` + `tests/test_frontend_cpp.cpp`。实测 P/Invoke
   边界 ~12ns/次可忽略；**frontend 直接面（缺省）比裸 port API 还快**（64B 4.17 vs
   6.97µs），路由面是直接面 ~8×。选型建议：默认 frontend 直接面，低层 port API 为

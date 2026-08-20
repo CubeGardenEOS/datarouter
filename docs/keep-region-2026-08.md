@@ -356,7 +356,7 @@ KEEP 命中延迟显著低于 ring 路由面全程延迟；跑分**分布在阶�
       `datarouter_protocol_frame_layout`）；`protocol.rs` 相应委托、`unpack` 改调。
 - [x] 阶段 A 全量基准回归：`protocol_hot_path` 无回归；跨语言 org 套件在既有
       ±30–60% 噪声带内。新增 `benches/validation_c.rs`（见
-      `docs/benchmark-validation-2026-08.md`）。
+      `datarouter-benchmark/docs/benchmark-validation-2026-08.md`）。
 - [ ] 前端下沉后续批次（路由/缓冲读取仲裁/Chunk-ACK/TLV builder 原语）由 C 提供，Rust 委托。
 
 **阶段 B（KEEP 区域）——M2 已完成（layout 13）**
