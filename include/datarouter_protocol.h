@@ -146,6 +146,17 @@ int datarouter_protocol_strip_chunk(const uint8_t *data, size_t len,
 int datarouter_protocol_ack_fields(const uint8_t *data, size_t len,
                                    uint64_t *id, uint16_t *index);
 
+/**
+ * Single-pass frame classification for the receive hot path: exact
+ * frame-header/length validation + var_data chunk-metadata TLV classify in
+ * one C call (one FFI crossing). Copy-neutral (reads borrowed bytes only).
+ * @return DATAROUTER_OK (fills *layout and *chunk) or
+ * DATAROUTER_ERR_PROTOCOL on header/length mismatch.
+ */
+int datarouter_protocol_classify_frame(const uint8_t *data, size_t buf_len,
+                                       datarouter_frame_layout *layout,
+                                       datarouter_chunk_meta *chunk);
+
 /* ── Opaque Types ───────────────────────────────────────────────────────── */
 
 typedef struct datarouter_message datarouter_message;

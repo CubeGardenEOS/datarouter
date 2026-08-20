@@ -1038,6 +1038,18 @@ pub fn raw_frame_layout(data: &[u8]) -> Option<(u8, u8, usize, usize)> {
     crate::validation::frame_layout(data)
 }
 
+/// Re-export of the C chunk classification outcome.
+pub use crate::validation::ChunkClass;
+
+/// Single-pass frame classification for the receive hot path: exact
+/// frame-header/length validation AND var_data chunk-metadata classify in one
+/// FFI crossing (copy-neutral). Returns `(message_type, flags, var_data_len,
+/// body_len, chunk_class)`.
+pub fn classify_frame(raw: &[u8]) -> Option<(u8, u8, usize, usize, ChunkClass)> {
+    crate::validation::classify_frame(raw)
+        .map(|f| (f.message_type, f.flags, f.var_data_len, f.body_len, f.chunk))
+}
+
 /// True when the var_data block is well-formed and carries no chunk
 /// metadata TLV at all. Such a frame is a complete single-frame message and
 /// can be queued verbatim (zero-copy) instead of being unpacked/repacked.

@@ -119,7 +119,7 @@ fn handle_raw_frame(
     source: [c_char; crate::DATAROUTER_SERVICE_NAME_MAX + 1],
     raw: Vec<u8>,
 ) {
-    let Some((message_type, _, vd_len, _)) = protocol::raw_frame_layout(&raw) else {
+    let Some((message_type, _, _vd_len, _, chunk)) = protocol::classify_frame(&raw) else {
         inner.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
         return;
     };
@@ -127,11 +127,7 @@ fn handle_raw_frame(
         message_type,
         protocol::MSG_CHUNK_ACK | protocol::MSG_CHUNK_ERROR
     );
-    if !is_chunk_control
-        && protocol::raw_is_single_frame(
-            &raw[protocol::HEADER_SIZE..protocol::HEADER_SIZE + vd_len],
-        )
-    {
+    if !is_chunk_control && chunk == protocol::ChunkClass::None {
         queue_complete_raw(inner, source, raw);
         return;
     }

@@ -62,12 +62,19 @@ Rust `protocol.rs` 相应经 FFI 委托（`src/validation.rs`），删除 Rust �
   `strip_chunk_metadata`、`chunk_control_fields_from_var_data` 全部改 FFI 委托。
 - 性能：接收热路径由「`raw_frame_layout`(C) + `validate_tlvs`(C FFI) + Rust 重扫 TLV」
   并为「`chunk_metadata` 单遍 C 分类」，消除一次冗余 FFI 调用与一次重复 TLV 扫描。
+- 进一步：新增 `datarouter_protocol_classify_frame`，把帧头精确校验 + TLV 分类合并为
+  **单次 FFI**（拷贝中性——只读已收到的借用字节，单帧仍 verbatim 入队 0 拷贝）；
+  `inbound.rs::handle_raw_frame` 改用一个调用。
 - 验收：
   - `protocol_hot_path`（决定性）无回归：64k direct 2.44ms / 512k direct 3.52ms。
   - `ipc_unsafe` 数据面持平：64B pingpong p50 3.56µs。
   - `validation_c` 新增接收分类指标：frame+single-frame 单遍分类 ~13.3 ns/op。
+  - `validation_c`：`classify_frame` 单 FFI 分类 ~12.6 ns/op（不易量化的数以拷贝为主）。
   - org 套件（`results/20260820-122526/`）无系统性回归，err=0。
   - `cargo test` 73 通过（含 chunk 分类/strip/ack FFI 语义测试）。
+  - **拷贝预算复核**：unsafe 直接数据面单程仍为 2 次拷贝（app→RX ring 1 次；
+    RX ring→app buffer 1 次），环回每方向 2 次；本轮校验/分类仅作用于已读入的借用
+    字节，未新增任何拷贝。
 
 ## 3. 验收结论
 

@@ -33,6 +33,12 @@ unsafe extern "C" {
         id: *mut u64,
         index: *mut u16,
     ) -> c_int;
+    fn datarouter_protocol_classify_frame(
+        data: *const u8,
+        buf_len: usize,
+        layout: *mut datarouter_frame_layout,
+        chunk: *mut datarouter_chunk_meta,
+    ) -> c_int;
 }
 
 /// Must match `datarouter_frame_layout` in `include/datarouter_protocol.h`
@@ -104,7 +110,7 @@ pub(crate) fn frame_layout(data: &[u8]) -> Option<(u8, u8, usize, usize)> {
 
 /// Chunk-classification outcome of a single-pass C TLV scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChunkClass {
+pub enum ChunkClass {
     /// Valid TLV, no chunk metadata at all.
     None,
     /// Valid TLV with all three chunk metadata fields present.
@@ -179,6 +185,58 @@ pub(crate) fn strip_chunk(var_data: &[u8]) -> Vec<u8> {
         out.truncate(required);
     }
     out
+}
+
+/// Result of a single-pass C frame classification (header + TLV classify).
+pub(crate) struct ClassifiedFrame {
+    pub message_type: u8,
+    pub flags: u8,
+    pub var_data_len: usize,
+    pub body_len: usize,
+    pub chunk: ChunkClass,
+}
+
+/// Single-pass frame classification via C: exact frame-header/length check and
+/// var_data chunk-metadata classify in one FFI crossing (copy-neutral).
+#[inline]
+pub(crate) fn classify_frame(raw: &[u8]) -> Option<ClassifiedFrame> {
+    let ptr = if raw.is_empty() {
+        std::ptr::null()
+    } else {
+        raw.as_ptr()
+    };
+    let mut layout = std::mem::MaybeUninit::<datarouter_frame_layout>::uninit();
+    let mut chunk = std::mem::MaybeUninit::<datarouter_chunk_meta>::uninit();
+    // SAFETY: ptr readable for len bytes (or NULL/0); layout/chunk are writable
+    // aligned MaybeUninit. C leaves them uninitialized on error, so we only read
+    // them after DATAROUTER_OK.
+    let code = unsafe {
+        datarouter_protocol_classify_frame(ptr, raw.len(), layout.as_mut_ptr(), chunk.as_mut_ptr())
+    };
+    if code != crate::DATAROUTER_OK {
+        return None;
+    }
+    // SAFETY: C fully initializes both on DATAROUTER_OK.
+    let layout = unsafe { layout.assume_init() };
+    let out = unsafe { chunk.assume_init() };
+    let chunk = match out.present {
+        0 => ChunkClass::None,
+        1 => ChunkClass::Complete {
+            id: out.chunk_id,
+            index: out.chunk_index as u16,
+            count: out.chunk_count as u16,
+            common_len: out.common_len,
+        },
+        -1 => ChunkClass::Incomplete,
+        _ => ChunkClass::Invalid,
+    };
+    Some(ClassifiedFrame {
+        message_type: layout.message_type,
+        flags: layout.flags,
+        var_data_len: layout.var_data_length as usize,
+        body_len: layout.body_length as usize,
+        chunk,
+    })
 }
 
 /// Extract the (chunk_id, chunk_index) pair from a chunk-control message's

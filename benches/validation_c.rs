@@ -77,6 +77,12 @@ fn main() {
     });
     let recv_ns = recv_time.as_nanos() as f64 / (iterations / 2) as f64;
 
+    // Single-pass frame classification (header + TLV classify in one FFI).
+    let one_time = best_ns(iterations / 2, || {
+        let _ = black_box(protocol::classify_frame(&frame));
+    });
+    let one_ns = one_time.as_nanos() as f64 / (iterations / 2) as f64;
+
     println!("validate_tlvs(blocksize={vd_len}B): {tlv_ns:.2} ns/op, {:.0} Mop/s", 1e9 / tlv_ns);
     println!(
         "raw_frame_layout(framesize={}B): {frame_ns:.2} ns/op, {:.0} Mop/s",
@@ -87,6 +93,10 @@ fn main() {
         "recv classify (frame + single-frame): {recv_ns:.2} ns/op, {:.0} Mop/s",
         1e9 / recv_ns
     );
+    println!(
+        "classify_frame (single FFI): {one_ns:.2} ns/op, {:.0} Mop/s",
+        1e9 / one_ns
+    );
 
     // Correctness self-check (the returned value is consumed so the optimizer
     // cannot elide the FFI calls).
@@ -94,5 +104,6 @@ fn main() {
     assert!(protocol::raw_frame_layout(&frame).is_some());
     assert!(protocol::validate_tlvs(&var_data[..var_data.len() - 1]).is_err());
     assert!(protocol::raw_is_single_frame(&var_data));
+    assert!(protocol::classify_frame(&frame).is_some());
     println!("validation self-check passed");
 }

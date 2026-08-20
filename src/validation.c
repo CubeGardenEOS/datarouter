@@ -65,6 +65,34 @@ int datarouter_protocol_validate_tlvs(const uint8_t *data, size_t len) {
  * lengths do not match `buf_len`, and DATAROUTER_ERR_INVALID_ARGUMENT when
  * `out` is NULL. `data` is only dereferenced after the `buf_len >= 8` guard.
  */
+/*
+ * Single-pass frame classification for the receive hot path: performs the
+ * exact frame-header/length validation AND the var_data chunk-metadata TLV
+ * classification in one C call, so the caller needs a single FFI crossing
+ * instead of (frame_layout + chunk_metadata). Copy-neutral: this only reads
+ * the already-received bytes; it never copies payload.
+ *
+ * Returns DATAROUTER_OK and fills *layout and *chunk when the frame header is
+ * well-formed and exactly matches buf_len; otherwise DATAROUTER_ERR_PROTOCOL.
+ * chunk->present carries the TLV outcome as in datarouter_protocol_chunk_metadata.
+ */
+int datarouter_protocol_classify_frame(const uint8_t *data, size_t buf_len,
+                                       datarouter_frame_layout *layout,
+                                       datarouter_chunk_meta *chunk) {
+    if (layout == NULL || chunk == NULL || (buf_len != 0 && data == NULL)) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    int rc = datarouter_protocol_frame_layout(data, buf_len, layout);
+    if (rc != DATAROUTER_OK) {
+        return rc;
+    }
+    /* The exact-length validation guarantees [8, 8+var_data_length) is in-bounds. */
+    size_t vd_len = layout->var_data_length;
+    (void)datarouter_protocol_chunk_metadata(
+        data + DATAROUTER_FRAME_HEADER_SIZE, vd_len, chunk);
+    return DATAROUTER_OK;
+}
+
 int datarouter_protocol_frame_layout(const uint8_t *data, size_t buf_len,
                                      datarouter_frame_layout *out) {
     if (out == NULL) {
