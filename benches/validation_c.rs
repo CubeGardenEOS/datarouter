@@ -106,4 +106,28 @@ fn main() {
     assert!(protocol::raw_is_single_frame(&var_data));
     assert!(protocol::classify_frame(&frame).is_some());
     println!("validation self-check passed");
+
+    // TLV builder: build a 4-field business var_data via VarDataBuilder (now
+    // routed through the C `datarouter_tlv_append` single source of truth).
+    let build_time = best_ns(iterations / 2, || {
+        let mut vd = protocol::VarDataBuilder::new();
+        vd.module("public").action("asset.read").request_id("r1");
+        let _ = black_box(vd.build());
+    });
+    let build_ns = build_time.as_nanos() as f64 / (iterations / 2) as f64;
+
+    // TLV read: single-pass validate+find via C datarouter_tlv_find.
+    let read_time = best_ns(iterations / 2, || {
+        let mut vd = protocol::VarDataBuilder::new();
+        vd.module("public").action("asset.read").request_id("r1");
+        let vd = black_box(vd.build());
+        let _ = black_box(protocol::tlv_read_string(&vd, protocol::TAG_ACTION));
+    });
+    let read_ns = read_time.as_nanos() as f64 / (iterations / 2) as f64;
+
+    println!("tlv build (3 fields): {build_ns:.2} ns/op, {:.0} Mop/s", 1e9 / build_ns);
+    println!(
+        "tlv find+read (single FFI): {read_ns:.2} ns/op, {:.0} Mop/s",
+        1e9 / read_ns
+    );
 }

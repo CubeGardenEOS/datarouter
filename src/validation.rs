@@ -39,6 +39,31 @@ unsafe extern "C" {
         layout: *mut datarouter_frame_layout,
         chunk: *mut datarouter_chunk_meta,
     ) -> c_int;
+    fn datarouter_tlv_append(
+        buf: *mut u8,
+        cap: usize,
+        len: usize,
+        tag: u8,
+        data: *const u8,
+        data_len: usize,
+        out_new_len: *mut usize,
+    ) -> c_int;
+    fn datarouter_tlv_find(
+        data: *const u8,
+        data_len: usize,
+        tag: u8,
+        start: usize,
+        out_value: *mut *const u8,
+        out_len: *mut usize,
+    ) -> c_int;
+    fn datarouter_tlv_next(
+        data: *const u8,
+        data_len: usize,
+        cursor: *mut usize,
+        out_tag: *mut u8,
+        out_value: *mut *const u8,
+        out_len: *mut usize,
+    ) -> c_int;
 }
 
 /// Must match `datarouter_frame_layout` in `include/datarouter_protocol.h`
@@ -260,6 +285,140 @@ pub(crate) fn ack_fields(var_data: &[u8]) -> Option<(u64, u16)> {
     }
 }
 
+/// Append one TLV into a Rust `Vec<u8>`, growing as needed, via the C
+/// single source of truth. This is the ONLY copy on the builder path (the C
+/// memcpy of value -> block). `data` must not alias `buf`.
+///
+/// Returns `Err(&'static str)` with the same messages the historical Rust
+/// builder used (`"TLV value exceeds u16"`, `"TLV builder length overflow"`),
+/// so callers' error strings are unchanged.
+pub(crate) fn tlv_append(buf: &mut Vec<u8>, tag: u8, data: &[u8]) -> Result<(), &'static str> {
+    if data.len() > u16::MAX as usize {
+        return Err("TLV value exceeds u16");
+    }
+    let Some(need) = 3usize.checked_add(data.len()) else {
+        return Err("TLV builder length overflow");
+    };
+    if buf.len().checked_add(need).is_none() {
+        return Err("TLV builder length overflow");
+    }
+    let mine = (buf.capacity() - buf.len()) < need;
+    if mine {
+        buf.reserve(need);
+    }
+    if (buf.capacity() - buf.len()) < need {
+        // Safety net: C would reject with FULL; treat as builder length overflow.
+        return Err("TLV builder length overflow");
+    }
+    let mut new_len = 0usize;
+    // SAFETY: buf is a live Vec with capacity >= len+need (reserved above), so
+    // C writes exactly need bytes at offset len within capacity. data is a
+    // disjoint readable region owned by the caller. set_len below adopts the
+    // C-written bytes.
+    let code = unsafe {
+        datarouter_tlv_append(
+            buf.as_mut_ptr(),
+            buf.capacity(),
+            buf.len(),
+            tag,
+            if data.is_empty() {
+                std::ptr::null()
+            } else {
+                data.as_ptr()
+            },
+            data.len(),
+            &mut new_len,
+        )
+    };
+    match code {
+        crate::DATAROUTER_OK => {
+            // SAFETY: new_len <= capacity (C only writes within cap) and >= len.
+            unsafe { buf.set_len(new_len) };
+            Ok(())
+        }
+        crate::DATAROUTER_ERR_PAYLOAD_TOO_LARGE => Err("TLV value exceeds u16"),
+        _ => Err("TLV builder length overflow"),
+    }
+}
+
+/// Single-pass validate-and-find over a full TLV block via C. Returns
+/// `Ok(Some((value_off, value_len)))` on a match (offsets borrow var_data),
+/// `Ok(None)` on a clean block without the tag, `Err(())` on a malformed block.
+pub(crate) fn tlv_find(
+    var_data: &[u8],
+    tag: u8,
+    start: usize,
+) -> Result<Option<(usize, usize)>, ()> {
+    let data = if var_data.is_empty() {
+        std::ptr::null()
+    } else {
+        var_data.as_ptr()
+    };
+    let mut value: *const u8 = std::ptr::null();
+    let mut out_len = 0usize;
+    // SAFETY: data readable for var_data.len() bytes (or NULL/0). C sets
+    // value/out_len only on DATAROUTER_OK and never writes out of bounds.
+    let code = unsafe {
+        datarouter_tlv_find(data, var_data.len(), tag, start, &mut value, &mut out_len)
+    };
+    match code {
+        crate::DATAROUTER_OK => {
+            let off = (value as usize).wrapping_sub(var_data.as_ptr() as usize);
+            if off + out_len > var_data.len() {
+                return Err(());
+            }
+            Ok(Some((off, out_len)))
+        }
+        crate::DATAROUTER_ERR_NOT_FOUND => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// In-order iterate over a TLV block via C. Returns the (tag, value_off,
+/// value_len) entries, or `Err` with `"truncated TLV header"` /
+/// `"truncated TLV value"` on malformed input (distinct C outcome codes).
+pub(crate) fn tlv_walk(var_data: &[u8]) -> Result<Vec<(u8, usize, usize)>, &'static str> {
+    let data = if var_data.is_empty() {
+        std::ptr::null()
+    } else {
+        var_data.as_ptr()
+    };
+    let len = var_data.len();
+    let mut cursor = 0usize;
+    let mut out = Vec::new();
+    loop {
+        let mut tag = 0u8;
+        let mut value: *const u8 = std::ptr::null();
+        let mut value_len = 0usize;
+        // SAFETY: data readable for len bytes; C only advances cursor within
+        // len and writes out* on DECODED.
+        let code = unsafe {
+            datarouter_tlv_next(
+                data,
+                len,
+                &mut cursor,
+                &mut tag,
+                &mut value,
+                &mut value_len,
+            )
+        };
+        if code == 1 {
+            let off = (value as usize).wrapping_sub(var_data.as_ptr() as usize);
+            if off + value_len > len {
+                return Err("truncated TLV value");
+            }
+            out.push((tag, off, value_len));
+        } else if code == 0 {
+            break;
+        } else if code == -1 {
+            return Err("truncated TLV header");
+        } else {
+            return Err("truncated TLV value");
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +540,54 @@ mod tests {
         assert_eq!(frame_layout(&frame[..6]), None);
         // empty
         assert_eq!(frame_layout(b""), None);
+    }
+
+    #[test]
+    fn c_tlv_append_find_next_round_trip() {
+        let mut block: Vec<u8> = Vec::new();
+        assert!(tlv_append(&mut block, 0x0F, b"admin").is_ok());
+        assert!(tlv_append(&mut block, 0x10, b"test").is_ok());
+        let expect = [
+            0x0F, 5, 0, b'a', b'd', b'm', b'i', b'n', // module="admin"
+            0x10, 4, 0, b't', b'e', b's', b't', // action="test"
+        ];
+        assert_eq!(block, expect);
+
+        // find returns value offset + length (borrowing block) .
+        let (off, len) = tlv_find(&block, 0x10, 0).unwrap().unwrap();
+        assert_eq!(&block[off..off + len], b"test");
+        assert_eq!(tlv_find(&block, 0x99, 0).unwrap(), None);
+
+        // in-order walk.
+        let walk = tlv_walk(&block).unwrap();
+        assert_eq!(walk.len(), 2);
+        assert_eq!(&block[walk[0].1..walk[0].1 + walk[0].2], b"admin");
+        assert_eq!(&block[walk[1].1..walk[1].1 + walk[1].2], b"test");
+    }
+
+    #[test]
+    fn c_tlv_truncation_codes_are_distinct() {
+        // truncated value: header says 4 but only 1 byte follows.
+        assert_eq!(tlv_walk(&[0x10, 4, 0, b'x']).unwrap_err(), "truncated TLV value");
+        // truncated header: 2 bytes remain, not enough for a 3-byte header.
+        assert_eq!(tlv_walk(&[0x10, 4]).unwrap_err(), "truncated TLV header");
+    }
+
+    #[test]
+    fn c_tlv_append_rejects_oversized_and_grows() {
+        // oversized value (> u16) is rejected with the builder error string.
+        let big = vec![0u8; 0x1_0000];
+        let mut block: Vec<u8> = Vec::new();
+        assert_eq!(
+            tlv_append(&mut block, 0x0F, &big).unwrap_err(),
+            "TLV value exceeds u16"
+        );
+        // growth across many appends keeps everything intact.
+        let mut block: Vec<u8> = Vec::new();
+        for i in 0u8..40 {
+            tlv_append(&mut block, i, &[i; 7]).unwrap();
+        }
+        assert_eq!(block.len(), 40 * 10);
+        assert_eq!(tlv_find(&block, 39, 0).unwrap().unwrap(), (39 * 10 + 3, 7usize));
     }
 }

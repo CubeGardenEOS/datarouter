@@ -319,23 +319,10 @@ pub fn unpack(data: &[u8]) -> Result<Message, &'static str> {
 
 /// Read a raw byte slice field from var_data by tag.
 pub fn tlv_read_bytes(var_data: &[u8], tag: u8) -> Option<&[u8]> {
-    if validate_tlvs(var_data).is_err() {
-        return None;
-    }
-    let mut i = 0;
-    while i + 3 <= var_data.len() {
-        let t = var_data[i];
-        let l = u16::from_le_bytes([var_data[i + 1], var_data[i + 2]]) as usize;
-        i += 3;
-        if i + l > var_data.len() {
-            return None;
-        }
-        if t == tag {
-            return Some(&var_data[i..i + l]);
-        }
-        i += l;
-    }
-    None
+    // Single C pass (validate + find); zero-copy borrow of var_data.
+    crate::validation::tlv_find(var_data, tag, 0)
+        .ok()?
+        .map(|(off, len)| &var_data[off..off + len])
 }
 
 /// Read a UTF-8 string field from var_data by tag.
@@ -364,19 +351,11 @@ pub fn tlv_read_byte(var_data: &[u8], tag: u8) -> Option<u8> {
 /// Read all TLV entries from var_data as a map of tag -> bytes.
 pub fn tlv_read_all(var_data: &[u8]) -> HashMap<u8, Vec<u8>> {
     let mut map = HashMap::new();
-    if validate_tlvs(var_data).is_err() {
+    let Ok(entries) = crate::validation::tlv_walk(var_data) else {
         return map;
-    }
-    let mut i = 0;
-    while i + 3 <= var_data.len() {
-        let t = var_data[i];
-        let l = u16::from_le_bytes([var_data[i + 1], var_data[i + 2]]) as usize;
-        i += 3;
-        if i + l > var_data.len() {
-            break;
-        }
-        map.insert(t, var_data[i..i + l].to_vec());
-        i += l;
+    };
+    for (tag, off, len) in entries {
+        map.insert(tag, var_data[off..off + len].to_vec());
     }
     map
 }
@@ -415,23 +394,10 @@ impl VarDataBuilder {
     }
 
     fn put(&mut self, tag: u8, data: &[u8]) -> &mut Self {
-        let Ok(len) = u16::try_from(data.len()) else {
-            self.error = Some("TLV value exceeds u16");
-            return self;
-        };
-        if self
-            .buf
-            .len()
-            .checked_add(3)
-            .and_then(|value| value.checked_add(data.len()))
-            .is_none()
-        {
-            self.error = Some("TLV builder length overflow");
-            return self;
+        // The single builder copy happens inside C (`src/tlv.c` append).
+        if let Err(error) = crate::validation::tlv_append(&mut self.buf, tag, data) {
+            self.error = Some(error);
         }
-        self.buf.push(tag);
-        self.buf.extend_from_slice(&len.to_le_bytes());
-        self.buf.extend_from_slice(data);
         self
     }
 
@@ -1285,26 +1251,18 @@ pub fn pack_business_response_into(
 pub fn parse_business_fields(msg: &Message) -> Result<BusinessFields, &'static str> {
     let mut fields = BusinessFields::default();
     let mut seen = [false; 256];
-    let mut offset = 0usize;
-    while offset < msg.var_data.len() {
-        let header_end = offset.checked_add(3).ok_or("TLV offset overflow")?;
-        if header_end > msg.var_data.len() {
-            return Err("truncated TLV header");
-        }
-        let tag = msg.var_data[offset];
-        let len = u16::from_le_bytes([msg.var_data[offset + 1], msg.var_data[offset + 2]]) as usize;
-        let value_end = header_end.checked_add(len).ok_or("TLV length overflow")?;
-        if value_end > msg.var_data.len() {
-            return Err("truncated TLV value");
-        }
-        let value = &msg.var_data[header_end..value_end];
+    // The raw TLV walk is C (`src/tlv.c`); this function supplies only the
+    // business-schema policy (field mapping, first-occurrence dedup, UTF-8 and
+    // streaming validation) on top of it.
+    let entries = crate::validation::tlv_walk(&msg.var_data)?;
+    for (tag, off, len) in entries {
+        let value = &msg.var_data[off..off + len];
         let string = |value: &[u8]| {
             std::str::from_utf8(value)
                 .map(str::to_owned)
                 .map_err(|_| "business field is not UTF-8")
         };
         if seen[usize::from(tag)] {
-            offset = value_end;
             continue;
         }
         seen[usize::from(tag)] = true;
@@ -1323,7 +1281,6 @@ pub fn parse_business_fields(msg: &Message) -> Result<BusinessFields, &'static s
             TAG_CONTEXT => fields.context = Some(value.to_vec()),
             _ => {}
         }
-        offset = value_end;
     }
     Ok(fields)
 }

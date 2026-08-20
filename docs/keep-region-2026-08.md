@@ -327,9 +327,15 @@ int datarouter_keep_grant(datarouter_port *port, const char *service_name);
   `datarouter_protocol_strip_chunk`、`datarouter_protocol_ack_fields`。Rust 的
   `parse_chunk_metadata`/`strip_chunk_metadata`/`chunk_control_fields_from_var_data`/
   `raw_is_single_frame` 全部委托；接收热路径由「validate+重扫」改为单遍 C 分类。
+- **TLV builder/reader 原语也下沉 C（A6，单独评审后落地）**：新增 `src/tlv.c`
+  （`datarouter_tlv_append` 编码原语 + `datarouter_tlv_find` 单遍校验查找 +
+  `datarouter_tlv_next` 迭代）。原 `protocol_ffi.rs` 导出的 `datarouter_tlv_put_*`/
+  `read_*` 公共 ABI 不变，其底层 `protocol::VarDataBuilder`/`tlv_read_*`/`parse_business_fields`
+  全部改走 C；Rust 删除自身的 TLV walk 实现，`parse_business_fields` 仅保留字段映射/
+  去重/UTF-8 校验等业务策略。拷贝纪律：append 只有 1 次 memcpy（value→block），
+  find/next 返回块内指针（零拷贝），未突破 2 拷贝数据面。
 - 本项已随更新计划**阶段 A**（先于 KEEP）落地；A6（TLV builder 原语原生下沉）按用户
   意见**单独评审**后再实施。
-
 ## 8. 基准与验收
 
 新增 `benches/keep_region.rs`（或等价 C bench，与 `benches/ipc_modes.rs` 同机同方法）评测：

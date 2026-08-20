@@ -229,6 +229,46 @@ void datarouter_tlv_put_u16(datarouter_message *msg, uint8_t tag, uint16_t value
  */
 void datarouter_tlv_put_byte(datarouter_message *msg, uint8_t tag, uint8_t value);
 
+/* ── TLV Builder / Reader primitives (C single source of truth) ─────────── */
+
+/**
+ * Append one TLV (`[tag][LE16 len][value]`) to a caller-owned growable byte
+ * block. Performs exactly one memcpy (value -> block); never reallocates — the
+ * caller grows and retries on DATAROUTER_ERR_FULL.
+ * @param buf Capable buffer; may be NULL only when cap/len/data_len are 0.
+ * @param cap Usable capacity of buf (not its allocated size).
+ * @param len Bytes already filled in buf (append offset).
+ * @param data Value bytes; may be NULL only when data_len is 0.
+ * @param out_new_len Receives len + 3 + data_len on success.
+ * @return DATAROUTER_OK, DATAROUTER_ERR_INVALID_ARGUMENT,
+ * DATAROUTER_ERR_PAYLOAD_TOO_LARGE (value > 0xFFFF), DATAROUTER_ERR_FULL
+ * (caller must grow), or DATAROUTER_ERR_PROTOCOL (length overflow).
+ */
+int datarouter_tlv_append(uint8_t *buf, size_t cap, size_t len, uint8_t tag,
+                          const void *data, size_t data_len, size_t *out_new_len);
+
+/**
+ * Single-pass validate-and-find over a full TLV block. Full-scan so a
+ * malformed tail yields DATAROUTER_ERR_PROTOCOL even when the target tag
+ * precedes it. Returns a POINTER INTO the block (zero-copy).
+ * @param tag  TLV tag to locate (first match at/after @p start).
+ * @param start Byte offset to begin matching at (0 scans the whole head).
+ * @param out_value Set to the value bytes inside the block on success.
+ * @return DATAROUTER_OK, DATAROUTER_ERR_NOT_FOUND (clean block, no match),
+ * DATAROUTER_ERR_PROTOCOL (malformed), DATAROUTER_ERR_INVALID_ARGUMENT.
+ */
+int datarouter_tlv_find(const uint8_t *data, size_t data_len, uint8_t tag,
+                        size_t start, const uint8_t **out_value, size_t *out_len);
+
+/**
+ * In-order TLV iterator. Decodes the entry at byte offset *cursor; on success
+ * sets *out_tag, *out_value (into the block), *out_len and advances *cursor.
+ * @return 1 decoded, 0 clean end of iteration, -1 truncated header,
+ * -2 truncated value, -3 invalid argument.
+ */
+int datarouter_tlv_next(const uint8_t *data, size_t data_len, size_t *cursor,
+                        uint8_t *out_tag, const uint8_t **out_value, size_t *out_len);
+
 /* ── TLV Readers ────────────────────────────────────────────────────────── */
 
 /**

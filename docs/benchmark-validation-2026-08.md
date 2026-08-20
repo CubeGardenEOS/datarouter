@@ -76,6 +76,22 @@ Rust `protocol.rs` 相应经 FFI 委托（`src/validation.rs`），删除 Rust �
     RX ring→app buffer 1 次），环回每方向 2 次；本轮校验/分类仅作用于已读入的借用
     字节，未新增任何拷贝。
 
+## A6 补充（TLV builder/reader 原生下沉 C，单独评审项）
+
+- 新增 `src/tlv.c`：`datarouter_tlv_append`（编码，1 次 memcpy）、`datarouter_tlv_find`
+  （单遍校验+查找，返回块内指针零拷贝）、`datarouter_tlv_next`（迭代，区分
+  truncated-header/value 两类截断码）。
+- Rust `protocol::VarDataBuilder`/`tlv_read_*`/`tlv_read_all`/`parse_business_fields` 全部
+  改调 C；`protocol_ffi.rs` 公共 ABI 不变，其底层自动路由到 C。接收/业务读路径不再有
+  Rust 第二份 TLV walk。
+- 验收：
+  - `protocol_hot_path` 无回归（64k direct 2.40ms / 512k direct 3.52ms）——pack 的
+    var_data 构建改走 C append 后仍满足 ±5%。
+  - `ipc_unsafe` 数据面持平（64B p50 3.49µs；300KiB 19.5 GB/s）。
+  - `validation_c`：tlv build（3 字段）~91.6 ns/op；tlv find+read（单 FFI）~132.9 ns/op。
+  - org 套件（`results/20260820-124910/`）无系统性回归（~1–2% 噪声带），err=0。
+  - `cargo test` 76 通过（含 append/find/next 与截断码 FFI 语义测试）。
+
 ## 3. 验收结论
 
 - 确定性基准（被改路径的直接度量）无回归 → 满足“±5%”硬门槛。
