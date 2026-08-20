@@ -113,6 +113,39 @@ int datarouter_protocol_validate_tlvs(const uint8_t *data, size_t len);
 int datarouter_protocol_frame_layout(const uint8_t *data, size_t buf_len,
                                      datarouter_frame_layout *out);
 
+/* Chunk-classification outcome of a single TLV pass. */
+typedef struct {
+    int      present;    /* 0=none 1=complete(all three) -1=incomplete -2=invalid */
+    uint8_t  has_chunk;  /* 1 if any chunk tag present */
+    uint64_t chunk_id;
+    uint32_t chunk_index;
+    uint32_t chunk_count;
+    size_t   common_len; /* bytes strip_chunk would retain when present==1 */
+} datarouter_chunk_meta;
+
+/**
+ * Single-pass TLV validate + classify (mirrors Rust `parse_chunk_metadata`).
+ * Always returns DATAROUTER_OK; out->present carries the outcome
+ * (0 none / 1 complete / -1 incomplete / -2 malformed or invalid).
+ */
+int datarouter_protocol_chunk_metadata(const uint8_t *data, size_t len,
+                                       datarouter_chunk_meta *out);
+
+/**
+ * Single-pass strip of chunk TLV fields (mirrors Rust `strip_chunk_metadata`).
+ * Returns DATAROUTER_OK, sets *out_len; copies when cap is large enough.
+ */
+int datarouter_protocol_strip_chunk(const uint8_t *data, size_t len,
+                                    uint8_t *out, size_t cap, size_t *out_len);
+
+/**
+ * Extract (chunk_id, chunk_index) from a chunk-control message's var_data
+ * (mirrors Rust `chunk_control_fields_from_var_data`).
+ * @return DATAROUTER_OK (fills *id,*index) or DATAROUTER_ERR_NOT_FOUND.
+ */
+int datarouter_protocol_ack_fields(const uint8_t *data, size_t len,
+                                   uint64_t *id, uint16_t *index);
+
 /* ── Opaque Types ───────────────────────────────────────────────────────── */
 
 typedef struct datarouter_message datarouter_message;

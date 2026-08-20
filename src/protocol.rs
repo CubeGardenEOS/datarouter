@@ -992,67 +992,25 @@ fn complete_wire_len(var_data_len: usize, body_len: usize) -> Option<usize> {
 }
 
 fn parse_chunk_metadata(var_data: &[u8]) -> Result<Option<ChunkMetadata>, &'static str> {
-    validate_tlvs(var_data)?;
-    let mut id = None;
-    let mut index = None;
-    let mut count = None;
-    let mut common_var_data = Vec::with_capacity(var_data.len());
-    let mut offset = 0usize;
-    while offset < var_data.len() {
-        let entry_start = offset;
-        let tag = var_data[offset];
-        let len = u16::from_le_bytes([var_data[offset + 1], var_data[offset + 2]]) as usize;
-        let value_start = offset + 3;
-        let value_end = value_start + len;
-        let value = &var_data[value_start..value_end];
-        match tag {
-            TAG_CHUNK_ID => {
-                if id.is_some() || value.len() != 8 {
-                    return Err("invalid or duplicate chunk id");
-                }
-                id = Some(u64::from_le_bytes(
-                    value.try_into().map_err(|_| "invalid chunk id")?,
-                ));
-            }
-            TAG_CHUNK_INDEX => {
-                if index.is_some() || value.len() != 2 {
-                    return Err("invalid or duplicate chunk index");
-                }
-                index = Some(u16::from_le_bytes(
-                    value.try_into().map_err(|_| "invalid chunk index")?,
-                ));
-            }
-            TAG_CHUNK_COUNT => {
-                if count.is_some() || value.len() != 2 {
-                    return Err("invalid or duplicate chunk count");
-                }
-                count = Some(u16::from_le_bytes(
-                    value.try_into().map_err(|_| "invalid chunk count")?,
-                ));
-            }
-            _ => common_var_data.extend_from_slice(&var_data[entry_start..value_end]),
+    match crate::validation::chunk_classify(var_data) {
+        crate::validation::ChunkClass::None => Ok(None),
+        crate::validation::ChunkClass::Complete { id, index, count, .. } => {
+            let common_var_data = crate::validation::strip_chunk(var_data);
+            Ok(Some(ChunkMetadata {
+                id,
+                index,
+                count,
+                common_var_data,
+            }))
         }
-        offset = value_end;
-    }
-    match (id, index, count) {
-        (None, None, None) => Ok(None),
-        (Some(id), Some(index), Some(count)) => Ok(Some(ChunkMetadata {
-            id,
-            index,
-            count,
-            common_var_data,
-        })),
-        _ => Err("incomplete chunk metadata"),
+        crate::validation::ChunkClass::Incomplete => Err("incomplete chunk metadata"),
+        crate::validation::ChunkClass::Invalid => Err("invalid chunk metadata"),
     }
 }
 
 /// Remove chunk TLV fields from var_data.
 pub fn strip_chunk_metadata(var_data: &[u8]) -> Vec<u8> {
-    parse_chunk_metadata(var_data)
-        .ok()
-        .flatten()
-        .map(|metadata| metadata.common_var_data)
-        .unwrap_or_else(|| var_data.to_vec())
+    crate::validation::strip_chunk(var_data)
 }
 
 /// Build a chunk ack message for the given chunked message.
@@ -1084,45 +1042,11 @@ pub fn raw_frame_layout(data: &[u8]) -> Option<(u8, u8, usize, usize)> {
 /// metadata TLV at all. Such a frame is a complete single-frame message and
 /// can be queued verbatim (zero-copy) instead of being unpacked/repacked.
 pub fn raw_is_single_frame(var_data: &[u8]) -> bool {
-    if validate_tlvs(var_data).is_err() {
-        return false;
-    }
-    let mut offset = 0usize;
-    while offset < var_data.len() {
-        let tag = var_data[offset];
-        let len = u16::from_le_bytes([var_data[offset + 1], var_data[offset + 2]]) as usize;
-        if matches!(tag, TAG_CHUNK_ID | TAG_CHUNK_INDEX | TAG_CHUNK_COUNT) {
-            return false;
-        }
-        offset = offset + 3 + len;
-    }
-    true
+    matches!(crate::validation::chunk_classify(var_data), crate::validation::ChunkClass::None)
 }
 
 fn chunk_control_fields_from_var_data(var_data: &[u8]) -> Option<(u64, u16)> {
-    validate_tlvs(var_data).ok()?;
-    let mut id = None;
-    let mut index = None;
-    let mut offset = 0usize;
-    while offset < var_data.len() {
-        let tag = var_data[offset];
-        let len = u16::from_le_bytes([var_data[offset + 1], var_data[offset + 2]]) as usize;
-        let value_start = offset + 3;
-        let value_end = value_start + len;
-        let value = &var_data[value_start..value_end];
-        match tag {
-            TAG_CHUNK_ID if id.is_none() && value.len() == 8 => {
-                id = Some(u64::from_le_bytes(value.try_into().ok()?));
-            }
-            TAG_CHUNK_INDEX if index.is_none() && value.len() == 2 => {
-                index = Some(u16::from_le_bytes(value.try_into().ok()?));
-            }
-            TAG_CHUNK_ID | TAG_CHUNK_INDEX => return None,
-            _ => {}
-        }
-        offset = value_end;
-    }
-    Some((id?, index?))
+    crate::validation::ack_fields(var_data)
 }
 
 fn chunk_control_fields(msg: &Message) -> Option<(u64, u16)> {

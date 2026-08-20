@@ -66,11 +66,26 @@ fn main() {
     });
     let frame_ns = frame_time.as_nanos() as f64 / iterations as f64;
 
+    // Receive-path classification: frame header validation + single-frame
+    // detection (which now happen in one C pass; the old path did a separate
+    // FFI validate_tlvs call plus a redundant Rust TLV re-scan).
+    let recv_time = best_ns(iterations / 2, || {
+        let _ = black_box(protocol::raw_frame_layout(&frame));
+        let _ = black_box(protocol::raw_is_single_frame(
+            &frame[protocol::HEADER_SIZE..protocol::HEADER_SIZE + var_data.len()],
+        ));
+    });
+    let recv_ns = recv_time.as_nanos() as f64 / (iterations / 2) as f64;
+
     println!("validate_tlvs(blocksize={vd_len}B): {tlv_ns:.2} ns/op, {:.0} Mop/s", 1e9 / tlv_ns);
     println!(
         "raw_frame_layout(framesize={}B): {frame_ns:.2} ns/op, {:.0} Mop/s",
         frame.len(),
         1e9 / frame_ns
+    );
+    println!(
+        "recv classify (frame + single-frame): {recv_ns:.2} ns/op, {:.0} Mop/s",
+        1e9 / recv_ns
     );
 
     // Correctness self-check (the returned value is consumed so the optimizer
@@ -78,5 +93,6 @@ fn main() {
     assert!(protocol::validate_tlvs(&var_data).is_ok());
     assert!(protocol::raw_frame_layout(&frame).is_some());
     assert!(protocol::validate_tlvs(&var_data[..var_data.len() - 1]).is_err());
+    assert!(protocol::raw_is_single_frame(&var_data));
     println!("validation self-check passed");
 }

@@ -55,6 +55,20 @@ Rust `protocol.rs` 相应经 FFI 委托（`src/validation.rs`），删除 Rust �
 - 结论：org 套件未显示**系统性**回归；p50 数据面延迟（c、rust↔rust 跨语言 4.0–4.1 µs）
   与基线一致。
 
+## M1.5 补充（chunk/ack 编解码下沉 + 接收热路径优化）
+
+- C 新增 `datarouter_protocol_chunk_metadata`（单遍校验+分类）/ `strip_chunk` /
+  `ack_fields`；Rust `raw_is_single_frame`、`parse_chunk_metadata`、
+  `strip_chunk_metadata`、`chunk_control_fields_from_var_data` 全部改 FFI 委托。
+- 性能：接收热路径由「`raw_frame_layout`(C) + `validate_tlvs`(C FFI) + Rust 重扫 TLV」
+  并为「`chunk_metadata` 单遍 C 分类」，消除一次冗余 FFI 调用与一次重复 TLV 扫描。
+- 验收：
+  - `protocol_hot_path`（决定性）无回归：64k direct 2.44ms / 512k direct 3.52ms。
+  - `ipc_unsafe` 数据面持平：64B pingpong p50 3.56µs。
+  - `validation_c` 新增接收分类指标：frame+single-frame 单遍分类 ~13.3 ns/op。
+  - org 套件（`results/20260820-122526/`）无系统性回归，err=0。
+  - `cargo test` 73 通过（含 chunk 分类/strip/ack FFI 语义测试）。
+
 ## 3. 验收结论
 
 - 确定性基准（被改路径的直接度量）无回归 → 满足“±5%”硬门槛。

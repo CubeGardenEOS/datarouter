@@ -322,8 +322,13 @@ int datarouter_keep_grant(datarouter_port *port, const char *service_name);
   `include/datarouter_protocol.h`。
 - Rust 侧 `protocol.rs::validate_tlvs` / `raw_frame_layout` / `unpack` 均改用
   `src/validation.rs` FFI 委托（`protocol.rs::validate_tlvs` 不再有第二份实现）。
-- 本项已随更新计划**阶段 A**（先于 KEEP）落地；A3–A7（路由/缓冲读取仲裁/
-  Chunk-ACK/TLV builder 原生下沉）为后续批次，见 `docs/update-plan-2026-08.md`。
+- **Chunk/ACK 编解码也下沉 C（M1.5）**：`datarouter_protocol_chunk_metadata`（单遍
+  校验+分类，`datarouter_chunk_meta.present` 区分 none/complete/incomplete/invalid）、
+  `datarouter_protocol_strip_chunk`、`datarouter_protocol_ack_fields`。Rust 的
+  `parse_chunk_metadata`/`strip_chunk_metadata`/`chunk_control_fields_from_var_data`/
+  `raw_is_single_frame` 全部委托；接收热路径由「validate+重扫」改为单遍 C 分类。
+- 本项已随更新计划**阶段 A**（先于 KEEP）落地；A6（TLV builder 原语原生下沉）按用户
+  意见**单独评审**后再实施。
 
 ## 8. 基准与验收
 

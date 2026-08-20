@@ -39,15 +39,17 @@ KEEP 区域的正确性依赖三块基础能力，它们目前分散在 Rust 前
 |---|---|---|---|---|---|
 | A1 | TLV 校验 | `protocol.rs::validate_tlvs` | `src/validation.c`：`datarouter_protocol_validate_tlvs`（已完成） | 仅 FFI 委托 + 错误码映射 | ✅ |
 | A2 | 帧头解析 | `frontend.rs`/`unpack`/`raw_frame_layout` 内联 | `src/validation.c`：`datarouter_protocol_frame_layout`（已完成，含结构） | 组合与上层语义 | ✅ |
-| A3 | 路由解析 | `frontend.rs::send` 内联查找 | `datarouter_route_lookup(port, service_name, out_route)`：走 registry 表 + 生成期校验 | 调用方策略（超时/重试） | ⏳ 后续批次 |
-| A4 | 缓冲读取仲裁 | `frontend.rs::recv_packed`/`PortFrontend` | `datarouter_recv_packed(port, timeout_ms, out, cap, &out_len, &src_route)`（peek 头→校验→读 body 循环） | 队列/背压/超限语义仍在上层 | ⏳ 后续批次 |
-| A5 | Chunk/ACK 编解码 | `frontend/outbound.rs` 与 message 内联 | `datarouter_chunk_id/seq/total` 编解码 + `datarouter_ack_build/parse` | ack 等待表、超时判定 | ⏳ 后续批次 |
-| A6 | TLV builder 原语 | `protocol.rs::VarDataBuilder` / `tlv_read_*` | 既有 C ABI（`datarouter_tlv_put_*`/`read_*`）实现下沉为 C（重构） | 类型化消息门面（保持 ergonomic） | ⏳ 后续批次 |
-| A7 | 诊断快照 | `registry_diagnostic` | 复用 `datarouter_registry_snapshot`，补 `datarouter_keep_stats` 同风格标准输出 | 格式化渲染 | ⏳ 后续批次 |
+| A3 | 路由解析 | `frontend.rs::send` 内联查找 | **审计结论**：已下沉 —— `port.c` 的 `datarouter_send`/`unsafe_send` 内部经 `datarouter_registry_find_*` 完成 service 名→slot 解析；Rust 仅保留重试/回退编排（按设计原则留 Rust） | 调用方策略（超时/重试） | ✅ 审计 |
+| A4 | 缓冲读取仲裁 | `frontend.rs::recv_packed`/`PortFrontend` | **审计结论**：已下沉 —— 环读取/帧头校验原语在 C（`datarouter_recv`/`unsafe_recv` + `frame_layout`）；仲裁/背压/队列仍在上层 | 队列/背压/超限语义仍在上层 | ✅ 审计 |
+| A5 | Chunk/ACK 编解码 | `protocol.rs` 内联（`parse_chunk_metadata`/`strip_chunk_metadata`/`chunk_control_fields`） | `src/validation.c`：`datarouter_protocol_chunk_metadata` / `strip_chunk` / `ack_fields`（已完成，单遍分类） | ack 等待表、超时判定（Rust） | ✅ |
+| A6 | TLV builder 原语 | `protocol.rs::VarDataBuilder` / `tlv_read_*` + `protocol_ffi.rs` | 既有 C ABI（`datarouter_tlv_put_*`/`read_*`）实现下沉为 C（重构） | 类型化消息门面（保持 ergonomic） | ⏳ 单独评审 |
+| A7 | 诊断快照 | `registry_diagnostic` | **审计结论**：数据图已下沉（`datarouter_registry_snapshot`）；文本渲染留绑定层 | 格式化渲染 | ✅ 审计 |
 
-> 说明：M1（第一批下沉）＝ A1 + A2（wire 校验单一事实来源，正是约束 2 的强制项），
-> 已落地并跑分（见 §1.4 与 `docs/benchmark-validation-2026-08.md`）。A3–A7 为**后续批次**，
-> 待评审后再实施。
+> 说明：M1（第一批下沉）＝ A1 + A2；M1.5（本轮）＝ A5（chunk/ack 编解码单遍 C 实现）+
+> A3/A4/A7 审计（确认路由、缓冲读取原语、诊断快照已在 C，Rust 仅编排/渲染）+
+> 接收热路径性能优化（`raw_is_single_frame` 由「validate+重扫」并为一趟 C 分类，消除一次
+> 冗余 FFI 与一次重复 TLV 扫描）。A6（TLV builder 原生下沉）跨所有绑定、工作量较大，
+> 按用户意见**单独评审**后再实施。
 ### 1.3 阶段 A 落成物
 
 - `src/validation.c`、`src/frontend.c`（或并入 `port.c` 的原语组）、`include/datarouter.h` 新增
@@ -89,7 +91,7 @@ KEEP 区域的正确性依赖三块基础能力，它们目前分散在 Rust 前
 |---|---|---|---|
 | M0 | 本计划评审通过 | 计划落库（本文档合入） | ✅ 评审通过 |
 | M1 | 阶段 A 第一批下沉：A1 校验 + A2 帧头 → C（约束 2 强制项），Rust 委托 | 测试平移全绿；确定性跑分（`protocol_hot_path`）无回归；跨语言 org 套件在既有噪声带内 | ✅ 已落地 + 跑分 |
-| M1.5 | 阶段 A 后续批次 A3–A7 | 同 M1 出口条件（每批独立跑分） | ⏳ 待评审 |
+| M1.5 | 阶段 A 后续：A5 chunk/ack 编解码 → C（单遍分类）；A3/A4/A7 审计确认已下沉；接收热路径单遍优化 | 测试全绿；决定性跑分无回归；org 套件无系统性回归 | ✅ 已落地 + 跑分 |
 | M2 | 阶段 B KEEP 代码（layout 13） | 集成测试全绿（含崩溃自愈/碰撞删除/重启重放）；跑分达标 | ⏳ |
 | M3 | 全量回归 + 文档（README/KEEP/基准报告） | 覆盖式发布 latest；AGENTS.md 约束保持一致 | ⏳ |
 
