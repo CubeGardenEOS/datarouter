@@ -17,6 +17,7 @@ from blinkcms_datarouter.protocol import (
     MAX_APP_PAYLOAD,
     MSG_BUSINESS_REQUEST,
     MSG_BUSINESS_RESPONSE,
+    MSG_CONTROL,
     MSG_LOG_NOTICE,
     TAG_ACTION,
     TAG_ACTOR_UUID,
@@ -68,6 +69,7 @@ class TestTagConstantsMatchRust(unittest.TestCase):
         self.assertEqual(MSG_BUSINESS_REQUEST, 0x07)
         self.assertEqual(MSG_BUSINESS_RESPONSE, 0x8C)
         self.assertEqual(MSG_LOG_NOTICE, 0x8D)
+        self.assertEqual(MSG_CONTROL, 0x8B)
 
     def test_max_app_payload(self) -> None:
         # 512 KiB power-of-two ring capacity minus 8-byte frame header.

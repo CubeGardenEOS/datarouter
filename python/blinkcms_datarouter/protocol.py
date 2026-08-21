@@ -38,6 +38,7 @@ MAX_APP_PAYLOAD: int = (512 * 1024) - 8
 MSG_BUSINESS_REQUEST: int = 0x07
 MSG_BUSINESS_RESPONSE: int = 0x8C
 MSG_LOG_NOTICE: int = 0x8D
+MSG_CONTROL: int = 0x8B
 
 
 @dataclass
