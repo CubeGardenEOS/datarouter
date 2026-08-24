@@ -150,6 +150,7 @@ fn queue_complete_raw(
         inner.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    tracing::debug!(len = raw.len(), "datarouter inbound frame queued");
     match inner.complete_queue.try_push(QueuedMessage {
         source,
         packed: raw,
@@ -211,6 +212,7 @@ fn handle_inbound_message(
 
 fn expire_reassemblies(inner: &FrontendInner, processor: &mut protocol::InboundProcessor) {
     for expired in processor.expire(Instant::now()) {
+        tracing::warn!(source = %expired.source, "datarouter reassembly expired");
         inner
             .stats
             .reassembly_expired

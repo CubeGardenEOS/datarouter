@@ -164,6 +164,12 @@ impl Frontend {
         let options = options.normalized()?;
         let port = port_frontend::PortFrontend::open(&options)?;
         let keepalive_interval = keepalive_interval(port.ttl_ms());
+        tracing::debug!(
+            service = %options.service_name,
+            shm = %options.shm_name,
+            direct = direct,
+            "datarouter frontend connected"
+        );
         let inner = Arc::new(FrontendInner {
             direct,
             complete_queue: queue::BoundedQueue::new(options.app_queue_capacity),
@@ -197,6 +203,12 @@ impl Frontend {
     }
 
     pub fn send(&self, target_service: &str, packed: &[u8], timeout_ms: u32) -> Result<(), c_int> {
+        tracing::debug!(
+            target = %target_service,
+            len = packed.len(),
+            direct = self.inner.direct,
+            "datarouter send frame"
+        );
         #[cfg(feature = "unsafe")]
         if self.inner.direct {
             // Direct data plane: single-frame only, straight into the target
@@ -1461,7 +1473,18 @@ mod tests {
         let shm_name = format!("/datarouter-{prefix}-{nanos}");
         unlink_shm(&shm_name);
         let child = TestSwitch::spawn(&shm_name);
-        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(10));
+            let probe = FrontendOptions {
+                shm_name: shm_name.clone(),
+                service_name: String::new(),
+                connect_timeout_ms: 100,
+                ..FrontendOptions::default()
+            };
+            if port_frontend::PortFrontend::open_raw(&probe).is_ok() {
+                break;
+            }
+        }
         Some(TestSwitch {
             child: Some(child),
             shm_name,

@@ -59,6 +59,7 @@ default = ["unsafe"]
 
 [dependencies]
 libc = "0.2"
+tracing = "0.1"
 
 [lib]
 name = "blinkcms_datarouter"

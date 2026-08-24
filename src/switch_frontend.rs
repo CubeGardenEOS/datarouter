@@ -450,6 +450,11 @@ impl SwitchHandle {
     /// transient temp file); no script or resource file is required.
     pub fn start(config: SwitchConfig) -> Result<Self, SwitchError> {
         config.validate()?;
+        tracing::info!(
+            shm = %config.shm_name,
+            max_ports = config.max_ports,
+            "datarouter switch starting"
+        );
         let shm_name = config.shm_name.clone();
         if probe_open(&shm_name, config.token.as_deref()).is_ok() {
             return Err(SwitchError::AlreadyRunning(shm_name));
@@ -466,6 +471,7 @@ impl SwitchHandle {
             handle.release_temp_binary();
         }
         ready?;
+        tracing::info!(shm = %shm_name, "datarouter switch ready");
         Ok(handle)
     }
 
@@ -506,6 +512,7 @@ impl SwitchHandle {
     /// switch unlinks its shared-memory object on exit; any temp materialized
     /// binary is removed.
     pub fn stop(&mut self) -> Result<(), SwitchError> {
+        tracing::info!(shm = %self.config.shm_name, "datarouter switch stopping");
         if let Some(mut child) = self.child.take() {
             stop_child(&mut child);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -520,6 +527,7 @@ impl SwitchHandle {
             }
         }
         self.materialized = None;
+        tracing::info!(shm = %self.config.shm_name, "datarouter switch stopped");
         Ok(())
     }
 
@@ -582,6 +590,11 @@ impl SwitchHandle {
     /// Grow (or shrink back) the switch capacity. This is a graceful restart
     /// with a new `--max-ports`; existing frontends re-register automatically.
     pub fn expand_capacity(&mut self, new_max_ports: u32) -> Result<SwitchStatus, SwitchError> {
+        tracing::info!(
+            shm = %self.config.shm_name,
+            new_max_ports = new_max_ports,
+            "datarouter switch capacity expanding"
+        );
         if !(1..=HARD_MAX_PORTS).contains(&new_max_ports) {
             return Err(SwitchError::InvalidConfig(format!(
                 "max_ports {new_max_ports} out of range 1..={HARD_MAX_PORTS}"

@@ -868,6 +868,26 @@ static void handle_control_request_slot(
             result_code,
             result_message
         );
+    } else if (operation == DATAROUTER_REG_OP_UNREGISTER) {
+        switch_log(
+            options,
+            result_code == DATAROUTER_OK ? SWITCH_LOG_INFO : SWITCH_LOG_WARN,
+            "unregister service=%s slot=%u code=%d message=%s",
+            service_name,
+            assigned_slot,
+            result_code,
+            result_message
+        );
+    } else if (operation == DATAROUTER_REG_OP_KEEP_GRANT) {
+        switch_log(
+            options,
+            result_code == DATAROUTER_OK ? SWITCH_LOG_INFO : SWITCH_LOG_WARN,
+            "keep write grant service=%s slot=%u code=%d message=%s",
+            service_name,
+            assigned_slot,
+            result_code,
+            result_message
+        );
     }
 }
 
