@@ -19,11 +19,14 @@ Version 2）约束。新增代码与文档默认沿用该许可，不得引入�
   `CGEOS-cgeai`、`CGEOS-office`、`CGEOS-stronghold`。
 - **服务（Python）**：`CGEOS-storage`、`CGEOS-content`、`CGEOS-ml`、
   `CGEOS-shared-python`（共享层）。
-- **轻量服务/库**：`CGEOS-adaptor`、`CGEOS-erp`、`CGEOS-insight`、`CGEOS-media`、
-  `CGEOS-outpost`。
+- **业务服务（Java/Spring Boot）**：`CGEOS-erp`（ERP 核心：单据引擎/基础资料/库存/资金，
+  Spring Boot 4.1.0 LTS 多模块 Maven 工程，PostgreSQL via CGEOS database，datarouter JNI 接入）。
+- **审计服务（C#/.NET 8）**：`CGEOS-audit`（独立非实时审计与版本管理，HDF5 存储，BLAKE3 哈希链）。
+- **轻量服务/库**：`CGEOS-adaptor`、`CGEOS-insight`、`CGEOS-media`、`CGEOS-outpost`。
 - **对外发布**：`CGEOS-client-service`（`@blinkcms/client-service`，含
   CGEOS-blinkimage 子模块）、`CGEOS-protect`（`@blinkcms/protect-wasm`）、
-  `CGEOS-access-service`（`@blinkcms/access-service`，访客访问 SDK + Rust 核心）。
+  `CGEOS-access-service`（`@blinkcms/access-service`，访客访问 SDK + Rust 核心）、
+  `CGEOS-database-client`（Java/Rust 客户端库，支持 JDBC / R2DBC / sqlx driver）。
 - **工具**：`CGEOS-cli`（`cgeos-cli`，AI 智能体 CLI）。
 - **客户端/模板**：`BizPilot`（桌面/Android 管理端 hyper）、`BlinkCMS`（mdui
   站点/展示站模板；经典微信小程序已废弃并删除）。
@@ -98,3 +101,9 @@ core 以 submodule 引用各服务与共享库：`services/*`（上述服务仓�
 5. **禁止使用 Bot 账号提交（必须使用本地 SSH 密钥）**：除非 CI/CD 自动化流水线必须（如自动化构建发布），
    否则所有日常开发、功能变更与代码维护**必须使用开发人员本地 SSH 密钥**进行 Git 提交与推送。严禁滥用 Bot
    账号代理日常提交，以防止提交记录责任不清、难以追责。
+6. **Action 严格大驼峰命名（PascalCase）**：系统内所有协议消息、WebSocket `/terminal` 入口、
+   DataRouter IPC 路由、服务注册与对外 SDK 中的 Action 标识，每一层级命名空间与动作谓词
+   均使用 PascalCase（大驼峰）并以英文点号 `.` 分隔（例如 `Core.Auth.Login`、`Cms.Tenant.Products.List`、
+   `Public.Products.Detail`、`Cgeai.Admin.Channels.List`、`Ml.Agent.Run`、`Erp.Document.Submit`、
+   `Dbc.Query`、`Storage.Frontend.Package.List`）。严禁使用小写下划线（snake_case）或小驼峰（camelCase）
+   作为 Action 字符串；新增或修改 Action 时文档与代码必须同步更新。
