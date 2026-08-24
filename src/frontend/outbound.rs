@@ -123,11 +123,6 @@ fn send_chunked(
     let msg = protocol::unpack(packed).map_err(|_| crate::DATAROUTER_ERR_PROTOCOL)?;
     let chunks = protocol::chunk(&msg, protocol::MAX_APP_PAYLOAD)
         .map_err(|_| crate::DATAROUTER_ERR_PROTOCOL)?;
-    tracing::debug!(
-        target = %target_service,
-        chunks = chunks.len(),
-        "datarouter sending chunked message"
-    );
     for chunk in chunks {
         send_one_chunk(inner, target_service, chunk.message, timeout_ms)?;
     }
@@ -172,7 +167,6 @@ fn wait_for_ack(
         Ok(crate::DATAROUTER_OK) => Ok(()),
         Ok(code) => Err(code),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            tracing::warn!(key = %key, "datarouter ACK timeout");
             inner.ack_waiters.remove(key);
             inner.stats.ack_timeouts.fetch_add(1, Ordering::Relaxed);
             Err(crate::DATAROUTER_ERR_TIMEOUT)
