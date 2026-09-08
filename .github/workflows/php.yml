@@ -1,0 +1,36 @@
+name: PHP 8.2 verification
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        type: choice
+        options: [smoke, full]
+        default: smoke
+  push:
+    paths: ['php/**', '.github/workflows/php.yml']
+permissions:
+  contents: read
+concurrency:
+  group: php82-benchmark-host
+  cancel-in-progress: false
+jobs:
+  verify:
+    # This dedicated machine supplies PHP 8.2 NTS CLI/FPM/dev, Rust and the
+    # CGEOS/cli + datarouter-benchmark checkouts. Full never compares hosts.
+    runs-on: [self-hosted, linux, x64, php82-benchmark]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build current CLI and verify PHP
+        env:
+          PHP_PROFILE: ${{ inputs.profile || 'smoke' }}
+          CGEOS_ASSEMBLY: ${{ vars.CGEOS_ASSEMBLY }}
+          DATAROUTER_BENCHMARK_DIR: ${{ vars.DATAROUTER_BENCHMARK_DIR }}
+        run: |
+          set -euo pipefail
+          test -n "$CGEOS_ASSEMBLY"
+          test -n "$DATAROUTER_BENCHMARK_DIR"
+          cargo build --locked --manifest-path "$CGEOS_ASSEMBLY/cli/Cargo.toml"
+          "$CGEOS_ASSEMBLY/cli/target/debug/cgeos-cli" datarouter php verify \
+            --profile "$PHP_PROFILE" --datarouter "$GITHUB_WORKSPACE" \
+            --benchmark "$DATAROUTER_BENCHMARK_DIR"

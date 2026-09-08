@@ -712,3 +712,8 @@ sudo systemctl start blinkcms-core
 ```
 
 `blinkcms-datarouter-switch.service` 声明 `Before=blinkcms-edge-node.service`，确保 switch 在 Edge Node 之前启动。Core 和 Python worker 的 systemd unit 应添加 `After=blinkcms-datarouter-switch.service` 和 `Wants=blinkcms-datarouter-switch.service`。
+
+## PHP 8.2 NTS
+
+Linux CLI/FPM 原生接入与独立验收见 [PHP 8.2 NTS](php/README.md)。
+通过 `cgeos-cli datarouter php verify --profile smoke|full` 执行；默认矩阵不变。

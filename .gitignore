@@ -10,3 +10,5 @@
 *.egg-info/
 /benches/csharp/bin/
 /benches/csharp/obj/
+
+/php/__pycache__/
