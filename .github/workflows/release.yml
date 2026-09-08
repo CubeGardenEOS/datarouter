@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "v*"
-      - "cgeos-v*"
+      - "latest"
 
 permissions:
   contents: write
@@ -29,8 +28,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build --wheel --outdir dist
-      - name: Publish GitHub Release
+      - name: Publish replaceable latest Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
           files: python/dist/*.whl
-          generate_release_notes: true
+          overwrite_files: true
+          generate_release_notes: false
