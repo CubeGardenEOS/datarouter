@@ -7,6 +7,30 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+
+#ifdef DATAROUTER_TEST_WRAP_PID
+/* Pause precisely after KEEP has read its authorization snapshot. Linker
+ * wrapping affects this test's C objects, not sanitizer shared libraries. */
+static _Thread_local int pause_pid;
+static atomic_int stopped_pid;
+static atomic_int resume_pid;
+extern pid_t __real_getpid(void);
+pid_t __wrap_getpid(void) {
+    if (pause_pid) {
+        pause_pid = 0;
+        atomic_store(&stopped_pid, 1);
+        while (!atomic_load(&resume_pid)) datarouter_yield();
+    }
+    return __real_getpid();
+}
+typedef struct { datarouter_port *port; int result; } paused_write;
+static void *write_after_pause(void *arg) {
+    paused_write *work = arg;
+    pause_pid = 1;
+    work->result = datarouter_keep_put(work->port, "stale", 5, "value", 5, 0);
+    return NULL;
+}
+#endif
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -44,6 +68,7 @@ static void keep_operations(const char *scenario) {
     assert(datarouter_init_shared_memory_with_keep(shm, 2, 60000, 0, 1024*1024, 8192) == DATAROUTER_OK);
     datarouter_port p = {0};
     p.shm = shm; p.map_size = size; p.slot_index = 0; p.route_id = 64;
+    memcpy(p.service_name, "core", 5);
     uint32_t uid;
     assert(datarouter_process_identity(getpid(), &uid, &p.process_start_id) == DATAROUTER_OK);
     datarouter_registry_entry *e = &shm->control.registry[0];
@@ -57,7 +82,31 @@ static void keep_operations(const char *scenario) {
     datarouter_registry_store_name(e, "core");
     atomic_store(&shm->control.keep_write_allow_bitmap, 1);
     char out[2048]; size_t len = 0;
-    if (!strcmp(scenario, "empty")) {
+    if (!strcmp(scenario, "keep_write_lifetime") || !strcmp(scenario, "keep_write_revoked")) {
+#ifdef DATAROUTER_TEST_WRAP_PID
+        paused_write work = { .port = &p, .result = -1 };
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, write_after_pause, &work) == 0);
+        uint64_t deadline = datarouter_now_ns() + 2000000000ULL;
+        while (!atomic_load(&stopped_pid)) {
+            assert(datarouter_now_ns() < deadline);
+            datarouter_yield();
+        }
+        if (!strcmp(scenario, "keep_write_revoked"))
+            atomic_store(&shm->control.keep_write_allow_bitmap, 0);
+        else
+            assert(datarouter_registry_release_slot(shm, 0) == 1);
+        atomic_store(&resume_pid, 1);
+        assert(pthread_join(thread, NULL) == 0);
+        assert(work.result == DATAROUTER_ERR_PERMISSION);
+        assert(datarouter_keep_get(&p, "stale", 5, out, sizeof(out), &len) == DATAROUTER_ERR_NOT_FOUND);
+#else
+        assert(!"this test requires --wrap=getpid");
+#endif
+    } else if (!strcmp(scenario, "key_limit")) {
+        char key[DATAROUTER_KEEP_KEY_MAX + 1U] = {0};
+        assert(datarouter_keep_invalidate(&p, key, sizeof(key)) == DATAROUTER_ERR_INVALID_ARGUMENT);
+    } else if (!strcmp(scenario, "empty")) {
         assert(datarouter_keep_put(&p, NULL, 0, NULL, 0, 0) == DATAROUTER_OK);
         assert(datarouter_keep_get(&p, NULL, 0, NULL, 0, &len) == DATAROUTER_OK && len == 0);
         assert(datarouter_keep_put(&p, "k", 1, "value", 5, 0) == DATAROUTER_OK);

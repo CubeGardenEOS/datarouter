@@ -392,6 +392,33 @@ static int keep_write_authorized(datarouter_port *port) {
     return DATAROUTER_OK;
 }
 
+static int keep_write_acquire(datarouter_port *port, datarouter_keep_header *h,
+                              datarouter_registry_entry **owner) {
+    datarouter_registry_entry *entry = &port->shm->control.registry[port->slot_index];
+    if (!datarouter_registry_pin_self(entry, keep_current_pid(),
+            atomic_load_explicit(&entry->uid, memory_order_relaxed), port->process_start_id,
+            port->route_id, port->service_name)) return DATAROUTER_ERR_PERMISSION;
+    int rc = keep_acquire_checked(h);
+    if (rc == DATAROUTER_OK) {
+        /* The earlier permission check can race unregister or revocation.
+         * This check is the write's authorization point. The registration
+         * pin then prevents reuse throughout the cache mutation. */
+        rc = keep_write_authorized(port);
+        if (rc == DATAROUTER_OK) {
+            *owner = entry;
+            return DATAROUTER_OK;
+        }
+        keep_writer_release(h);
+    }
+    datarouter_registry_unpin(entry);
+    return rc;
+}
+
+static void keep_write_release(datarouter_keep_header *h, datarouter_registry_entry *owner) {
+    keep_writer_release(h);
+    datarouter_registry_unpin(owner);
+}
+
 int datarouter_keep_get_ref(datarouter_port *port, const void *key, size_t key_len,
                             const void **value_out, size_t *value_len_out, uint64_t *seq_out) {
     if (!port || !port->shm || !value_out || !value_len_out || !seq_out ||
@@ -467,7 +494,8 @@ int datarouter_keep_put(
         return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
     }
     
-    int rc = keep_acquire_checked(h);
+    datarouter_registry_entry *owner = NULL;
+    int rc = keep_write_acquire(port, h, &owner);
     if (rc != DATAROUTER_OK) return rc;
     datarouter_keep_slot *rehash_tmp = NULL;
     if (h->tombstones > h->slot_capacity / 4u)
@@ -476,7 +504,7 @@ int datarouter_keep_put(
     uint32_t need = KEEP_ALIGN8(sizeof(datarouter_keep_entry_hdr) + (uint32_t)key_len + (uint32_t)value_len);
     uint64_t now = datarouter_now_ns();
     if (ttl_ns > UINT64_MAX - now) {
-        keep_writer_release(h);
+        keep_write_release(h, owner);
         free(rehash_tmp);
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
@@ -498,7 +526,7 @@ int datarouter_keep_put(
     uint32_t off = 0u;
     rc = keep_arena_alloc(h, arena, need, now, &off);
     if (rc != DATAROUTER_OK) {
-        keep_writer_release(h);
+        keep_write_release(h, owner);
         free(rehash_tmp);
         return rc;
     }
@@ -517,19 +545,19 @@ int datarouter_keep_put(
                 off, off + (uint32_t)sizeof(datarouter_keep_entry_hdr) + (uint32_t)key_len,
                 (uint32_t)value_len, 1u);
     if (ir != DATAROUTER_OK) {
-        keep_writer_release(h);
+        keep_write_release(h, owner);
         free(rehash_tmp);
         return ir;
     }
     h->entry_count++;
-    keep_writer_release(h);
+    keep_write_release(h, owner);
     free(rehash_tmp);
     result = DATAROUTER_OK;
     return result;
 }
 
 int datarouter_keep_invalidate(datarouter_port *port, const void *key, size_t key_len) {
-    if (!port || (key == NULL && key_len != 0u)) {
+    if (!port || (key == NULL && key_len != 0u) || key_len > DATAROUTER_KEEP_KEY_MAX) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     int auth = keep_write_authorized(port);
@@ -540,7 +568,8 @@ int datarouter_keep_invalidate(datarouter_port *port, const void *key, size_t ke
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
-    int rc = keep_acquire_checked(h);
+    datarouter_registry_entry *owner = NULL;
+    int rc = keep_write_acquire(port, h, &owner);
     if (rc != DATAROUTER_OK) {
         return rc;
     }
@@ -549,14 +578,14 @@ int datarouter_keep_invalidate(datarouter_port *port, const void *key, size_t ke
     uint8_t *arena = keep_arena(h);
     datarouter_keep_slot *s = slot_find(h, slots, arena, key, key_len, hash);
     if (!s) {
-        keep_writer_release(h);
+        keep_write_release(h, owner);
         return DATAROUTER_ERR_NOT_FOUND;
     }
     slot_mark_tombstone(h, s);
     if (h->entry_count > 0u) {
         h->entry_count--;
     }
-    keep_writer_release(h);
+    keep_write_release(h, owner);
     return DATAROUTER_OK;
 }
 
@@ -572,7 +601,8 @@ int datarouter_keep_invalidate_prefix(datarouter_port *port, const void *prefix,
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
-    int rc = keep_acquire_checked(h);
+    datarouter_registry_entry *owner = NULL;
+    int rc = keep_write_acquire(port, h, &owner);
     if (rc != DATAROUTER_OK) {
         return rc;
     }
@@ -602,7 +632,7 @@ int datarouter_keep_invalidate_prefix(datarouter_port *port, const void *prefix,
             h->entry_count--;
         }
     }
-    keep_writer_release(h);
+    keep_write_release(h, owner);
     (void)arena;
     return DATAROUTER_OK;
 }

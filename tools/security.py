@@ -69,11 +69,12 @@ def main():
                 test_source = ROOT/'tests'/(test+'.c')
                 copied = out/(label+'-'+test+'.c')
                 copied.write_text(test_source.read_text().replace('../src/', str(source/'src')+'/'))
-                if run(common + ['-g', '-O1', '-fno-omit-frame-pointer',
+                test_flags = ['-DDATAROUTER_TEST_WRAP_PID', '-Wl,--wrap=getpid'] if test == 'test_security' else []
+                if run(common + test_flags + ['-g', '-O1', '-fno-omit-frame-pointer',
                                  '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
                                  copied] + sources + ['-o', binary], label+'-'+test+'-build', source):
                     result[label][test+'_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
-                    cases = ['tlvs', 'layout', 'chunk', 'ref', 'keep', 'empty', 'ttl', 'lease', 'wrap', 'prefix', 'generation', 'recovery', 'writer_lifetime', 'pin_lifetime'] if test == 'test_security' else ['all']
+                    cases = ['tlvs', 'layout', 'chunk', 'ref', 'keep', 'empty', 'ttl', 'lease', 'wrap', 'prefix', 'generation', 'recovery', 'writer_lifetime', 'pin_lifetime', 'keep_write_lifetime', 'keep_write_revoked', 'key_limit'] if test == 'test_security' else ['all']
                     for case in cases:
                         run([binary, case], label+'-'+test+'-'+case, source,
                             dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=1',
