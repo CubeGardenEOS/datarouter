@@ -89,6 +89,7 @@ pub struct FrontendInner {
     pub direct: bool,
     pub options: FrontendOptions,
     pub closing: AtomicBool,
+    keep_scope: Arc<()>,
     pub ack_waiters: outbound::AckWaiters,
     pub complete_queue: queue::BoundedQueue<QueuedMessage>,
     /// Reusable receive buffers returned by the application side after
@@ -170,6 +171,7 @@ impl Frontend {
             ack_waiters: outbound::AckWaiters::new(options.max_pending_acks),
             buffer_pool: Mutex::new(std::collections::VecDeque::new()),
             closing: AtomicBool::new(false),
+            keep_scope: Arc::new(()),
             stats: FrontendStats::default(),
             port: RwLock::new(Some(port)),
             keepalive_interval,
@@ -561,22 +563,25 @@ impl Frontend {
             .map_err(keep::KeepStatus::from_code)?
     }
 
-    /// KEEP 两段式零拷贝读。调用方在复制/交付 value 后必须调用
-    /// [`Self::keep_verify_ref`]（data 可能被并发写撕裂）。返回的指针仅在本调用
-    /// 期间有效，严禁跨异保存续。
+    /// Own a KEEP mapping and C read lease until the returned guard is dropped.
+    pub fn keep_reference(&self, key: &[u8]) -> Result<keep::KeepReference, keep::KeepStatus> {
+        self.inner.with_port(|p| keep::keep_reference(p, key))
+            .map_err(keep::KeepStatus::from_code)?
+    }
+
+    /// KEEP 两段式零拷贝读。映射与 C 读引用保留至 verify_ref 完成。
     ///
     /// # Safety
-    /// 见 `keep::keep_get_ref`——返回的裸指针指向共享内存，交付前必须复检。
+    /// 完成读取后必须调用 verify_ref；验证之后不得继续读取指针。
+    /// 应在丢弃 frontend 前完成验证，避免泄漏读引用。优先使用 keep_reference。
     pub unsafe fn keep_get_ref(&self, key: &[u8]) -> Result<(*const u8, usize, u64), keep::KeepStatus> {
         self.inner
-            .with_port(|p| unsafe { keep::keep_get_ref(p, key) })
+            .with_port(|p| unsafe { keep::keep_get_ref_scoped(p, key, Some(Arc::clone(&self.inner.keep_scope))) })
             .map_err(keep::KeepStatus::from_code)?
     }
 
     pub fn keep_verify_ref(&self, seq: u64) -> Result<(), keep::KeepStatus> {
-        self.inner
-            .with_port(|p| keep::keep_verify_ref(p, seq))
-            .map_err(keep::KeepStatus::from_code)?
+        keep::keep_verify_ref_scoped(&self.inner.keep_scope, seq)
     }
 
     /// 写入（需本服务被授权为 KEEP 写方）。`ttl_ns == 0` 永不过期。

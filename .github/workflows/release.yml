@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: publish-latest
+  cancel-in-progress: false
+
 defaults:
   run:
     working-directory: python
@@ -27,7 +31,19 @@ jobs:
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip build
-          python -m build --wheel --outdir dist
+          python -m build --outdir dist
+      - name: Point latest at the built source
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.git.getRef({...context.repo, ref: 'tags/latest'});
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({...context.repo, ref: 'refs/tags/latest', sha: context.sha});
+              return;
+            }
+            await github.rest.git.updateRef({...context.repo, ref: 'tags/latest', sha: context.sha, force: true});
       - name: Publish replaceable latest Release
         uses: softprops/action-gh-release@v2
         with:
@@ -35,3 +51,24 @@ jobs:
           files: python/dist/*.whl
           overwrite_files: true
           generate_release_notes: false
+      - name: Remove superseded wheel assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const current = new Set(fs.readdirSync('python/dist').filter(name => name.endsWith('.whl')));
+            if (!current.size) throw new Error('No built wheels; refusing asset cleanup');
+            const {data: release} = await github.rest.repos.getReleaseByTag({...context.repo, tag: 'latest'});
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              ...context.repo, release_id: release.id, per_page: 100
+            });
+            for (const name of current) {
+              if (!assets.some(asset => asset.name === name && asset.state === 'uploaded')) {
+                throw new Error(`Missing uploaded wheel: ${name}`);
+              }
+            }
+            for (const asset of assets) {
+              if (asset.name.endsWith('.whl') && !current.has(asset.name)) {
+                await github.rest.repos.deleteReleaseAsset({...context.repo, asset_id: asset.id});
+              }
+            }

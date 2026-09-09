@@ -7,6 +7,7 @@
 /python/.pytest_cache/
 **/__pycache__/
 /python/build/
+/python/dist/
 *.egg-info/
 /benches/csharp/bin/
 /benches/csharp/obj/

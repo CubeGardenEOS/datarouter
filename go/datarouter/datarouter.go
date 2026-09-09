@@ -25,6 +25,7 @@ import "C"
 
 import (
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -83,6 +84,7 @@ type Options struct {
 
 // Frontend is an owned frontend handle. Close releases it.
 type Frontend struct {
+	mu     sync.RWMutex
 	handle *C.datarouter_frontend
 	opts   Options
 }
@@ -132,6 +134,9 @@ func Open(opts Options) (*Frontend, error) {
 // plane the message must be a single frame ≤ MaxPayload; larger messages
 // return ErrPayloadTooLarge (use the routed plane for chunking).
 func (f *Frontend) Send(targetService string, data []byte, timeoutMs uint32) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	defer runtime.KeepAlive(f)
 	target := C.CString(targetService)
 	defer C.free(unsafe.Pointer(target))
 	var ptr unsafe.Pointer
@@ -147,6 +152,9 @@ func (f *Frontend) Send(targetService string, data []byte, timeoutMs uint32) err
 // ErrPayloadTooLarge is returned; query FrameLen and retry with a larger
 // buffer.
 func (f *Frontend) Recv(buf []byte, timeoutMs uint32) (int, string, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	defer runtime.KeepAlive(f)
 	var info C.datarouter_message_info
 	var ptr unsafe.Pointer
 	if len(buf) > 0 {
@@ -170,6 +178,9 @@ func (f *Frontend) Recv(buf []byte, timeoutMs uint32) (int, string, error) {
 // FrameLen peeks the next RX frame's payload length without consuming it.
 // Returns ErrAgain when the RX ring is empty.
 func (f *Frontend) FrameLen() (int, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	defer runtime.KeepAlive(f)
 	var n C.size_t
 	rc := C.datarouter_frontend_frame_len(f.handle, &n)
 	if rc != C.int(ErrOK) {
@@ -180,7 +191,12 @@ func (f *Frontend) FrameLen() (int, error) {
 
 // Close releases the frontend handle. Safe to call multiple times.
 func (f *Frontend) Close() {
-	if f == nil || f.handle == nil {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle == nil {
 		return
 	}
 	C.datarouter_frontend_close(f.handle)

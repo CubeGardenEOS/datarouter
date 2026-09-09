@@ -75,7 +75,11 @@ static const datarouter_copy_strategy_def kCopyStrategies[] = {
 
 static datarouter_copy_fn g_copy_large = copy_scalar;
 static const datarouter_copy_strategy_def *g_copy_active = &kCopyStrategies[0];
+#ifdef _WIN32
+static INIT_ONCE g_copy_once = INIT_ONCE_STATIC_INIT;
+#else
 static pthread_once_t g_copy_once = PTHREAD_ONCE_INIT;
+#endif
 
 static void copy_init(void) {
     const char *choice = getenv("DATAROUTER_COPY");
@@ -95,9 +99,25 @@ static void copy_init(void) {
     g_copy_large = kCopyStrategies[0].fn;
 }
 
+#ifdef _WIN32
+static BOOL CALLBACK copy_init_windows(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once; (void)parameter; (void)context;
+    copy_init();
+    return TRUE;
+}
+#endif
+
+static void copy_ensure_initialized(void) {
+#ifdef _WIN32
+    InitOnceExecuteOnce(&g_copy_once, copy_init_windows, NULL, NULL);
+#else
+    pthread_once(&g_copy_once, copy_init);
+#endif
+}
+
 static void datarouter_copy(void *dst, const void *src, size_t n) {
     if (n >= 64) {
-        pthread_once(&g_copy_once, copy_init);
+        copy_ensure_initialized();
         g_copy_large(dst, src, n);
     } else {
         memcpy(dst, src, n);
@@ -105,7 +125,7 @@ static void datarouter_copy(void *dst, const void *src, size_t n) {
 }
 
 const char *datarouter_copy_strategy(void) {
-    pthread_once(&g_copy_once, copy_init);
+    copy_ensure_initialized();
     return g_copy_active->name;
 }
 
@@ -369,5 +389,21 @@ int datarouter_ring_transfer_frame(
         source_tail + (uint32_t)source_frame_len,
         memory_order_release
     );
+    return DATAROUTER_OK;
+}
+
+/* Copy the body before releasing any byte of its frame to the producer. */
+int datarouter_ring_read_frame(datarouter_channel *channel, uint8_t *data, size_t payload_len) {
+    if (!channel || (!data && payload_len)) return DATAROUTER_ERR_INVALID_ARGUMENT;
+    if (payload_len > DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
+        return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
+    size_t used = 0;
+    int rc = datarouter_ring_validate(channel, &used);
+    if (rc != DATAROUTER_OK) return rc;
+    size_t total = DATAROUTER_FRAME_HEADER_SIZE + payload_len;
+    if (used < total) return DATAROUTER_ERR_AGAIN;
+    uint32_t tail = atomic_load_explicit(&channel->header.tail, memory_order_relaxed);
+    ring_copy_out(channel, tail + DATAROUTER_FRAME_HEADER_SIZE, data, payload_len);
+    atomic_store_explicit(&channel->header.tail, tail + (uint32_t)total, memory_order_release);
     return DATAROUTER_OK;
 }

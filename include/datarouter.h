@@ -36,7 +36,7 @@ extern "C" {
  * payload is DATAROUTER_MAX_APP_PAYLOAD (512 KiB - 8). The legacy 60 KiB cap
  * is deliberately gone: the whole ring is usable as one frame. */
 #define DATAROUTER_FRAME_HEADER_SIZE 8U
-#define DATAROUTER_RING_HEADER_SIZE 8U
+#define DATAROUTER_RING_HEADER_SIZE 128U
 #define DATAROUTER_RING_CAPACITY (DATAROUTER_CHANNEL_SIZE)
 #define DATAROUTER_MAX_APP_PAYLOAD \
     (DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
@@ -44,7 +44,7 @@ extern "C" {
 #define DATAROUTER_SHM_NAME_MAX 120
 #define DATAROUTER_DEFAULT_TIMEOUT_MS 3000U
 
-/* ---- KEEP 区域（layout 13） ---- */
+/* ---- KEEP 区域（layout 17） ---- */
 #define DATAROUTER_KEEP_DEFAULT_SIZE (8u * 1024u * 1024u) /* 8 MiB */
 #define DATAROUTER_KEEP_KEY_MAX 256u
 
@@ -164,7 +164,7 @@ typedef struct {
 } datarouter_keep_stats_t;
 
 /* KEEP 直通读/写缓存（仅供 core 与 core 授权的服务写）。命中路径不经 Ring Buffer、
- * 不经 switch 路由；get_ref 为零拷贝两段式 seqlock（交付前必须 verify_ref）。 */
+ * 不经 switch 路由；get_ref 持有独占读引用；读完必须 verify_ref 释放，期间保持 port 存活。 */
 int datarouter_keep_get(
     datarouter_port *port,
     const void *key, size_t key_len,

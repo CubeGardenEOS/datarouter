@@ -46,6 +46,26 @@ const HEADERS: &[&str] = &[
 ];
 
 fn main() {
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
+    for name in ["CC", "AR", "LD", "CGEOS_GIT_COMMIT"] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    for name in ["HEAD", "index"] {
+        if let Ok(out) = Command::new("git").args(["rev-parse", "--git-path", name]).output() {
+            if out.status.success() {
+                println!("cargo:rerun-if-changed={}", String::from_utf8_lossy(&out.stdout).trim());
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git").args(["symbolic-ref", "-q", "HEAD"]).output() {
+        if out.status.success() {
+            let reference = String::from_utf8_lossy(&out.stdout);
+            if let Ok(path) = Command::new("git").args(["rev-parse", "--git-path", reference.trim()]).output() {
+                println!("cargo:rerun-if-changed={}", String::from_utf8_lossy(&path.stdout).trim());
+            }
+        }
+    }
+
     for path in C_SOURCES.iter().chain(HEADERS.iter()) {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -60,6 +80,7 @@ fn main() {
 
     let target = env::var("TARGET").expect("Cargo did not set TARGET");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
+    std::fs::write(out_dir.join("build-commands.txt"), "").expect("initialize compiler command record");
     let generated = out_dir.join("generated_constants.rs");
     std::fs::write(
         &generated,
@@ -136,6 +157,22 @@ fn datarouter_channel_size() -> u32 {
     }
 }
 
+fn source_commit() -> String {
+    if let Ok(commit) = env::var("CGEOS_GIT_COMMIT") { return commit; }
+    // Cargo includes the source commit in published packages, even though
+    // their unpacked build directory has no Git checkout of its own.
+    if let Ok(info) = std::fs::read_to_string(".cargo_vcs_info.json") {
+        if let Some(value) = info.lines().find_map(|line| {
+            let (key, value) = line.trim().split_once(':')?;
+            (key == "\"sha1\"").then(|| value.trim().trim_end_matches(',').trim_matches('"').to_owned())
+        }) { return value; }
+    }
+    if let Ok(out) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
+        if out.status.success() { return String::from_utf8_lossy(&out.stdout).trim().to_owned(); }
+    }
+    "unknown".to_owned()
+}
+
 fn compile_c(
     source: &str,
     out_dir: &Path,
@@ -144,6 +181,8 @@ fn compile_c(
     channel_size: u32,
     unsafe_enabled: bool,
 ) -> PathBuf {
+    let commit = source_commit();
+    assert!(commit == "unknown" || (commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit())), "invalid Git build identity");
     let source_path = Path::new(source);
     let stem = source_path
         .file_stem()
@@ -169,8 +208,10 @@ fn compile_c(
         let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cl"));
         let mut cmd = Command::new(compiler);
         cmd.arg("/nologo")
+            .arg(format!("/DCGEOS_GIT_COMMIT=\"{commit}\""))
             .arg("/c")
             .arg("/std:c11")
+            .arg("/experimental:c11atomics")
             .arg("/O2")
             .arg("/D_CRT_SECURE_NO_WARNINGS")
             .arg(format!("/DDATAROUTER_CHANNEL_SIZE={channel_size}U"))
@@ -185,7 +226,8 @@ fn compile_c(
     } else {
         let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
         let mut cmd = Command::new(compiler);
-        cmd.arg("-std=c11")
+        cmd.arg(format!("-DCGEOS_GIT_COMMIT=\"{commit}\""))
+            .arg("-std=c11")
             .arg("-O3")
             .arg("-fno-strict-aliasing")
             .arg("-Wall")
@@ -269,6 +311,7 @@ fn build_switch_binary(
 }
 
 fn run_optional(mut cmd: Command, label: &str) -> bool {
+    record_command(&cmd, label);
     match cmd.status() {
         Ok(status) if status.success() => true,
         Ok(status) => {
@@ -301,10 +344,18 @@ fn archive_static_library(objects: &[PathBuf], out_dir: &Path, is_msvc: bool) {
 }
 
 fn run(mut cmd: Command, label: &str) {
+    record_command(&cmd, label);
     let status = cmd
         .status()
         .unwrap_or_else(|err| panic!("failed to run compiler step for {label}: {err}"));
     if !status.success() {
         panic!("compiler step failed for {label}: {status}");
     }
+}
+
+fn record_command(cmd: &Command, label: &str) {
+    use std::io::Write;
+    let path = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR")).join("build-commands.txt");
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).expect("open compiler command record");
+    writeln!(file, "{label}: {cmd:?}").expect("write compiler command record");
 }

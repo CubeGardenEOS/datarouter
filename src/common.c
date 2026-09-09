@@ -69,6 +69,37 @@ const char *datarouter_strerror(int code) {
     }
 }
 
+uint64_t datarouter_clock_ticks_to_ns(uint64_t ticks, uint64_t frequency) {
+    if (!frequency) return 0;
+    uint64_t seconds = ticks / frequency;
+    uint64_t remainder = ticks % frequency;
+    if (seconds > UINT64_MAX / 1000000000ULL) return UINT64_MAX;
+    uint64_t fraction;
+    if (remainder <= UINT64_MAX / 1000000000ULL) {
+        fraction = remainder * 1000000000ULL / frequency;
+    } else {
+        /* Exact overflow-free remainder * 10^9 / frequency. Only the
+         * unusual >18 GHz frequency case needs this 30-step fallback. */
+        uint64_t rest = 0;
+        fraction = 0;
+        for (int bit = 29; bit >= 0; --bit) {
+            fraction *= 2U;
+            if (rest >= frequency - rest) {
+                rest -= frequency - rest;
+                ++fraction;
+            } else rest *= 2U;
+            if ((1000000000U >> bit) & 1U) {
+                if (rest >= frequency - remainder) {
+                    rest -= frequency - remainder;
+                    ++fraction;
+                } else rest += remainder;
+            }
+        }
+    }
+    uint64_t whole = seconds * 1000000000ULL;
+    return fraction > UINT64_MAX - whole ? UINT64_MAX : whole + fraction;
+}
+
 uint64_t datarouter_now_ns(void) {
 #ifdef _WIN32
     LARGE_INTEGER frequency;
@@ -76,7 +107,8 @@ uint64_t datarouter_now_ns(void) {
     if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter)) {
         return 0;
     }
-    return (uint64_t)((counter.QuadPart * 1000000000ULL) / (uint64_t)frequency.QuadPart);
+    if (frequency.QuadPart <= 0 || counter.QuadPart < 0) return 0;
+    return datarouter_clock_ticks_to_ns((uint64_t)counter.QuadPart, (uint64_t)frequency.QuadPart);
 #else
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -271,10 +303,10 @@ size_t datarouter_shared_memory_size_with_keep(uint32_t max_ports, uint32_t keep
         return 0U;
     }
     size_t channel_count = (size_t)max_ports * 2U;
-    if (channel_count > (SIZE_MAX - sizeof(datarouter_control_plane)) / sizeof(datarouter_channel)) {
+    if (channel_count > (SIZE_MAX - DATAROUTER_DATA_OFFSET) / sizeof(datarouter_channel)) {
         return 0U;
     }
-    size_t base = sizeof(datarouter_control_plane) + channel_count * sizeof(datarouter_channel);
+    size_t base = DATAROUTER_DATA_OFFSET + channel_count * sizeof(datarouter_channel);
     if (keep_size == 0U) {
         return base;
     }
@@ -369,7 +401,10 @@ int datarouter_init_shared_memory_with_keep(
 ) {
     size_t total_size = datarouter_shared_memory_size(max_ports);
     if (keep_size > 0U) {
-        if (keep_size < DATAROUTER_KEEP_MIN_SIZE) {
+        if (keep_size < DATAROUTER_KEEP_MIN_SIZE || keep_size > 8u * 1024u * 1024u ||
+            keep_size % 8u != 0u ||
+            (keep_slot_capacity != 0u &&
+             keep_slot_capacity > (keep_size - DATAROUTER_KEEP_HEADER_SIZE - 16u) / DATAROUTER_KEEP_SLOT_SIZE)) {
             return DATAROUTER_ERR_INVALID_ARGUMENT;
         }
         total_size = datarouter_shared_memory_size_with_keep(max_ports, keep_size);
@@ -384,11 +419,11 @@ int datarouter_init_shared_memory_with_keep(
     shm->control.channel_count = max_ports * 2U;
     shm->control.channel_size = DATAROUTER_CHANNEL_SIZE;
     shm->control.control_size = (uint32_t)sizeof(datarouter_control_plane);
-    shm->control.data_offset = (uint32_t)sizeof(datarouter_control_plane);
+    shm->control.data_offset = (uint32_t)DATAROUTER_DATA_OFFSET;
     shm->control.keep_size = keep_size;
     uint32_t channel_blob = max_ports * 2U * (uint32_t)sizeof(datarouter_channel);
     shm->control.keep_offset =
-        keep_size > 0U ? (uint32_t)sizeof(datarouter_control_plane) + channel_blob : 0u;
+        keep_size > 0U ? (uint32_t)DATAROUTER_DATA_OFFSET + channel_blob : 0u;
     atomic_store_explicit(
         &shm->control.keep_write_allow_bitmap, 0ULL, memory_order_release);
     shm->control.total_size = (uint32_t)total_size;
@@ -487,7 +522,7 @@ int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_
         shm->control.channel_count != shm->control.max_ports * 2U ||
         shm->control.channel_size != DATAROUTER_CHANNEL_SIZE ||
         shm->control.control_size != (uint32_t)sizeof(datarouter_control_plane) ||
-        shm->control.data_offset != (uint32_t)sizeof(datarouter_control_plane) ||
+        shm->control.data_offset != (uint32_t)DATAROUTER_DATA_OFFSET ||
         shm->control.total_size != (uint32_t)datarouter_shared_memory_size_with_keep(
             shm->control.max_ports, shm->control.keep_size) ||
         map_size < shm->control.total_size) {
@@ -495,10 +530,23 @@ int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_
     }
     if (shm->control.keep_size > 0U) {
         uint32_t expected_keep_offset =
-            (uint32_t)sizeof(datarouter_control_plane) +
+            (uint32_t)DATAROUTER_DATA_OFFSET +
             shm->control.max_ports * 2U * (uint32_t)sizeof(datarouter_channel);
         if (shm->control.keep_offset != expected_keep_offset ||
-            shm->control.keep_offset + shm->control.keep_size > shm->control.total_size) {
+            shm->control.keep_size > 8u * 1024u * 1024u ||
+            shm->control.keep_size < DATAROUTER_KEEP_MIN_SIZE ||
+            shm->control.keep_size % 8u != 0u ||
+            (size_t)shm->control.keep_offset + shm->control.keep_size > map_size) {
+            return DATAROUTER_ERR_PROTOCOL;
+        }
+    }
+    if (shm->control.keep_size) {
+        const datarouter_keep_header *h = (const void *)((const uint8_t *)shm + shm->control.keep_offset);
+        size_t slots = (size_t)h->slot_capacity * DATAROUTER_KEEP_SLOT_SIZE;
+        if (h->magic != DATAROUTER_KEEP_MAGIC || h->layout_version != DATAROUTER_KEEP_LAYOUT_VERSION ||
+            h->slot_capacity == 0 || slots > shm->control.keep_size - DATAROUTER_KEEP_HEADER_SIZE ||
+            h->capacity != shm->control.keep_size - DATAROUTER_KEEP_HEADER_SIZE - slots ||
+            h->capacity < sizeof(datarouter_keep_entry_hdr) || h->capacity % 8u != 0u) {
             return DATAROUTER_ERR_PROTOCOL;
         }
     }

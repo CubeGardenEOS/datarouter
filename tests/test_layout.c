@@ -23,12 +23,20 @@ static void test_layout(uint32_t ports) {
     require_int(shm->control.total_size == size, "computed total size");
     require_int(
         sizeof(datarouter_channel) == DATAROUTER_CHANNEL_SIZE + DATAROUTER_RING_HEADER_SIZE,
-        "channel is 8-byte header plus power-of-two data capacity"
+        "channel is padded header plus power-of-two data capacity"
     );
     require_int(
-        size == sizeof(datarouter_control_plane) + ((size_t)ports * 2U * sizeof(datarouter_channel)),
+        size == shm->control.data_offset + ((size_t)ports * 2U * sizeof(datarouter_channel)),
         "data plane matches channel count"
     );
+#if DATAROUTER_LAYOUT_VERSION >= 17U
+    require_int(shm->control.data_offset % 64U == 0U, "data plane aligned to cache line");
+    require_int(sizeof(datarouter_channel) % 64U == 0U, "channel stride aligned to cache line");
+    require_int(offsetof(datarouter_ring_header, tail) == 64U, "head and tail are separate cache lines");
+    shm->control.data_offset += 4U;
+    require_int(datarouter_validate_shared_memory(shm, size) == DATAROUTER_ERR_PROTOCOL, "misaligned data plane rejected");
+    shm->control.data_offset -= 4U;
+#endif
 
     for (uint32_t i = 0; i < ports; i++) {
         require_int(shm->control.slots[i].slot_index == i, "slot index");

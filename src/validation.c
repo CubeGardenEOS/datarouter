@@ -29,6 +29,7 @@
  * Semantics are byte-for-byte equivalent to the prior Rust `validate_tlvs`.
  */
 int datarouter_protocol_validate_tlvs(const uint8_t *data, size_t len) {
+    if (data == NULL && len != 0) return 0;
     size_t offset = 0;
     while (offset < len) {
         /* TLV offset overflow (3-byte header) */
@@ -95,7 +96,7 @@ int datarouter_protocol_classify_frame(const uint8_t *data, size_t buf_len,
 
 int datarouter_protocol_frame_layout(const uint8_t *data, size_t buf_len,
                                      datarouter_frame_layout *out) {
-    if (out == NULL) {
+    if (out == NULL || (data == NULL && buf_len != 0)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     if (buf_len < DATAROUTER_FRAME_HEADER_SIZE) {
@@ -105,7 +106,7 @@ int datarouter_protocol_frame_layout(const uint8_t *data, size_t buf_len,
     uint32_t b_len = (uint32_t)data[4] | ((uint32_t)data[5] << 8) |
                      ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24);
     uint64_t total = (uint64_t)DATAROUTER_FRAME_HEADER_SIZE + (uint64_t)vd_len + (uint64_t)b_len;
-    if (total != (uint64_t)buf_len) {
+    if (total > UINT32_MAX || total != (uint64_t)buf_len) {
         return DATAROUTER_ERR_PROTOCOL;
     }
     out->message_type = data[0];
@@ -140,7 +141,7 @@ static int tlv_chunk_tag(uint8_t tag) {
  */
 int datarouter_protocol_chunk_metadata(const uint8_t *data, size_t len,
                                        datarouter_chunk_meta *out) {
-    if (out == NULL) {
+    if (out == NULL || (data == NULL && len != 0)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     out->present = 0;

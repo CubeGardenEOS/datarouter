@@ -616,33 +616,43 @@ Port 库是应用面对的 ABI。它打开 switch-owned shared memory，调用 `
 
 ### 布局升级
 
-当前 shared-memory layout **13**（在 layout 12 基础上：控制面新增 `keep_offset` /
-`keep_size` / `keep_write_allow_bitmap`，并新增 KEEP 区域——见下节；registry 槽位直写 pin
-计数器 `direct_writers` 与写者身份；ring 数据容量 = 2 的幂 `DATAROUTER_CHANNEL_SIZE`
-（默认 2^19），channel 磁盘布局 = 8B 头 + 数据，环形回绕用掩码）、8 字节帧头、26 位
-route generation 以及 frontend ABI v2 与旧版本不兼容。升级时必须停止所有 frontend 和
-switch，替换 switch、C/Rust 库及 Go/Python 绑定，删除旧 layout 的 shared-memory object，
-再整体启动。Linux 默认对象 `/datarouter` 对应 `/dev/shm/datarouter`。不要混跑新旧客户端；
-旧 frontend open/stats 符号只安全返回 `DATAROUTER_ERR_PROTOCOL`，v2 符号会先校验 struct
-size 与 ABI version，shared-memory 布局不一致同样明确返回 protocol mismatch。
+当前开发候选使用 shared-memory **layout 17 / KEEP layout 3**。frontend ABI v2/v3
+与应用使用的 Rust 接口保留；Ring 数据容量与 8 字节线帧头不变。
+`rx_writer_owner` 保存独占 RX 写入者 PID，生命周期中不随槽位清理而重置，direct 与 switch 路由共用该保护。
+竞争返回可重试的 `AGAIN`；活的暂停进程不会被强制夺锁。
 
-### KEEP 区域（layout 13）
+升级时先停止所属 switch 与所有消费者，删除**该实例所属**旧共享内存，统一重编译并
+替换 switch、Rust/C 库及各绑定，再启动。旧 layout 明确拒绝连接；不要全局清空 `/dev/shm`。
+本候选尚未解除性能合入门禁，完整状态见 [安全审查记录](docs/security-audit-2026-09.md)。
 
-KEEP 是 Switch 维持的**直通字节缓存**（供 core 与 core 授权的服务共享高频命中查询结果）。
-命中路径不经 Ring Buffer、不经 switch 路由：调用方直接对同一共享内存镜像完成 lookup + 读
-取（`get_ref` 零拷贝、`get` 一次 memcpy）。区域默认 8 MiB（`--keep-size <bytes|[kKmMgG]>`），
-`0` 关闭需 `--keep-disable`；写入仅对 `--keep-write-allow`（静态名单，注册即置位）或经
-`datarouter_keep_grant`（控制面，仅受信任写方）授权的服务开放。C 侧 `src/keep.c` 为单一
-事实来源：环形 log-structured arena（条目物理连续，保零拷贝 `get_ref`）+ 开放寻址哈希
-（墓碑 + 探测延续 + 阈值压实，无假性未命中）+ 跨进程 seqlock 崩溃自愈（`writer_pid` +
-接管重建）。Rust 前端 `src/frontend/keep.rs` 只做 FFI 委托。9 个 API：`datarouter_keep_get` /
-`get_ref` / `verify_ref` / `put` / `invalidate` / `invalidate_prefix` / `stats` / `grant`。
+### KEEP 区域（layout 17）
 
+KEEP 是由 Switch 维持的 ≤8 MiB 字节缓存，命中不经 Ring。`src/keep.c` 管理
+8 字节对齐条目、环形物理游标、显式尾部填充标记、墓碑哈希及独占读写引用。
+空键、空值有效；TTL 加法溢出拒绝；短缓冲返回所需长度且不消费数据。
+前缀失效扫描完整区域，`AGAIN` 表示锁竞争，不代表固定前段的部分扫描。
+
+复制读取持锁至 memcpy 完成。`get_ref` 返回的指针在对应 `verify_ref` 之前稳定；
+旧 tuple 接口在读完后须恰好验证一次，不得在验证后访问指针；Rust 适配层保留原映射至验证结束。
+新增 `Frontend::keep_reference` 返回自动释放的 guard，可安全跨线程并在 frontend 销毁后继续读取。
+当前读引用也是独占的，因此长持有引用会使其他 KEEP 操作返回 `AGAIN`。
+确认持有者死亡后，接管者在独占状态下整体失效缓存再开放访问；PID 复用保守地延迟恢复。
+这套实现不再使用“复制后校验 seqlock 即可消除数据竞争”的假设。
+
+安全检查由重新编译的 CLI 驱动：
+
+```sh
+cgeos-cli datarouter verify --profile security --datarouter /path/to/datarouter \
+  --baseline-datarouter /path/to/baseline --out /path/to/new-result-directory
+```
+
+`security` 记录编译与 sanitizer 日志、源码及二进制指纹、Rust 集成测试及清理结果。
+它是安全检查子集，不代表完整八语言性能门禁。基线失败单独保留；候选任一检查失败即非零退出。
 
 ### ABI 兼容性测试（缺省翻转后全链路验证）
 
-缺省翻转（`unsafe` 缺省开启）本身**不改变 shared-memory layout 与 C ABI**（仍为 layout
-12、frontend ABI v2）；直接数据面只是额外导出符号（`datarouter_unsafe_send` 等）。ABI
+历史上的缺省翻转（`unsafe` 缺省开启）本身没有改变当时的 layout 12 / frontend ABI v2；
+当前安全候选已升级到上述 layout 17，直接数据面只是额外导出符号（`datarouter_unsafe_send` 等）。ABI
 表面由三层测试钉扎，任何 layout/struct 变更必须同步更新：
 
 - `tests/abi_compat.rs`：锁定 layout 12 常量（`CHANNEL_SIZE`=2^19、`RING_CAPACITY`=2^19

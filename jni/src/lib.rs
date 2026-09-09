@@ -333,21 +333,26 @@ fn get_option_int(env: &mut JNIEnv, options: &JObject, method: &str) -> Result<j
         .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)
 }
 
+fn get_option_nonnegative(env: &mut JNIEnv, options: &JObject, method: &str) -> Result<u32, c_int> {
+    u32::try_from(get_option_int(env, options, method)?)
+        .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)
+}
+
 fn read_options(env: &mut JNIEnv, options: JObject) -> Result<FrontendOptions, c_int> {
     let options = FrontendOptions {
         shm_name: get_option_string(env, &options, "sharedMemoryName")?,
         service_name: get_option_string(env, &options, "serviceName")?,
         auth_token: None, // JNI ABI v1 predates switch auth; --token switches reject here.
-        connect_timeout_ms: get_option_int(env, &options, "connectTimeoutMillis")? as u32,
-        recv_timeout_ms: get_option_int(env, &options, "receiveTimeoutMillis")? as u32,
-        ack_timeout_ms: get_option_int(env, &options, "acknowledgementTimeoutMillis")? as u32,
-        reader_wait_ms: get_option_int(env, &options, "readerWaitMillis")? as u32,
-        app_queue_capacity: get_option_int(env, &options, "applicationQueueCapacity")? as usize,
-        max_message_bytes: get_option_int(env, &options, "maxMessageBytes")? as usize,
-        max_pending_acks: get_option_int(env, &options, "maxPendingAcknowledgements")? as usize,
-        chunk_ttl_ms: get_option_int(env, &options, "chunkTtlMillis")? as u32,
-        max_reassembly_groups: get_option_int(env, &options, "maxReassemblyGroups")? as usize,
-        max_reassembly_bytes: get_option_int(env, &options, "maxReassemblyBytes")? as usize,
+        connect_timeout_ms: get_option_nonnegative(env, &options, "connectTimeoutMillis")? as u32,
+        recv_timeout_ms: get_option_nonnegative(env, &options, "receiveTimeoutMillis")? as u32,
+        ack_timeout_ms: get_option_nonnegative(env, &options, "acknowledgementTimeoutMillis")? as u32,
+        reader_wait_ms: get_option_nonnegative(env, &options, "readerWaitMillis")? as u32,
+        app_queue_capacity: get_option_nonnegative(env, &options, "applicationQueueCapacity")? as usize,
+        max_message_bytes: get_option_nonnegative(env, &options, "maxMessageBytes")? as usize,
+        max_pending_acks: get_option_nonnegative(env, &options, "maxPendingAcknowledgements")? as usize,
+        chunk_ttl_ms: get_option_nonnegative(env, &options, "chunkTtlMillis")? as u32,
+        max_reassembly_groups: get_option_nonnegative(env, &options, "maxReassemblyGroups")? as usize,
+        max_reassembly_bytes: get_option_nonnegative(env, &options, "maxReassemblyBytes")? as usize,
     };
     options.normalized()
 }
@@ -404,8 +409,10 @@ pub extern "system" fn Java_io_blinkcms_datarouter_DataRouterFrontend_nativeSend
         let lease = lease(id)?;
         let target = get_string(env, JObject::from(target))?;
         let methods = methods(env)?;
-        let message_type = get_int_field(env, &message, methods.f_message_type)? as u8;
-        let flags = get_int_field(env, &message, methods.f_flags)? as u8;
+        let message_type = u8::try_from(get_int_field(env, &message, methods.f_message_type)?)
+            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)?;
+        let flags = u8::try_from(get_int_field(env, &message, methods.f_flags)?)
+            .map_err(|_| blinkcms_datarouter::DATAROUTER_ERR_INVALID_ARGUMENT)?;
         let vd_object = get_obj_field(env, &message, methods.f_var_data)?;
         // Fast path: most messages already carry a materialized body array,
         // so read the backing field directly. Only an unmaterialized
@@ -855,7 +862,7 @@ mod tests {
             blinkcms_datarouter::DATAROUTER_MAX_APP_PAYLOAD,
             524_288 - 8
         );
-        assert_eq!(blinkcms_datarouter::DATAROUTER_RING_HEADER_SIZE, 8);
+        assert_eq!(blinkcms_datarouter::DATAROUTER_RING_HEADER_SIZE, 128);
         assert_eq!(blinkcms_datarouter::DATAROUTER_FRAME_HEADER_SIZE, 8);
         assert_eq!(ABI_FINGERPRINT.len(), 64);
     }

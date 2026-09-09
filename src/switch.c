@@ -16,6 +16,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <process.h>
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -40,6 +42,7 @@ typedef struct {
     uint32_t ttl_ms;
     uint32_t max_ports;
     const char *auth_token;
+    char stdin_token[129];
     char allowlist[DATAROUTER_MAX_PORTS][DATAROUTER_SERVICE_NAME_MAX + 1U];
     uint32_t allowlist_len;
     int allow_any;
@@ -136,7 +139,7 @@ static void print_usage(const char *argv0) {
     fprintf(
         stderr,
         "usage: %s [--name /datarouter] [--mode 0600] [--ttl-ms 30000] "
-        "[--max-ports 4] [--token secret] "
+        "[--max-ports 4] [--token-stdin | --token secret] "
         "(--allow Core,MLHelper | --config path.ini | --allow-any) [--once] "
         "[--reap-dead-processes] [--keep-size 8m] [--keep-write-allow core,database] "
         "[--keep-disable] "
@@ -276,12 +279,8 @@ static int parse_allowlist(switch_options *options, const char *value) {
         if (options->allowlist_len >= DATAROUTER_MAX_PORTS) {
             return DATAROUTER_ERR_FULL;
         }
-        snprintf(
-            options->allowlist[options->allowlist_len],
-            sizeof(options->allowlist[options->allowlist_len]),
-            "%s",
-            cursor
-        );
+        /* The canonical service-name validator above bounds this copy. */
+        memcpy(options->allowlist[options->allowlist_len], cursor, strlen(cursor) + 1U);
         options->allowlist_len++;
         if (!comma) {
             break;
@@ -318,8 +317,8 @@ static int parse_keep_write_allow(switch_options *options, const char *value) {
         if (options->keep_write_allow_len >= DATAROUTER_MAX_PORTS) {
             return DATAROUTER_ERR_FULL;
         }
-        snprintf(options->keep_write_allow[options->keep_write_allow_len],
-                 sizeof(options->keep_write_allow[options->keep_write_allow_len]), "%s", cursor);
+        /* The canonical service-name validator above bounds this copy. */
+        memcpy(options->keep_write_allow[options->keep_write_allow_len], cursor, strlen(cursor) + 1U);
         options->keep_write_allow_len++;
         if (!comma) {
             break;
@@ -372,10 +371,21 @@ static int parse_args(int argc, char **argv, switch_options *options) {
             }
         } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
             const char *token = argv[++i];
-            if (token[0] == '\0' || strlen(token) > 128U) {
+            if (options->auth_token || token[0] == '\0' || strlen(token) > 128U) {
                 return DATAROUTER_ERR_INVALID_ARGUMENT;
             }
             options->auth_token = token;
+        } else if (strcmp(argv[i], "--token-stdin") == 0) {
+            if (options->auth_token) return DATAROUTER_ERR_INVALID_ARGUMENT;
+#ifdef _WIN32
+            if (_setmode(_fileno(stdin), _O_BINARY) == -1) return DATAROUTER_ERR_PLATFORM;
+#endif
+            size_t length = fread(options->stdin_token, 1U, sizeof(options->stdin_token), stdin);
+            if (ferror(stdin)) return DATAROUTER_ERR_PLATFORM;
+            if (!length || length > 128U || memchr(options->stdin_token, '\0', length))
+                return DATAROUTER_ERR_INVALID_ARGUMENT;
+            options->stdin_token[length] = '\0';
+            options->auth_token = options->stdin_token;
         } else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc) {
             if (options->config_mode || options->allow_any || options->allowlist_len != 0U ||
                 parse_allowlist(options, argv[++i]) != DATAROUTER_OK) {
@@ -630,7 +640,10 @@ static unsigned int finish_request(
 static int find_free_slot(datarouter_shared_memory *shm, uint32_t *slot_index) {
     uint32_t max_ports = datarouter_active_max_ports(shm);
     for (uint32_t i = 0U; i < max_ports; i++) {
-        if (datarouter_registry_empty_slot_ready(&shm->control.registry[i])) {
+        /* Never wrap a route generation while old processes may retain it.
+         * An exhausted slot is reusable only after a fresh switch mapping. */
+        if (shm->control.registry[i].generation < DATAROUTER_ROUTE_GENERATION_MASK &&
+            datarouter_registry_empty_slot_ready(&shm->control.registry[i])) {
             *slot_index = i;
             return DATAROUTER_OK;
         }
@@ -678,6 +691,9 @@ static void activate_slot(
     atomic_store_explicit(&entry->process_start_id, req->owner_start_id, memory_order_relaxed);
     datarouter_registry_store_name(entry, req->service_name);
     atomic_store_explicit(&entry->last_active_ns, datarouter_now_ns(), memory_order_release);
+    atomic_store_explicit(&entry->io_users,
+        (unsigned long long)atomic_load_explicit(&entry->route_id, memory_order_relaxed) << 32U,
+        memory_order_release);
     atomic_store_explicit(&entry->state, DATAROUTER_PORT_ACTIVE, memory_order_seq_cst);
 }
 
@@ -881,7 +897,13 @@ static void handle_control_requests(
         memory_order_acq_rel
     );
     while (ready != 0ULL) {
+#ifdef _MSC_VER
+        uint32_t i = 0U;
+        uint64_t bits = ready; /* ready is nonzero in this loop. */
+        while ((bits & 1ULL) == 0ULL) { bits >>= 1U; ++i; }
+#else
         uint32_t i = (uint32_t)__builtin_ctzll(ready);
+#endif
         ready &= ready - 1ULL;
         handle_control_request_slot(shm, options, &shm->control.register_requests[i]);
     }
@@ -1191,7 +1213,9 @@ int main(int argc, char **argv) {
         reap_interval_ns = 1000000000ULL;
     }
 
+    int exit_code = 0;
     do {
+        uint32_t signal_sequence = datarouter_signal_prepare(&mapping.shm->control.switch_signal);
         uint64_t iteration_started_ns = datarouter_now_ns();
         if (iteration_started_ns >= next_request_recovery_ns) {
             recover_control_requests(mapping.shm);
@@ -1256,10 +1280,16 @@ int main(int argc, char **argv) {
                 continue;
             }
             idle_spin_started_ns = 0ULL;
-            (void)datarouter_signal_wait(
+            int wait_rc = datarouter_signal_wait_prepared(
                 &mapping.shm->control.switch_signal,
+                signal_sequence,
                 DATAROUTER_SWITCH_WAIT_MS
             );
+            if (wait_rc != DATAROUTER_OK && wait_rc != DATAROUTER_ERR_TIMEOUT) {
+                switch_log(&options, SWITCH_LOG_ERROR, "signal wait failed: %s", datarouter_strerror(wait_rc));
+                exit_code = 1;
+                break;
+            }
         }
     } while (!g_stop && !options.once);
 
@@ -1282,5 +1312,5 @@ int main(int argc, char **argv) {
         fprintf(stderr, "datarouter-switch: unlink shm failed: %s\n", datarouter_strerror(rc));
         return 1;
     }
-    return 0;
+    return exit_code;
 }

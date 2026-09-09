@@ -110,7 +110,6 @@ static int port_rx_mutex_init(datarouter_port *port) {
 #endif
 }
 
-#ifdef DATAROUTER_UNSAFE
 static int port_rx_mutex_lock(datarouter_port *port) {
     if (!port) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
@@ -135,7 +134,6 @@ static void port_rx_mutex_unlock(datarouter_port *port) {
     (void)pthread_mutex_unlock(&port->rx_mutex);
 #endif
 }
-#endif /* DATAROUTER_UNSAFE */
 
 static void port_rx_mutex_destroy(datarouter_port *port) {
     if (!port) {
@@ -286,6 +284,11 @@ int datarouter_frame_len(datarouter_port *port, size_t *payload_len) {
     if (!self) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
+    int lock_rc = port_rx_mutex_lock(port);
+    if (lock_rc != DATAROUTER_OK) {
+        datarouter_registry_unpin(self);
+        return lock_rc;
+    }
     datarouter_touch_entry(self, datarouter_now_ns());
     datarouter_channel *rx = datarouter_rx_channel(port->shm, port->slot_index);
     size_t used = 0U;
@@ -314,6 +317,7 @@ int datarouter_frame_len(datarouter_port *port, size_t *payload_len) {
     if (rc == DATAROUTER_ERR_PROTOCOL) {
         report_corrupt_self(port);
     }
+    port_rx_mutex_unlock(port);
     datarouter_registry_unpin(self);
     return rc;
 }
@@ -390,10 +394,7 @@ static int recv_frame_unchecked(
         return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
     }
 
-    rc = datarouter_ring_skip(rx, DATAROUTER_FRAME_HEADER_SIZE);
-    if (rc == DATAROUTER_OK) {
-        rc = datarouter_ring_read(rx, (uint8_t *)buffer, payload_len);
-    }
+    rc = datarouter_ring_read_frame(rx, (uint8_t *)buffer, payload_len);
     if (rc != DATAROUTER_OK) {
         if (rc == DATAROUTER_ERR_PROTOCOL) {
             report_corrupt_self(port);
@@ -552,6 +553,7 @@ static int submit_control_request(
     }
 
     for (;;) {
+        uint32_t signal_sequence = datarouter_signal_prepare(&port->shm->control.registration_signal);
         unsigned int state = atomic_load_explicit(&req->state, memory_order_acquire);
         if (state == DATAROUTER_REG_ACCEPTED || state == DATAROUTER_REG_REJECTED) {
             unsigned int terminal = state;
@@ -663,7 +665,7 @@ static int submit_control_request(
         if (wait_ms == 0U) {
             wait_ms = 1U;
         }
-        int wait_rc = datarouter_signal_wait(&port->shm->control.registration_signal, wait_ms);
+        int wait_rc = datarouter_signal_wait_prepared(&port->shm->control.registration_signal, signal_sequence, wait_ms);
         if (wait_rc != DATAROUTER_OK && wait_rc != DATAROUTER_ERR_TIMEOUT) {
             return wait_rc;
         }
@@ -871,9 +873,8 @@ out:
  * Frontend API; both complete the inflight counter the same way.
  *
  * Constraints (dev feature):
- *  - one logical writer per target RX ring (the switch's router is also a
- *    single writer per ring); concurrent direct writers to the same target
- *    from different processes are not serialized,
+ *  - concurrent direct and routed writers share nonblocking RX ownership;
+ *    contention returns DATAROUTER_ERR_AGAIN,
  *  - a full target RX ring returns DATAROUTER_ERR_FULL (no switch blocked
  *    queue/requeue protocol in the direct path),
  *  - the target is re-validated against the registry while pinned, so slot
@@ -919,12 +920,15 @@ int datarouter_unsafe_send(
         goto out;
     }
     datarouter_registry_entry *target_entry = &port->shm->control.registry[target_slot];
-    /* Write pin: the seq_cst direct_writers handshake blocks finalize_release
-     * (and therefore slot reuse by a new registration) until the write
-     * completes. The pin lives on its own counter with writer identity so the
-     * switch never mistakes a live foreign writer for a stale owner pin.
-     * Identity is stored BEFORE the increment: finalize_release reads the
-     * counter with acquire and sees the store through the release RMW. */
+    /* Acquire the same RX writer ownership as routed sends. Publish the PID
+     * atomically with ownership so teardown never mistakes a paused claimant
+     * for a dead writer during identity publication. */
+    unsigned int expected_writer = 0;
+    if (!atomic_compare_exchange_strong_explicit(&target_entry->rx_writer_owner,
+            &expected_writer, (unsigned int)current_pid(), memory_order_seq_cst, memory_order_relaxed)) {
+        rc = DATAROUTER_ERR_AGAIN;
+        goto out;
+    }
     atomic_store_explicit(
         &target_entry->direct_writer_pid,
         current_pid(),
@@ -940,18 +944,17 @@ int datarouter_unsafe_send(
         port->process_start_id,
         memory_order_relaxed
     );
-    atomic_fetch_add_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
     /* Re-verify the pinned entry is still the same active registration. */
     datarouter_registry_metadata recheck;
     if (!datarouter_registry_read_active(target_entry, &recheck) ||
         recheck.route_id != target.route_id || recheck.slot_index != target_slot) {
-        atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
+        atomic_store_explicit(&target_entry->rx_writer_owner, 0U, memory_order_seq_cst);
         rc = DATAROUTER_ERR_NOT_FOUND;
         goto out;
     }
     datarouter_channel *rx = datarouter_rx_channel(port->shm, target_slot);
     if (!rx) {
-        atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
+        atomic_store_explicit(&target_entry->rx_writer_owner, 0U, memory_order_seq_cst);
         rc = DATAROUTER_ERR_INTERNAL;
         goto out;
     }
@@ -964,13 +967,13 @@ int datarouter_unsafe_send(
     if (rc != DATAROUTER_OK) {
         /* Nothing was published; undo the inflight increment. */
         datarouter_registry_complete_inflight(port->shm, port->route_id, target_slot);
-        atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
+        atomic_store_explicit(&target_entry->rx_writer_owner, 0U, memory_order_seq_cst);
         if (rc == DATAROUTER_ERR_PROTOCOL) {
             report_corrupt_self(port);
         }
         goto out;
     }
-    atomic_fetch_sub_explicit(&target_entry->direct_writers, 1U, memory_order_seq_cst);
+    atomic_store_explicit(&target_entry->rx_writer_owner, 0U, memory_order_seq_cst);
     datarouter_signal_post(&port->shm->control.rx_signal[target_slot]);
     datarouter_touch_entry(self, datarouter_now_ns());
 
@@ -1001,7 +1004,6 @@ int datarouter_recv(
         return DATAROUTER_ERR_NOT_FOUND;
     }
     datarouter_touch_entry(self, datarouter_now_ns());
-#ifdef DATAROUTER_UNSAFE
     /* The direct (unsafe) data plane has no reader thread; multiple
      * application threads may call datarouter_recv concurrently on the same
      * SPSC RX ring. Serialize ring reads within this process. */
@@ -1014,11 +1016,6 @@ int datarouter_recv(
     port_rx_mutex_unlock(port);
     datarouter_registry_unpin(self);
     return rc;
-#else
-    int rc = recv_frame_unchecked(port, rx, buffer, capacity, info, 1);
-    datarouter_registry_unpin(self);
-    return rc;
-#endif
 }
 
 int datarouter_poll(datarouter_port *port) {
@@ -1030,7 +1027,11 @@ int datarouter_poll(datarouter_port *port) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
     datarouter_touch_entry(self, datarouter_now_ns());
-    int rc = channel_has_complete_frame(port, datarouter_rx_channel(port->shm, port->slot_index));
+    int rc = port_rx_mutex_lock(port);
+    if (rc == DATAROUTER_OK) {
+        rc = channel_has_complete_frame(port, datarouter_rx_channel(port->shm, port->slot_index));
+        port_rx_mutex_unlock(port);
+    }
     datarouter_registry_unpin(self);
     return rc;
 }
@@ -1063,6 +1064,7 @@ int datarouter_wait(datarouter_port *port, uint32_t timeout_ms) {
     uint64_t started = datarouter_now_ns();
     uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
     for (;;) {
+        uint32_t signal_sequence = datarouter_signal_prepare(&port->shm->control.rx_signal[port->slot_index]);
         uint64_t spin_started = datarouter_now_ns();
         for (;;) {
             int rc = datarouter_poll(port);
@@ -1085,14 +1087,16 @@ int datarouter_wait(datarouter_port *port, uint32_t timeout_ms) {
                 wait_ms = 100U;
             }
         }
-        int rc = datarouter_signal_wait(
+        int rc = datarouter_signal_wait_prepared(
             &port->shm->control.rx_signal[port->slot_index],
+            signal_sequence,
             wait_ms
         );
         if (!switch_identity_alive(port, 1)) {
             return DATAROUTER_ERR_NOT_FOUND;
         }
         touch_self(port);
+        if (rc != DATAROUTER_OK && rc != DATAROUTER_ERR_TIMEOUT && rc != DATAROUTER_ERR_AGAIN) return rc;
         if (rc != DATAROUTER_OK) {
             /* The signal wait elapsed (up to 100ms) without a wakeup. Poll
              * once for a frame that raced the signal (the sender publishes
@@ -1143,13 +1147,11 @@ int datarouter_drain(
     uint64_t started = datarouter_now_ns();
     uint64_t budget_ns = (uint64_t)normalize_drain_budget_us(budget_us) * 1000ULL;
     int last_rc = DATAROUTER_ERR_AGAIN;
-#ifdef DATAROUTER_UNSAFE
     int rx_lock_rc = port_rx_mutex_lock(port);
     if (rx_lock_rc != DATAROUTER_OK) {
         datarouter_registry_unpin(self);
         return rx_lock_rc;
     }
-#endif
     while (*drained < max_frames) {
         datarouter_message_info info;
         int rc = recv_frame_unchecked(
@@ -1178,9 +1180,7 @@ int datarouter_drain(
     if (*drained > 0U && datarouter_scheduler_wake_blocked(port->shm) > 0U) {
         datarouter_signal_post(&port->shm->control.switch_signal);
     }
-#ifdef DATAROUTER_UNSAFE
     port_rx_mutex_unlock(port);
-#endif
     datarouter_registry_unpin(self);
     return *drained > 0U && last_rc == DATAROUTER_ERR_AGAIN ? DATAROUTER_OK : last_rc;
 }
@@ -1306,6 +1306,8 @@ void datarouter_close(datarouter_port *port) {
     if (!port) {
         return;
     }
+    uint64_t keep_seq = atomic_load_explicit(&port->keep_ref_seq, memory_order_acquire);
+    if (keep_seq) (void)datarouter_keep_verify_ref(port, keep_seq);
     if (port->shm && port->route_id != 0U) {
         (void)unregister_self(port, DATAROUTER_UNREGISTER_TIMEOUT_MS);
     }

@@ -20,7 +20,7 @@ fn layout_12_constants_are_pinned() {
         0
     );
     // 8 字节原子 ring 头 + 8 字节帧头。
-    assert_eq!(blinkcms_datarouter::DATAROUTER_RING_HEADER_SIZE, 8);
+    assert_eq!(blinkcms_datarouter::DATAROUTER_RING_HEADER_SIZE, 128);
     assert_eq!(blinkcms_datarouter::DATAROUTER_FRAME_HEADER_SIZE, 8);
     // 最大单帧负载 = 2^19 - 8。
     assert_eq!(
@@ -42,7 +42,7 @@ fn c_library_links_and_reports_version() {
     let version = blinkcms_datarouter::version();
     let bytes = version.to_bytes();
     assert!(
-        bytes.starts_with(b"0.2."),
+        bytes.len() >= 7 && bytes.iter().all(u8::is_ascii_hexdigit),
         "unexpected C ABI version string: {:?}",
         bytes
     );

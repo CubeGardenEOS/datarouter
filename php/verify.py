@@ -24,7 +24,7 @@ class Processes:
         self.out = out
         self.children = []
         self.shm = set()
-        self.known = set()
+        self.known = {}
         self.before = set(Path('/dev/shm').iterdir())
         self.done = threading.Event()
         ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # become child subreaper on Linux
@@ -33,37 +33,61 @@ class Processes:
     def watch(self):
         while not self.done.wait(.02):
             self.scan()
+    @staticmethod
+    def identity(pid):
+        try:
+            return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+        except (OSError, IndexError): return None
     def scan(self):
-        # Track only descendants, never unrelated workspace services.
-        ids = {p.pid for p in self.children} | self.known
+        # Retain only live identities, so PID reuse cannot adopt an unrelated
+        # process and cost per scan does not grow with completed scenarios.
         entries = {}
         for path in Path('/proc').glob('[0-9]*/stat'):
             try:
                 tail = path.read_text().rsplit(')', 1)[1].split()
-                entries[int(path.parent.name)] = int(tail[1])
+                entries[int(path.parent.name)] = (int(tail[1]), tail[19])
             except (OSError, ValueError, IndexError): pass
-        for _ in range(8):
-            new = {pid for pid, parent in entries.items() if parent in ids}
+        ids = {pid for pid, start in self.known.items()
+               if pid in entries and entries[pid][1] == start}
+        # This driver owns its subprocesses and is a subreaper. Including self
+        # also finds orphaned descendants after their immediate parent exits.
+        ids.add(os.getpid())
+        while True:
+            new = {pid for pid, (parent, _) in entries.items() if parent in ids}
             if new <= ids: break
             ids |= new
-        self.known |= ids
+        ids.discard(os.getpid())
+        self.known = {pid: entries[pid][1] for pid in ids if pid in entries}
         for pid in ids:
             try:
                 for line in Path(f'/proc/{pid}/maps').read_text().splitlines():
                     if '/dev/shm/' in line:
-                        path = Path(line.split('/dev/shm/', 1)[1].removesuffix(' (deleted)'))
-                        path = Path('/dev/shm') / path
+                        path = Path('/dev/shm') / line.split('/dev/shm/', 1)[1].removesuffix(' (deleted)')
                         if path not in self.before: self.shm.add(path)
             except OSError: pass
-    def spawn(self, args, name, cwd=ROOT, env=None):
+    def spawn(self, args, name, cwd=None, env=None, stdin_data=None):
+        if cwd is None: cwd = ROOT
         args = [str(x) for x in args]
+        logged = list(args)
+        for i, value in enumerate(logged[:-1]):
+            if value == '--token': logged[i+1] = '[REDACTED]'
         with (self.out / 'commands.jsonl').open('a') as f:
-            f.write(json.dumps(dict(argv=args, cwd=str(cwd)))+'\n')
+            f.write(json.dumps(dict(argv=logged, cwd=str(cwd)))+'\n')
         log = (self.out / f'{name}.log').open('wb')
         try:
-            p = subprocess.Popen(args, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            p = subprocess.Popen(args, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                                 start_new_session=True)
         finally: log.close()
+        p.dr_start = self.identity(p.pid)
         self.children.append(p)
+        if stdin_data is not None:
+            try:
+                with p.stdin as pipe:
+                    pipe.write(stdin_data)
+            except BaseException:
+                self.stop(p)
+                raise
         return p
     def wait(self, p, timeout=120):
         try:rc = p.wait(timeout)
@@ -74,14 +98,26 @@ class Processes:
     def run(self, args, name, timeout=120, **kw):
         p = self.spawn(args, name, **kw); self.wait(p, timeout); return p
     def stop(self, p):
-        try: os.killpg(p.pid, signal.SIGTERM)
-        except ProcessLookupError: pass
+        def owned_group():
+            if p.poll() is None and self.identity(p.pid) == p.dr_start: return True
+            for pid, start in tuple(self.known.items()):
+                if self.identity(pid) != start: continue
+                try:
+                    if os.getpgid(pid) == p.pid: return True
+                except ProcessLookupError: pass
+            return False
+        if owned_group():
+            try: os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
         try: p.wait(3)
         except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL); p.wait(3)
-        # A completed parent can still have live grandchildren in its group.
-        try: os.killpg(p.pid, signal.SIGKILL)
-        except ProcessLookupError: pass
+            if owned_group():
+                try: os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+            p.wait(3)
+        if owned_group():
+            try: os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
     def cleanup(self):
         self.scan(); self.done.set(); self.thread.join()
         for p in reversed(self.children): self.stop(p)
@@ -109,9 +145,9 @@ class Processes:
         if path.exists(): raise RuntimeError('shared memory collision')
         self.shm.add(path)
         args = [ROOT/'build/datarouter-switch', '--name', shm, '--allow-any', '--max-ports', '8', '--ttl-ms', '60000']
-        if token: args += ['--token', 'secret']
+        if token: args += ['--token-stdin']
         if name=='restart-switch':args += ['--reap-dead-processes']
-        p = self.spawn(args, name)
+        p = self.spawn(args, name, stdin_data=b'secret' if token else None)
         deadline = time.monotonic()+5
         while not path.exists():
             if p.poll() is not None or time.monotonic()>deadline: raise RuntimeError('switch did not start')
@@ -124,10 +160,9 @@ def native_build(proc):
     if not (ROOT/'Cargo.lock').is_file():proc.run(['cargo','generate-lockfile'],'native-lockfile')
     shutil.copy2(ROOT/'Cargo.lock',proc.out/'native-Cargo.lock')
     proc.run(['cargo','build','--release','--locked','--target-dir',target], 'native-build', 300)
-    switches = list((target/'release/build').glob('*/out/datarouter-switch'))
-    if len(switches) != 1: raise RuntimeError(f'ambiguous source-built switch: {switches}')
-    shutil.copy2(switches[0], ROOT/'build/datarouter-switch')
-    proc.run(['cc','-shared','-o',ROOT/'build/libblinkcms_datarouter.so','-Wl,--whole-archive',target/'release/libblinkcms_datarouter.a','-Wl,--no-whole-archive','-lrt','-lpthread','-ldl'], 'native-link')
+    proc.run(['python3', Path(__file__).resolve().parents[1]/'tools/build_native.py', '--datarouter', ROOT,
+              '--target-dir', target], 'native-artifacts', 300)
+    shutil.copy2(ROOT/'build/native-build.json', proc.out/'native-build.json')
 
 def require_result(path, **expected):
     obj = json.loads(path.read_text())
@@ -312,11 +347,16 @@ def regressions(proc):
     return failures
 
 def frozen_sources(benchmark):
-    result={}
-    for repo, prefixes in [(ROOT,('src/','include/','tests/','go/','jni/','python/','benches/')), (benchmark,('languages/c/','languages/cpp/','languages/csharp/','languages/go/','languages/java/','languages/python/','languages/rust/','scenarios/default.json','scenarios/cross-language.json'))]:
-        for name in command(['git','-C',repo,'ls-files']).splitlines():
-            path=repo/name
-            if name.startswith(prefixes) and path.is_file():result[str(path)]=fingerprint(path)
+    result = {}
+    selections = [(ROOT, ('src/', 'include/', 'tests/', 'go/', 'jni/', 'python/', 'php/', 'tools/',
+                          'benches/', 'Cargo.toml', 'Cargo.lock', 'build.rs')),
+                  (benchmark, ('languages/', 'scenarios/', 'tools/', 'common/', 'run.py', 'build.sh'))]
+    for repo, prefixes in selections:
+        names = command(['git', '-C', repo, 'ls-files', '--cached', '--others', '--exclude-standard'])
+        for name in names.splitlines():
+            path = repo/name
+            if name.startswith(prefixes) and path.is_file():
+                result[str(path)] = fingerprint(path)
     return result
 
 

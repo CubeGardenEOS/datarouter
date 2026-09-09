@@ -1,4 +1,4 @@
-//! KEEP 区域（layout 13）集成测试：权限、put/get/get_ref+verify、invalidate、
+//! KEEP 区域（layout 15）集成测试：权限、put/get/get_ref+verify、invalidate、
 //! prefix 失效、过期、逐出、grant。KEEP 是 C 单一事实来源（`src/keep.c`），
 //! Rust 前端（`frontend::keep`）只做 FFI 委托。
 
@@ -240,4 +240,54 @@ fn keep_hash_delete_has_no_false_miss() {
             "deleted key {i} misses"
         );
     }
+}
+
+#[test]
+fn keep_owned_reference_survives_frontend_and_blocks_early_release() {
+    let sw = start_keep_switch("owned-reference");
+    let core = connect(&sw, "core");
+    let writer = connect(&sw, "database");
+    core.keep_put(b"owned", b"stable", 0).expect("put");
+    let reference = core.keep_reference(b"owned").expect("owned read");
+    // The legacy safe verifier cannot consume an RAII lease by guessing its
+    // private C sequence. Only the guard owns the release capability.
+    for guess in 1..20 {
+        assert!(core.keep_verify_ref(guess).is_err());
+    }
+    assert_eq!(writer.keep_put(b"owned", b"new", 0), Err(KeepStatus::Again));
+    drop(core);
+    let reference = std::thread::spawn(move || {
+        assert_eq!(reference.as_ref(), b"stable");
+        reference
+    }).join().expect("reader thread");
+    assert_eq!(writer.keep_put(b"owned", b"new", 0), Err(KeepStatus::Again));
+    drop(reference);
+    writer.keep_put(b"owned", b"new", 0).expect("lease released");
+    let mut value = [0; 8];
+    assert_eq!(writer.keep_get(b"owned", &mut value), Ok(3));
+    assert_eq!(&value[..3], b"new");
+}
+
+#[test]
+fn keep_legacy_reference_releases_original_mapping_after_reconnect() {
+    let mut sw = start_keep_switch("reference-reconnect");
+    let core = connect(&sw, "core");
+    core.keep_put(b"k", b"old", 0).expect("old put");
+    let (old_ptr, old_len, old_token) = unsafe { core.keep_get_ref(b"k") }.expect("old read");
+    sw.handle.stop().expect("stop old switch");
+    let next = start_keep_switch("reference-reconnect");
+    let peer = connect(&next, "database");
+    let frame = blinkcms_datarouter::protocol::pack(&blinkcms_datarouter::protocol::Message {
+        message_type: 0x07, flags: 0, var_data: vec![], body: b"reconnect".to_vec(),
+    }).expect("frame");
+    core.send("database", &frame, 3000).expect("reconnect");
+    core.keep_put(b"k", b"new", 0).expect("new put");
+    let (new_ptr, new_len, new_token) = unsafe { core.keep_get_ref(b"k") }.expect("new read");
+    assert_ne!(old_token, new_token);
+    assert_eq!(unsafe { std::slice::from_raw_parts(old_ptr, old_len) }, b"old");
+    core.keep_verify_ref(old_token).expect("release original mapping");
+    assert_eq!(peer.keep_put(b"k", b"blocked", 0), Err(KeepStatus::Again));
+    assert_eq!(unsafe { std::slice::from_raw_parts(new_ptr, new_len) }, b"new");
+    core.keep_verify_ref(new_token).expect("release new mapping");
+    peer.keep_put(b"k", b"released", 0).expect("write resumes");
 }

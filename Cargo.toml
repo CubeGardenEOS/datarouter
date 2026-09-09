@@ -10,6 +10,7 @@ links = "datarouter"
 build = "build.rs"
 include = [
     "Cargo.toml",
+    "LICENSE",
     "README.md",
     "build.rs",
     "include/datarouter.h",
@@ -25,6 +26,8 @@ include = [
     "src/query/*.rs",
     "src/protocol_ffi.rs",
     "src/common.c",
+    "src/keep.c",
+    "src/tlv.c",
     "src/datarouter_internal.h",
     "src/datarouter_registry.h",
     "src/datarouter_router.h",

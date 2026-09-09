@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_REASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_READER_WAIT_MS: u32 = 1000;
 pub const MAX_CHUNK_TTL_MS: u32 = 300_000;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FrontendOptions {
     pub shm_name: String,
     pub service_name: String,
@@ -32,6 +32,26 @@ pub struct FrontendOptions {
     pub chunk_ttl_ms: u32,
     pub max_reassembly_groups: usize,
     pub max_reassembly_bytes: usize,
+}
+
+impl std::fmt::Debug for FrontendOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontendOptions")
+            .field("shm_name", &self.shm_name)
+            .field("service_name", &self.service_name)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "[REDACTED]"))
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("recv_timeout_ms", &self.recv_timeout_ms)
+            .field("ack_timeout_ms", &self.ack_timeout_ms)
+            .field("reader_wait_ms", &self.reader_wait_ms)
+            .field("app_queue_capacity", &self.app_queue_capacity)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .field("max_pending_acks", &self.max_pending_acks)
+            .field("chunk_ttl_ms", &self.chunk_ttl_ms)
+            .field("max_reassembly_groups", &self.max_reassembly_groups)
+            .field("max_reassembly_bytes", &self.max_reassembly_bytes)
+            .finish()
+    }
 }
 
 impl Default for FrontendOptions {

@@ -1,15 +1,14 @@
 /*
  * datarouter KEEP region — log-structured ring arena + open-addressing hash
- * with backward-shift deletion + cross-process seqlock with crash recovery.
+ * with tombstone deletion and exclusive cross-process leases with crash recovery.
  *
  * Single source of truth (C); the Rust frontend (`src/frontend/keep.rs`)
  * delegates here and MUST NOT carry a second implementation.
  *
- * Copy discipline: get (copying) does one memcpy (arena -> caller buffer);
- * get_ref returns a POINTER into the arena (zero-copy) with a seqlock epoch
- * that the caller must re-verify before delivering. The data plane's
- * 2-copy-per-direction budget is untouched: KEEP sits on the side, keyed by
- * opaque bytes.
+ * Copying reads hold the lease through memcpy. get_ref holds the same lease
+ * until verify_ref consumes it; writers return AGAIN while a reference is
+ * outstanding. Callers must retain the port until verification and must not
+ * dereference the pointer afterward. Read leases are currently exclusive.
  */
 
 #include "datarouter_internal.h"
@@ -26,7 +25,7 @@ static int32_t keep_current_pid(void) { return (int32_t)_getpid(); }
 static int32_t keep_current_pid(void) { return (int32_t)getpid(); }
 #endif
 
-#define KEEP_ALIGN4(x) (((x) + 3u) & ~3u)
+#define KEEP_ALIGN8(x) (((x) + 7u) & ~7u)
 
 static uint64_t keep_hash(const void *key, size_t key_len) {
     uint64_t hash = 14695981039346656037ULL;
@@ -66,6 +65,8 @@ void datarouter_keep_init(datarouter_shared_memory *shm, uint32_t slot_capacity)
             slot_capacity = 32u;
         }
     }
+    if (keep_size < DATAROUTER_KEEP_MIN_SIZE || keep_size > 8u*1024u*1024u ||
+        keep_size % 8u || slot_capacity > (keep_size - DATAROUTER_KEEP_HEADER_SIZE - 16u) / DATAROUTER_KEEP_SLOT_SIZE) return;
     uint32_t slot_bytes = slot_capacity * DATAROUTER_KEEP_SLOT_SIZE;
     uint32_t capacity = keep_size - DATAROUTER_KEEP_HEADER_SIZE - slot_bytes;
     h->magic = DATAROUTER_KEEP_MAGIC;
@@ -90,62 +91,84 @@ void datarouter_keep_init(datarouter_shared_memory *shm, uint32_t slot_capacity)
     }
 }
 
-/* ---- 崩溃自愈：探测持锁写方；若已死则由任一观察者接管 ---- */
-static void keep_recover_if_dead(datarouter_keep_header *h) {
-    if (atomic_load_explicit(&h->writer_lock, memory_order_acquire) == KEEP_WRITE_LOCK_FREE) {
-        return;
-    }
-    int32_t wp = h->writer_pid;
-    if (wp > 0 && datarouter_pid_alive(wp)) {
-        return; /* 长写：不抢锁 */
-    }
-    unsigned int expected = KEEP_WRITE_LOCK_HELD;
-    if (atomic_compare_exchange_strong_explicit(
-            &h->writer_lock, &expected, KEEP_WRITE_LOCK_FREE,
-            memory_order_acq_rel, memory_order_relaxed)) {
-        uint64_t g = atomic_load_explicit(&h->generation, memory_order_relaxed);
-        if ((g & 1ULL) != 0ULL) {
-            atomic_store_explicit(&h->generation, (g | 1ULL) + 1ULL, memory_order_release);
-        }
-        atomic_fetch_add_explicit(&h->recovery_seq, 1u, memory_order_relaxed);
-        h->writer_pid = 0;
-    }
+/* Exclusive read leases and writes share an atomic PID owner. A paused live
+ * process is never evicted. PID reuse conservatively delays recovery. This
+ * avoids the former lock-publication gap (HELD with writer_pid still zero). */
+static void keep_clear(datarouter_keep_header *h) {
+    for (uint32_t i = 0; i < h->slot_capacity; ++i) keep_slots(h)[i].key_offset = KEEP_EMPTY;
+    h->entry_count = h->used = h->tombstones = 0;
+    h->write_head = h->evict_head = 0;
 }
 
 static int keep_writer_acquire(datarouter_keep_header *h) {
-    uint32_t spins = 0u;
-    for (;;) {
-        unsigned int expected = KEEP_WRITE_LOCK_FREE;
-        if (atomic_compare_exchange_strong_explicit(
-                &h->writer_lock, &expected, KEEP_WRITE_LOCK_HELD,
-                memory_order_acquire, memory_order_relaxed)) {
-            h->writer_pid = keep_current_pid();
-            uint64_t g = atomic_load_explicit(&h->generation, memory_order_relaxed);
-            uint64_t odd = (g | 1ULL);
-            if (odd == g) {
-                odd += 2ULL;
-            }
-            atomic_store_explicit(&h->generation, odd, memory_order_release);
-            return DATAROUTER_OK;
-        }
-        if (++spins >= DATAROUTER_KEEP_LOCK_SPIN_LIMIT) {
-            keep_recover_if_dead(h);
-            spins = 0u;
-            if (atomic_load_explicit(&h->writer_pid, memory_order_acquire) > 0 &&
-                datarouter_pid_alive(h->writer_pid)) {
-                return DATAROUTER_ERR_AGAIN; /* 活的长写，放弃本次 */
-            }
-        }
-        datarouter_yield();
+    unsigned int owner = 0;
+    unsigned int pid = (unsigned int)keep_current_pid();
+    if (!atomic_compare_exchange_strong_explicit(&h->writer_lock, &owner, pid,
+                                                 memory_order_acquire, memory_order_relaxed)) {
+        if (owner == pid || owner == 0 || datarouter_pid_alive((int32_t)owner))
+            return DATAROUTER_ERR_AGAIN;
+        if (!atomic_compare_exchange_strong_explicit(&h->writer_lock, &owner, pid,
+                                                     memory_order_acquire, memory_order_relaxed))
+            return DATAROUTER_ERR_AGAIN;
+        /* Recovered ownership is exclusive. Never publish potentially half
+         * written arena/slots as valid cache contents. */
+        keep_clear(h);
+        atomic_fetch_add_explicit(&h->recovery_seq, 1u, memory_order_relaxed);
     }
+    h->writer_pid = (int32_t)pid;
+    uint64_t seq = atomic_load_explicit(&h->generation, memory_order_relaxed);
+    atomic_store_explicit(&h->generation, (seq | 1ULL) + 2ULL, memory_order_release);
+    return DATAROUTER_OK;
 }
 
 static void keep_writer_release(datarouter_keep_header *h) {
-    uint64_t g = atomic_load_explicit(&h->generation, memory_order_relaxed);
-    atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&h->generation, g + 1ULL, memory_order_release); /* 奇 -> 偶 */
+    atomic_fetch_add_explicit(&h->generation, 1ULL, memory_order_release);
     h->writer_pid = 0;
-    atomic_store_explicit(&h->writer_lock, KEEP_WRITE_LOCK_FREE, memory_order_release);
+    atomic_store_explicit(&h->writer_lock, 0u, memory_order_release);
+}
+
+/* Geometry is immutable while connected in the cooperative process model.
+ * Validate against the actual mapping, never solely a shared total_size. */
+static datarouter_keep_header *keep_port_header(datarouter_port *port) {
+    if (!port || datarouter_validate_shared_memory(port->shm, port->map_size) != DATAROUTER_OK)
+        return NULL;
+    return datarouter_keep_header_of(port->shm);
+}
+
+static int keep_entry_valid(const datarouter_keep_header *h, uint32_t off) {
+    if (off % 8u || off > h->capacity || h->capacity - off < sizeof(datarouter_keep_entry_hdr))
+        return 0;
+    const datarouter_keep_entry_hdr *e = (const void *)(keep_arena((datarouter_keep_header *)h) + off);
+    return e->key_len <= DATAROUTER_KEEP_KEY_MAX &&
+        e->key_len <= h->capacity - off - sizeof(*e) &&
+        e->value_len <= h->capacity - off - sizeof(*e) - e->key_len;
+}
+
+static int keep_contents_valid(datarouter_keep_header *h) {
+    if (h->used > h->capacity || h->write_head >= h->capacity || h->evict_head >= h->capacity ||
+        h->entry_count > h->slot_capacity || h->tombstones > h->slot_capacity) return 0;
+    uint32_t count = 0, tombstones = 0;
+    for (uint32_t i = 0; i < h->slot_capacity; ++i) {
+        const datarouter_keep_slot *s = &keep_slots(h)[i];
+        if (s->key_offset == KEEP_EMPTY) continue;
+        if (s->key_offset == KEEP_TOMBSTONE) { ++tombstones; continue; }
+        if (!keep_entry_valid(h, s->key_offset)) return 0;
+        const datarouter_keep_entry_hdr *e = (const void *)(keep_arena(h) + s->key_offset);
+        if (s->value_offset != s->key_offset + sizeof(*e) + e->key_len ||
+            s->value_len != e->value_len || s->expires_ns != e->expires_ns) return 0;
+        ++count;
+    }
+    return count == h->entry_count && tombstones == h->tombstones;
+}
+
+static int keep_acquire_checked(datarouter_keep_header *h) {
+    int rc = keep_writer_acquire(h);
+    if (rc != DATAROUTER_OK) return rc;
+    if (!keep_contents_valid(h)) {
+        keep_writer_release(h);
+        return DATAROUTER_ERR_PROTOCOL;
+    }
+    return DATAROUTER_OK;
 }
 
 /* ---- Hash 探测：墓碑态（KEEP_TOMBSTONE）不终止探测，消除假性未命中 ---- */
@@ -167,7 +190,7 @@ static datarouter_keep_slot *slot_find(
             const datarouter_keep_entry_hdr *eh =
                 (const datarouter_keep_entry_hdr *)(arena + s->key_offset);
             if (eh->key_len == key_len &&
-                memcmp(arena + s->key_offset + sizeof(datarouter_keep_entry_hdr), key, key_len) == 0) {
+                (key_len == 0 || memcmp(arena + s->key_offset + sizeof(datarouter_keep_entry_hdr), key, key_len) == 0)) {
                 return s;
             }
         }
@@ -301,90 +324,53 @@ static void keep_blank_entry_slot(datarouter_keep_header *h, const uint8_t *aren
 /* 淘汰最旧条目（逻辑段头部 = evict_head），返回被回收的字节数。
  * write/evict 均为单调逻辑游标（物理位置 = 逻辑 % capacity），故淘汰总能落在活条目上。 */
 static uint32_t keep_evict_oldest(datarouter_keep_header *h, uint8_t *arena, uint64_t now) {
-    uint32_t cap = h->capacity;
-    uint32_t e = (uint32_t)(h->evict_head % cap);
-    const datarouter_keep_entry_hdr *eh = (const datarouter_keep_entry_hdr *)(arena + e);
-    uint32_t elen = KEEP_ALIGN4(sizeof(datarouter_keep_entry_hdr) + eh->key_len + eh->value_len);
-    if (eh->key_len == 0u || elen > cap) {
-        /* 逻辑空隙（物理对齐/wrap 的 pad 段），无内部条目：跳过到下一个 capacity 边界。 */
-        uint32_t skip = (cap - (e % cap)) % cap;
-        if (skip == 0u) {
-            skip = cap;
-        }
-        h->evict_head += skip;
-        return skip;
-    }
-    int expired_p = eh->expires_ns != 0ULL && eh->expires_ns <= now;
-    keep_blank_entry_slot(h, arena, e);
-    if (expired_p) {
-        h->expired++;
+    uint32_t e = h->evict_head;
+    uint32_t remaining = h->capacity - e;
+    uint32_t freed;
+    if (remaining < sizeof(datarouter_keep_entry_hdr) ||
+        ((datarouter_keep_entry_hdr *)(arena + e))->key_len == UINT32_MAX) {
+        freed = remaining;
     } else {
-        h->evictions++;
+        if (!keep_entry_valid(h, e)) return 0;
+        const datarouter_keep_entry_hdr *eh = (const void *)(arena + e);
+        freed = KEEP_ALIGN8(sizeof(*eh) + eh->key_len + eh->value_len);
+        if (freed > remaining || freed > h->used) return 0;
+        keep_blank_entry_slot(h, arena, e);
+        if (eh->expires_ns && eh->expires_ns <= now) ++h->expired;
+        else ++h->evictions;
     }
-    h->evict_head += elen; /* 逻辑递增；物理 = %capacity */
-    return elen;
+    if (freed > h->used) return 0;
+    h->evict_head = (e + freed) % h->capacity;
+    h->used -= freed;
+    return freed;
 }
 
-static int keep_arena_alloc(
-    datarouter_keep_header *h,
-    uint8_t *arena,
-    uint32_t need,
-    uint64_t now,
-    uint32_t *out_off)
-{
-    uint32_t cap = h->capacity;
-    uint32_t used = h->used;
-    uint32_t evicted = 0u;
-
-    /* 1) 保证逻辑总占用 + need <= cap */
-    while (used + need > cap) {
-        if (used == 0u || evicted >= DATAROUTER_KEEP_EVICT_PER_PUT) {
-            break;
-        }
-        uint32_t freed = keep_evict_oldest(h, arena, now);
-        if (freed == 0u) {
-            return DATAROUTER_ERR_INTERNAL;
-        }
-        used -= freed;
-        evicted++;
-    }
-
-    /* 2) 物理放置（保持每条目物理连续，get_ref 零拷贝前提）：尾部放不下则对齐到
-     *    capacity 边界（填充 = 跳过尾部空闲），从物理 0 起写。pad 计入逻辑 used，
-     *    必要时再淘汰以容纳。 */
-    uint32_t pad = 0u;
-    uint32_t wphys = (uint32_t)(h->write_head % cap);
-    if (wphys + need > cap) {
-        uint64_t aligned = ((uint64_t)h->write_head / cap + 1ULL) * (uint64_t)cap;
-        uint64_t diff = aligned - h->write_head;
-        pad = (uint32_t)diff;
-        while (used + pad + need > cap) {
-            if (used == 0u || evicted >= DATAROUTER_KEEP_EVICT_PER_PUT) {
-                return DATAROUTER_ERR_FULL;
+static int keep_arena_alloc(datarouter_keep_header *h, uint8_t *arena,
+                            uint32_t need, uint64_t now, uint32_t *out_off) {
+    if (need > h->capacity) return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
+    for (;;) {
+        if (!h->used) h->write_head = h->evict_head = 0;
+        uint32_t remaining = h->capacity - h->write_head;
+        uint32_t pad = need > remaining ? remaining : 0;
+        if ((uint64_t)h->used + pad + need <= h->capacity) {
+            if (pad) {
+                if (pad >= sizeof(datarouter_keep_entry_hdr))
+                    ((datarouter_keep_entry_hdr *)(arena + h->write_head))->key_len = UINT32_MAX;
+                h->write_head = 0;
             }
-            uint32_t freed = keep_evict_oldest(h, arena, now);
-            if (freed == 0u) {
-                return DATAROUTER_ERR_INTERNAL;
-            }
-            used -= freed;
-            evicted++;
+            *out_off = h->write_head;
+            h->write_head = (h->write_head + need) % h->capacity;
+            h->used += pad + need;
+            return DATAROUTER_OK;
         }
-        h->write_head = (uint32_t)aligned; /* write_head % cap == 0 */
-        wphys = 0u;
+        if (!keep_evict_oldest(h, arena, now)) return DATAROUTER_ERR_PROTOCOL;
     }
-    if (wphys + need > cap) {
-        return DATAROUTER_ERR_FULL; /* 防御：对齐后总应放下 */
-    }
-
-    *out_off = wphys;
-    h->write_head += need;
-    h->used = used + pad + need;
-    return DATAROUTER_OK;
 }
 
 /* ---- 权限：位图 + 进程身份匹配当前注册（用已缓存 start_id，不再每次读 /proc） ---- */
 static int keep_write_authorized(datarouter_port *port) {
-    if (!port || !port->shm) {
+    if (!port || !port->shm || port->slot_index >= DATAROUTER_MAX_PORTS ||
+        port->slot_index >= datarouter_active_max_ports(port->shm)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     uint64_t bm = atomic_load_explicit(
@@ -399,129 +385,62 @@ static int keep_write_authorized(datarouter_port *port) {
     }
     /* pid + process_start_id 双因子（后者在 open 时经 /proc 采集并缓存于 port）：
      * 即使 pid 被复用，start_id（进程启动时间）也不同，足以防跨进程复用槽位。 */
-    if (m.pid != keep_current_pid() || port->process_start_id == 0ULL ||
+    if (m.route_id != port->route_id || m.pid != keep_current_pid() || port->process_start_id == 0ULL ||
         port->process_start_id != m.process_start_id) {
         return DATAROUTER_ERR_PERMISSION;
     }
     return DATAROUTER_OK;
 }
 
-int datarouter_keep_get(
-    datarouter_port *port,
-    const void *key, size_t key_len,
-    void *out, size_t out_cap, size_t *out_len)
-{
-    if (!port || !out || !out_len || (key == NULL && key_len != 0u)) {
+int datarouter_keep_get_ref(datarouter_port *port, const void *key, size_t key_len,
+                            const void **value_out, size_t *value_len_out, uint64_t *seq_out) {
+    if (!port || !port->shm || !value_out || !value_len_out || !seq_out ||
+        (!key && key_len) || key_len > DATAROUTER_KEEP_KEY_MAX)
         return DATAROUTER_ERR_INVALID_ARGUMENT;
-    }
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
-    if (!h) {
+    *value_out = NULL; *value_len_out = 0; *seq_out = 0;
+    datarouter_keep_header *h = keep_port_header(port);
+    if (!h) return DATAROUTER_ERR_NOT_FOUND;
+    int rc = keep_acquire_checked(h);
+    if (rc != DATAROUTER_OK) return rc;
+    datarouter_keep_slot *s = slot_find(h, keep_slots(h), keep_arena(h), key, key_len, keep_hash(key, key_len));
+    if (!s || (s->expires_ns && s->expires_ns <= datarouter_now_ns())) {
+        ++h->misses;
+        if (s) ++h->expired;
+        keep_writer_release(h);
         return DATAROUTER_ERR_NOT_FOUND;
     }
-    uint64_t hash = keep_hash(key, key_len);
-    datarouter_keep_slot *slots = keep_slots(h);
-    uint8_t *arena = keep_arena(h);
-    uint64_t now = datarouter_now_ns();
-    for (uint32_t retry = 0U; retry < DATAROUTER_KEEP_SEQLOCK_RETRY; retry++) {
-        uint64_t g1 = atomic_load_explicit(&h->generation, memory_order_acquire);
-        if ((g1 & 1ULL) != 0ULL) {
-            keep_recover_if_dead(h);
-            continue;
-        }
-        atomic_thread_fence(memory_order_acquire);
-        datarouter_keep_slot *s =
-            (key_len != 0u || key != NULL) ? slot_find(h, slots, arena, key, key_len, hash) : NULL;
-        const uint8_t *val_ptr = NULL;
-        uint32_t val_len = 0u;
-        int expired = 0;
-        if (s) {
-            expired = s->expires_ns != 0ULL && s->expires_ns <= now;
-            if (!expired) {
-                val_ptr = arena + s->value_offset;
-                val_len = s->value_len;
-            }
-        }
-        atomic_thread_fence(memory_order_acquire);
-        uint64_t g2 = atomic_load_explicit(&h->generation, memory_order_acquire);
-        if (g2 != g1) {
-            continue;
-        }
-        if (!s) {
-            h->misses++;
-            return DATAROUTER_ERR_NOT_FOUND;
-        }
-        if (expired) {
-            h->misses++;
-            h->expired++;
-            return DATAROUTER_ERR_NOT_FOUND;
-        }
-        if (out_cap < val_len) {
-            return DATAROUTER_ERR_FULL;
-        }
-        memcpy(out, val_ptr, val_len);
-        *out_len = val_len;
-        s->age++;
-        h->hits++;
-        return DATAROUTER_OK;
-    }
-    return DATAROUTER_ERR_AGAIN;
-}
-
-int datarouter_keep_get_ref(
-    datarouter_port *port,
-    const void *key, size_t key_len,
-    const void **value_out, size_t *value_len_out,
-    uint64_t *seq_out)
-{
-    if (!port || !value_out || !value_len_out || !seq_out ||
-        (key == NULL && key_len != 0u)) {
-        return DATAROUTER_ERR_INVALID_ARGUMENT;
-    }
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
-    if (!h) {
-        return DATAROUTER_ERR_NOT_FOUND;
-    }
-    uint64_t hash = keep_hash(key, key_len);
-    datarouter_keep_slot *slots = keep_slots(h);
-    uint8_t *arena = keep_arena(h);
-    uint64_t now = datarouter_now_ns();
-    for (uint32_t retry = 0U; retry < DATAROUTER_KEEP_SEQLOCK_RETRY; retry++) {
-        uint64_t g1 = atomic_load_explicit(&h->generation, memory_order_acquire);
-        if ((g1 & 1ULL) != 0ULL) {
-            keep_recover_if_dead(h);
-            continue;
-        }
-        atomic_thread_fence(memory_order_acquire);
-        datarouter_keep_slot *s = slot_find(h, slots, arena, key, key_len, hash);
-        if (s && !(s->expires_ns != 0ULL && s->expires_ns <= now)) {
-            *value_out = (const void *)(arena + s->value_offset);
-            *value_len_out = s->value_len;
-            *seq_out = g1;
-            s->age++;
-            h->hits++;
-            return DATAROUTER_OK;
-        }
-        if (!s) {
-            h->misses++;
-            return DATAROUTER_ERR_NOT_FOUND;
-        }
-        h->misses++;
-        h->expired++;
-        return DATAROUTER_ERR_NOT_FOUND;
-    }
-    return DATAROUTER_ERR_AGAIN;
+    ++s->age; ++h->hits;
+    *value_out = keep_arena(h) + s->value_offset;
+    *value_len_out = s->value_len;
+    *seq_out = atomic_load_explicit(&h->generation, memory_order_relaxed);
+    atomic_store_explicit(&port->keep_ref_seq, *seq_out, memory_order_release);
+    return DATAROUTER_OK; /* lease held until verify_ref */
 }
 
 int datarouter_keep_verify_ref(datarouter_port *port, uint64_t seq) {
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
-    if (!h) {
-        return DATAROUTER_ERR_NOT_FOUND;
-    }
-    uint64_t g2 = atomic_load_explicit(&h->generation, memory_order_acquire);
-    if ((g2 & 1ULL) == 0ULL && g2 == seq) {
-        return DATAROUTER_OK;
-    }
-    return DATAROUTER_ERR_AGAIN;
+    if (!port || !port->shm || !seq) return DATAROUTER_ERR_INVALID_ARGUMENT;
+    datarouter_keep_header *h = keep_port_header(port);
+    if (!h) return DATAROUTER_ERR_NOT_FOUND;
+    if (atomic_load_explicit(&h->writer_lock, memory_order_acquire) != (unsigned int)keep_current_pid() ||
+        !atomic_compare_exchange_strong_explicit(&port->keep_ref_seq, &seq, 0,
+                                                 memory_order_acq_rel, memory_order_relaxed))
+        return DATAROUTER_ERR_AGAIN;
+    keep_writer_release(h);
+    return DATAROUTER_OK;
+}
+
+int datarouter_keep_get(datarouter_port *port, const void *key, size_t key_len,
+                        void *out, size_t out_cap, size_t *out_len) {
+    if (!out_len || (!out && out_cap)) return DATAROUTER_ERR_INVALID_ARGUMENT;
+    *out_len = 0;
+    const void *value; size_t len; uint64_t seq;
+    int rc = datarouter_keep_get_ref(port, key, key_len, &value, &len, &seq);
+    if (rc != DATAROUTER_OK) return rc;
+    *out_len = len;
+    if (out_cap < len) rc = DATAROUTER_ERR_FULL;
+    else if (len) memcpy(out, value, len);
+    int release = datarouter_keep_verify_ref(port, seq);
+    return release == DATAROUTER_OK ? rc : release;
 }
 
 int datarouter_keep_put(
@@ -538,7 +457,7 @@ int datarouter_keep_put(
     if (auth != DATAROUTER_OK) {
         return auth;
     }
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
+    datarouter_keep_header *h = keep_port_header(port);
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
@@ -548,19 +467,19 @@ int datarouter_keep_put(
         return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
     }
     
+    int rc = keep_acquire_checked(h);
+    if (rc != DATAROUTER_OK) return rc;
     datarouter_keep_slot *rehash_tmp = NULL;
-    if (h->tombstones > h->slot_capacity / 4u) {
-        rehash_tmp = (datarouter_keep_slot *)malloc((size_t)h->slot_capacity * sizeof(datarouter_keep_slot));
-    }
-    
-    int rc = keep_writer_acquire(h);
-    if (rc != DATAROUTER_OK) {
-        free(rehash_tmp);
-        return rc;
-    }
+    if (h->tombstones > h->slot_capacity / 4u)
+        rehash_tmp = malloc((size_t)h->slot_capacity * sizeof(*rehash_tmp));
     keep_compact_if_needed(h, rehash_tmp);
-    uint32_t need = KEEP_ALIGN4(sizeof(datarouter_keep_entry_hdr) + (uint32_t)key_len + (uint32_t)value_len);
+    uint32_t need = KEEP_ALIGN8(sizeof(datarouter_keep_entry_hdr) + (uint32_t)key_len + (uint32_t)value_len);
     uint64_t now = datarouter_now_ns();
+    if (ttl_ns > UINT64_MAX - now) {
+        keep_writer_release(h);
+        free(rehash_tmp);
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
     uint64_t expires = ttl_ns == 0ULL ? 0ULL : (now + ttl_ns);
     uint64_t hash = keep_hash(key, key_len);
     datarouter_keep_slot *slots = keep_slots(h);
@@ -617,11 +536,11 @@ int datarouter_keep_invalidate(datarouter_port *port, const void *key, size_t ke
     if (auth != DATAROUTER_OK) {
         return auth;
     }
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
+    datarouter_keep_header *h = keep_port_header(port);
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
-    int rc = keep_writer_acquire(h);
+    int rc = keep_acquire_checked(h);
     if (rc != DATAROUTER_OK) {
         return rc;
     }
@@ -649,28 +568,24 @@ int datarouter_keep_invalidate_prefix(datarouter_port *port, const void *prefix,
     if (auth != DATAROUTER_OK) {
         return auth;
     }
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
+    datarouter_keep_header *h = keep_port_header(port);
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
-    int rc = keep_writer_acquire(h);
+    int rc = keep_acquire_checked(h);
     if (rc != DATAROUTER_OK) {
         return rc;
     }
     datarouter_keep_slot *slots = keep_slots(h);
     uint8_t *arena = keep_arena(h);
     uint32_t cap = h->slot_capacity;
-    uint32_t scanned = 0u;
-    uint32_t removed = 0u;
-    /* 空槽过滤 + 前缀字节比较；分片限流（即使中途超上限也返回已处理的部分完成语义）。 */
+
+    /* 完整扫描受限的 KEEP 区域；不会因前段未匹配条目反复返回 AGAIN。 */
     for (uint32_t i = 0u; i < cap; i++) {
         datarouter_keep_slot *s = &slots[i];
         if (s->key_offset == KEEP_EMPTY || s->key_offset == KEEP_TOMBSTONE ||
             s->key_hash == 0ULL) {
             continue;
-        }
-        if (++scanned > DATAROUTER_KEEP_PREFIX_SCAN_LIMIT) {
-            break;
         }
         const datarouter_keep_entry_hdr *eh = (const datarouter_keep_entry_hdr *)(arena + s->key_offset);
         if (eh->key_len < prefix_len) {
@@ -683,24 +598,25 @@ int datarouter_keep_invalidate_prefix(datarouter_port *port, const void *prefix,
             continue;
         }
         slot_mark_tombstone(h, s);
-        removed++;
         if (h->entry_count > 0u) {
             h->entry_count--;
         }
     }
     keep_writer_release(h);
     (void)arena;
-    return scanned >= DATAROUTER_KEEP_PREFIX_SCAN_LIMIT ? DATAROUTER_ERR_AGAIN : DATAROUTER_OK;
+    return DATAROUTER_OK;
 }
 
 int datarouter_keep_stats(datarouter_port *port, datarouter_keep_stats_t *out) {
     if (!port || !out) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
-    datarouter_keep_header *h = datarouter_keep_header_of(port->shm);
+    datarouter_keep_header *h = keep_port_header(port);
     if (!h) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
+    int rc = keep_acquire_checked(h);
+    if (rc != DATAROUTER_OK) return rc;
     out->capacity = h->capacity;
     out->entry_count = h->entry_count;
     out->hits = h->hits;
@@ -710,5 +626,6 @@ int datarouter_keep_stats(datarouter_port *port, datarouter_keep_stats_t *out) {
     out->generation = atomic_load_explicit(&h->generation, memory_order_relaxed);
     out->recovery_seq = atomic_load_explicit(&h->recovery_seq, memory_order_relaxed);
     out->slot_capacity = h->slot_capacity;
+    keep_writer_release(h);
     return DATAROUTER_OK;
 }

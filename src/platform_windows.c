@@ -96,7 +96,8 @@ int datarouter_platform_open(const char *name, size_t size_hint, datarouter_mapp
             return DATAROUTER_ERR_AGAIN;
         }
         size_t total_size = header->control.total_size;
-        size_t maximum_size = datarouter_shared_memory_size(DATAROUTER_MAX_PORTS);
+        size_t maximum_size = datarouter_shared_memory_size_with_keep(
+            DATAROUTER_MAX_PORTS, 8U * 1024U * 1024U);
         if (header->control.magic != DATAROUTER_MAGIC ||
             header->control.layout_version != DATAROUTER_LAYOUT_VERSION ||
             total_size < sizeof(datarouter_control_plane) || total_size > maximum_size) {

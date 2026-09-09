@@ -85,56 +85,13 @@ static void isolate_corrupt_slot(datarouter_shared_memory *shm, uint32_t slot_in
     datarouter_signal_post(&shm->control.rx_signal[slot_index]);
 }
 
-static int route_one_frame(
-    datarouter_shared_memory *shm,
-    uint32_t source_slot,
-    int *frame_consumed
-) {
-    if (frame_consumed) {
-        *frame_consumed = 0;
-    }
-    datarouter_registry_entry *source = datarouter_registry_find_routable_by_slot(shm, source_slot);
-    if (!source) {
-        return DATAROUTER_ERR_NOT_FOUND;
-    }
-    datarouter_registry_metadata source_metadata;
-    if (!datarouter_registry_read_routable(source, &source_metadata)) {
-        return DATAROUTER_ERR_NOT_FOUND;
-    }
-    datarouter_channel *tx = datarouter_tx_channel(shm, source_slot);
-    if (!tx) {
-        return DATAROUTER_ERR_INTERNAL;
-    }
-
-    uint32_t route_id = 0U;
-    uint32_t payload_len = 0U;
-    int rc = decode_route_header(tx, &route_id, &payload_len);
-    if (rc == DATAROUTER_ERR_PROTOCOL) {
-        isolate_corrupt_slot(shm, source_slot);
-        return rc;
-    }
-    if (rc != DATAROUTER_OK) {
-        return rc;
-    }
+static int route_locked(datarouter_shared_memory *shm, uint32_t source_slot,
+                        uint32_t target_slot, datarouter_registry_entry *source,
+                        datarouter_registry_metadata source_metadata,
+                        datarouter_channel *tx, datarouter_channel *rx,
+                        uint32_t payload_len, int *frame_consumed) {
     size_t frame_len = DATAROUTER_FRAME_HEADER_SIZE + (size_t)payload_len;
-
-    datarouter_registry_entry *target = datarouter_registry_find_active_by_route(shm, route_id);
-    if (!target) {
-        rc = datarouter_ring_skip(tx, frame_len);
-        if (rc == DATAROUTER_OK && frame_consumed) {
-            *frame_consumed = 1;
-        }
-        if (rc == DATAROUTER_ERR_PROTOCOL) {
-            isolate_corrupt_slot(shm, source_slot);
-            return rc;
-        }
-        return rc == DATAROUTER_OK ? DATAROUTER_ERR_NOT_FOUND : rc;
-    }
-    uint32_t target_slot = target->slot_index;
-    datarouter_channel *rx = datarouter_rx_channel(shm, target_slot);
-    if (!rx) {
-        return DATAROUTER_ERR_INTERNAL;
-    }
+    int rc;
     size_t rx_used = 0U;
     rc = datarouter_ring_validate(rx, &rx_used);
     if (rc == DATAROUTER_ERR_PROTOCOL) {
@@ -202,6 +159,68 @@ static int route_one_frame(
     datarouter_touch_entry(source, datarouter_now_ns());
     datarouter_scheduler_clear_tx_blocked(shm, source_slot);
     return DATAROUTER_OK;
+}
+
+static int route_one_frame(
+    datarouter_shared_memory *shm,
+    uint32_t source_slot,
+    int *frame_consumed
+) {
+    if (frame_consumed) {
+        *frame_consumed = 0;
+    }
+    datarouter_registry_entry *source = datarouter_registry_find_routable_by_slot(shm, source_slot);
+    if (!source) {
+        return DATAROUTER_ERR_NOT_FOUND;
+    }
+    datarouter_registry_metadata source_metadata;
+    if (!datarouter_registry_read_routable(source, &source_metadata)) {
+        return DATAROUTER_ERR_NOT_FOUND;
+    }
+    datarouter_channel *tx = datarouter_tx_channel(shm, source_slot);
+    if (!tx) {
+        return DATAROUTER_ERR_INTERNAL;
+    }
+
+    uint32_t route_id = 0U;
+    uint32_t payload_len = 0U;
+    int rc = decode_route_header(tx, &route_id, &payload_len);
+    if (rc == DATAROUTER_ERR_PROTOCOL) {
+        isolate_corrupt_slot(shm, source_slot);
+        return rc;
+    }
+    if (rc != DATAROUTER_OK) {
+        return rc;
+    }
+    size_t frame_len = DATAROUTER_FRAME_HEADER_SIZE + (size_t)payload_len;
+
+    datarouter_registry_entry *target = datarouter_registry_find_active_by_route(shm, route_id);
+    if (!target) {
+        rc = datarouter_ring_skip(tx, frame_len);
+        if (rc == DATAROUTER_OK && frame_consumed) {
+            *frame_consumed = 1;
+        }
+        if (rc == DATAROUTER_ERR_PROTOCOL) {
+            isolate_corrupt_slot(shm, source_slot);
+            return rc;
+        }
+        return rc == DATAROUTER_OK ? DATAROUTER_ERR_NOT_FOUND : rc;
+    }
+    uint32_t target_slot = target->slot_index;
+    datarouter_channel *rx = datarouter_rx_channel(shm, target_slot);
+    if (!rx) {
+        return DATAROUTER_ERR_INTERNAL;
+    }
+    unsigned int owner = 0;
+    if (!atomic_compare_exchange_strong_explicit(&target->rx_writer_owner, &owner,
+            (unsigned int)shm->control.switch_pid, memory_order_seq_cst, memory_order_relaxed)) {
+        datarouter_scheduler_mark_tx_ready(shm, source_slot);
+        return DATAROUTER_ERR_AGAIN;
+    }
+    rc = route_locked(shm, source_slot, target_slot, source, source_metadata, tx, rx,
+                      payload_len, frame_consumed);
+    atomic_store_explicit(&target->rx_writer_owner, 0U, memory_order_seq_cst);
+    return rc;
 }
 
 uint32_t datarouter_route_frames_budget(

@@ -75,7 +75,7 @@ impl LogLevel {
 }
 
 /// Configuration for starting one `datarouter-switch` process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SwitchConfig {
     /// Shared-memory object name, e.g. `/datarouter`.
     pub shm_name: String,
@@ -110,6 +110,27 @@ pub struct SwitchConfig {
     pub log_file: Option<PathBuf>,
     /// How long [`SwitchHandle::start`] waits for the transport to come up.
     pub ready_timeout: Duration,
+}
+
+impl std::fmt::Debug for SwitchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwitchConfig")
+            .field("shm_name", &self.shm_name)
+            .field("mode", &self.mode)
+            .field("ttl_ms", &self.ttl_ms)
+            .field("max_ports", &self.max_ports)
+            .field("allow", &self.allow)
+            .field("allow_any", &self.allow_any)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("reap_dead_processes", &self.reap_dead_processes)
+            .field("keep_size", &self.keep_size)
+            .field("keep_write_allow", &self.keep_write_allow)
+            .field("log_level", &self.log_level)
+            .field("binary", &self.binary)
+            .field("log_file", &self.log_file)
+            .field("ready_timeout", &self.ready_timeout)
+            .finish()
+    }
 }
 
 impl Default for SwitchConfig {
@@ -194,9 +215,8 @@ impl SwitchConfig {
         if self.allow_any {
             args.push("--allow-any".to_owned());
         }
-        if let Some(token) = &self.token {
-            args.push("--token".to_owned());
-            args.push(token.clone());
+        if self.token.is_some() {
+            args.push("--token-stdin".to_owned());
         }
         if self.reap_dead_processes {
             args.push("--reap-dead-processes".to_owned());
@@ -217,6 +237,7 @@ impl SwitchConfig {
     fn command(&self, program: &Path) -> Result<Command, SwitchError> {
         let mut cmd = Command::new(program);
         cmd.args(self.args());
+        cmd.stdin(if self.token.is_some() { Stdio::piped() } else { Stdio::null() });
         match &self.log_file {
             Some(path) => {
                 let file = std::fs::OpenOptions::new()
@@ -243,7 +264,9 @@ impl SwitchConfig {
 struct Materialized {
     path: PathBuf,
     owned: bool,
-    memfd: Option<std::os::fd::RawFd>,
+    // libc's descriptor type is portable; std::os::fd is Unix-only. This is
+    // populated only by the Linux memfd path.
+    memfd: Option<libc::c_int>,
 }
 
 impl Materialized {
@@ -357,15 +380,18 @@ fn temp_file_executable(bytes: &[u8]) -> Result<Materialized, SwitchError> {
         std::env::temp_dir().join(format!("datarouter-switch-{}-{nanos}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    let mut file = options.open(&path).map_err(SwitchError::Io)?;
-    file.write_all(bytes).map_err(SwitchError::Io)?;
-    drop(file);
-    // SAFETY: only the uid can read/write/execute the file (0700).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
     }
+    let mut file = options.open(&path).map_err(SwitchError::Io)?;
+    if let Err(err) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(SwitchError::Io(err));
+    }
+    drop(file);
     Ok(Materialized {
         path,
         owned: true,
@@ -472,7 +498,18 @@ impl SwitchHandle {
     fn spawn_child(&mut self) -> Result<(), SwitchError> {
         let materialized = materialize_switch(&self.config)?;
         let mut cmd = self.config.command(materialized.program())?;
-        let child = cmd.spawn().map_err(SwitchError::Io)?;
+        let mut child = cmd.spawn().map_err(SwitchError::Io)?;
+        if let Some(token) = &self.config.token {
+            use std::io::Write;
+            let result = child.stdin.take()
+                .ok_or_else(|| io::Error::other("missing switch token pipe"))
+                .and_then(|mut pipe| pipe.write_all(token.as_bytes()));
+            if let Err(error) = result {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SwitchError::Io(error));
+            }
+        }
         self.child = Some(child);
         self.materialized = Some(materialized);
         Ok(())
@@ -800,6 +837,14 @@ mod tests {
         })
         .expect("start authenticated switch");
         switch.verify_auth().expect("auth verified");
+        assert!(!switch.config.args().iter().any(|arg| arg.contains("hunter2")));
+        assert!(!format!("{:?}", switch.config).contains("hunter2"));
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/proc/{}/cmdline", switch.child.as_ref().unwrap().id());
+            let command = std::fs::read(path).expect("switch command line");
+            assert!(!command.windows(7).any(|part| part == b"hunter2"));
+        }
 
         let missing = FrontendOptions {
             shm_name: name.clone(),
@@ -822,6 +867,7 @@ mod tests {
             reader_wait_ms: 10,
             ..FrontendOptions::default()
         };
+        assert!(!format!("{with_token:?}").contains("hunter2"));
         let _core = Frontend::connect_routed(with_token).expect("token opens the switch");
         switch.stop().expect("stop switch");
         cleanup(&name);

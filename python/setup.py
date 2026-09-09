@@ -1,12 +1,49 @@
 from __future__ import annotations
 
 import shutil
+import os
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.sdist import sdist as _sdist
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+
+def source_root() -> Path:
+    project = Path(__file__).resolve().parent
+    bundled = project / "_native_source"
+    return bundled if bundled.is_dir() else project.parent
+
+
+class sdist(_sdist):
+    """Carry the exact Cargo source package so an sdist builds independently."""
+    def make_release_tree(self, base_dir, files):
+        super().make_release_tree(base_dir, files)
+        root = source_root()
+        destination = Path(base_dir) / "_native_source"
+        if root.name == "_native_source":
+            shutil.copytree(root, destination, ignore=shutil.ignore_patterns("target"))
+            return
+        (root / "target").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-source-", dir=root / "target") as target:
+            subprocess.run(["cargo", "package", "--allow-dirty", "--locked", "--no-verify",
+                            "--target-dir", target], cwd=root, check=True)
+            packages = list((Path(target) / "package").glob("blinkcms-datarouter-*.crate"))
+            if len(packages) != 1:
+                raise RuntimeError("expected exactly one current Cargo source package")
+            with tarfile.open(packages[0]) as archive:
+                for member in archive:
+                    relative = Path(*Path(member.name).parts[1:])
+                    if not member.isfile() or relative.is_absolute() or ".." in relative.parts:
+                        raise RuntimeError("invalid Cargo source archive member")
+                    path = destination / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.extractfile(member) as source, path.open("wb") as output:
+                        shutil.copyfileobj(source, output)
 
 
 class bdist_wheel(_bdist_wheel):
@@ -35,14 +72,13 @@ class build_py(_build_py):
         super().run()
 
     def _build_datarouter_so(self) -> None:
-        root = Path(__file__).resolve().parent.parent
+        root = source_root()
         static_lib = root / "target" / "release" / "libblinkcms_datarouter.a"
-        if not static_lib.exists():
-            subprocess.run(
-                ["cargo", "build", "--release"],
-                cwd=str(root),
-                check=True,
-            )
+        subprocess.run(
+            ["cargo", "build", "--release", "--locked", "--target-dir", str(root / "target")],
+            cwd=str(root),
+            check=True,
+        )
         if not static_lib.exists():
             raise RuntimeError(f"static library not found: {static_lib}")
 
@@ -53,7 +89,7 @@ class build_py(_build_py):
 
         subprocess.run(
             [
-                "cc",
+                os.environ.get("CC") or "cc",
                 "-shared",
                 "-o",
                 str(so_path),
@@ -68,4 +104,4 @@ class build_py(_build_py):
         )
 
 
-setup(cmdclass={"build_py": build_py, "bdist_wheel": bdist_wheel})
+setup(cmdclass={"build_py": build_py, "bdist_wheel": bdist_wheel, "sdist": sdist})

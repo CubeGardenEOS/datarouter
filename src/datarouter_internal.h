@@ -18,21 +18,32 @@ typedef int pid_t;
 #else
 #include <sys/types.h>
 #endif
-typedef atomic_uint datarouter_signal;
 typedef CRITICAL_SECTION datarouter_mutex;
 #else
 #include <pthread.h>
-#include <semaphore.h>
 #include <sys/types.h>
-typedef sem_t datarouter_signal;
 typedef pthread_mutex_t datarouter_mutex;
 #endif
 
-#define DATAROUTER_VERSION "0.2.0"
+typedef struct {
+    _Alignas(8) atomic_uint sequence;
+    atomic_uint consumed;
+    atomic_uint waiters;
+    unsigned char reserved[20];
+} datarouter_signal;
+_Static_assert(sizeof(atomic_uint) == 4, "futex word must be 32 bits");
+_Static_assert(sizeof(datarouter_signal) == 32, "stable signal storage");
+
+#ifndef CGEOS_GIT_COMMIT
+#define CGEOS_GIT_COMMIT "unknown"
+#endif
+#define DATAROUTER_VERSION CGEOS_GIT_COMMIT
 #define DATAROUTER_MAGIC 0x534D4342U
-#define DATAROUTER_LAYOUT_VERSION 13U
+#define DATAROUTER_LAYOUT_VERSION 17U
+#define DATAROUTER_IO_CLOSED 0x80000000ULL
+#define DATAROUTER_IO_REF_MASK 0x7fffffffULL
 #define DATAROUTER_KEEP_MAGIC 0x4B454550u /* "KEEP" */
-#define DATAROUTER_KEEP_LAYOUT_VERSION 2u
+#define DATAROUTER_KEEP_LAYOUT_VERSION 3u
 #define DATAROUTER_KEEP_HEADER_SIZE 128u
 #define DATAROUTER_KEEP_SLOT_SIZE 32u
 #define DATAROUTER_KEEP_SLOTS_PER_ENTRY 2u /* 开放寻址负载 <50% */
@@ -102,10 +113,13 @@ typedef enum {
 
 typedef struct {
     atomic_uint head;
+    unsigned char head_padding[60];
     atomic_uint tail;
+    unsigned char tail_padding[60];
 } datarouter_ring_header;
 
 _Static_assert(sizeof(datarouter_ring_header) == DATAROUTER_RING_HEADER_SIZE, "ring header size mismatch");
+_Static_assert(offsetof(datarouter_ring_header, tail) == 64U, "ring cursors must occupy separate cache lines");
 /* The ring index wrap is a mask, so the data capacity must be a power of two.
  * Default DATAROUTER_CHANNEL_SIZE=524288 (2^19) satisfies this. */
 _Static_assert(
@@ -129,13 +143,11 @@ typedef struct {
     /* Owner-thread pin counter (recv/touch/drain from the slot owner). The
      * switch's finalize_release handshake zeroes it only when the owner is
      * dead, because a dead owner's threads can never unpin. */
-    atomic_uint io_users;
-    /* Direct (unsafe) data-plane writer pin counter + last-writer identity.
-     * Kept separate from io_users so a live foreign direct writer is never
-     * mistaken for a stale owner pin: finalize_release drains this counter
-     * while the writer is alive, and only force-zeroes it when the recorded
-     * writer process is dead (crashed mid-write). The one-logical-writer
-     * constraint makes the single identity triplet sufficient. */
+    atomic_ullong io_users; /* route_id in high 32 bits; closed bit + reference count below */
+    /* Exclusive RX writer PID (0 = free), shared by direct and routed sends.
+     * A live paused writer blocks reuse. PID reuse conservatively delays
+     * reclamation rather than freeing a potentially active writer's ring. */
+    atomic_uint rx_writer_owner; /* Lifetime gate: never reset by clear_entry. */
     atomic_uint direct_writers;
     atomic_int direct_writer_pid;
     atomic_uint direct_writer_uid;
@@ -251,6 +263,10 @@ typedef struct {
     datarouter_slot_descriptor slots[DATAROUTER_MAX_PORTS];
 } datarouter_control_plane;
 
+/* Real mappings are page-aligned. Round the data plane separately instead of
+ * over-aligning C structs, so ordinary heap/stack fixtures remain valid C. */
+#define DATAROUTER_DATA_OFFSET ((sizeof(datarouter_control_plane) + 63U) & ~(size_t)63U)
+
 typedef struct {
     datarouter_control_plane control;
 } datarouter_shared_memory;
@@ -277,6 +293,7 @@ struct datarouter_port {
      * where multiple application threads may call datarouter_recv on the
      * same SPSC RX ring without a reader thread. Process-local. */
     datarouter_mutex rx_mutex;
+    atomic_ullong keep_ref_seq; /* outstanding C KEEP reference, zero if absent */
     uint8_t *drain_buffer;
     size_t drain_buffer_capacity;
 };
@@ -300,6 +317,8 @@ int datarouter_platform_unlink(const char *name);
 void datarouter_platform_close(datarouter_mapping *mapping);
 
 uint64_t datarouter_now_ns(void);
+#define DATAROUTER_HAS_CLOCK_CONVERSION 1
+uint64_t datarouter_clock_ticks_to_ns(uint64_t ticks, uint64_t frequency);
 void datarouter_sleep_us(uint32_t usec);
 void datarouter_yield(void);
 int datarouter_pid_alive(pid_t pid);
@@ -352,6 +371,7 @@ int datarouter_ring_write_parts(
 );
 int datarouter_ring_peek(const datarouter_channel *channel, uint8_t *data, size_t len);
 int datarouter_ring_read(datarouter_channel *channel, uint8_t *data, size_t len);
+int datarouter_ring_read_frame(datarouter_channel *channel, uint8_t *data, size_t payload_len);
 int datarouter_ring_skip(datarouter_channel *channel, size_t len);
 int datarouter_ring_transfer_frame(
     datarouter_channel *source,

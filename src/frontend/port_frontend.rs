@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use super::options::FrontendOptions;
 
@@ -17,11 +18,25 @@ pub struct RawFrame {
 #[derive(Debug)]
 pub struct PortFrontend {
     port: *mut crate::datarouter_port,
+    owner: Arc<PortOwner>,
 }
+
+/// Ownership only: normal calls remain serialized by the frontend; KEEP
+/// leases use the C lease protocol. The last owner closes the C mapping.
+#[derive(Debug)]
+pub(crate) struct PortOwner {
+    pub(crate) port: *mut crate::datarouter_port,
+}
+unsafe impl Send for PortOwner {}
+unsafe impl Sync for PortOwner {}
 
 unsafe impl Send for PortFrontend {}
 
 impl PortFrontend {
+    pub(crate) fn keep_owner(&self) -> Arc<PortOwner> {
+        Arc::clone(&self.owner)
+    }
+
     /// Raw C port pointer (internal FFI escape hatch).
     pub(crate) fn raw(&self) -> *mut crate::datarouter_port {
         self.port
@@ -48,7 +63,7 @@ impl PortFrontend {
         };
         let mut port = ptr::null_mut();
         status_to_result(unsafe { crate::datarouter_open(&c_options, &mut port) })?;
-        Ok(Self { port })
+        Ok(Self { port, owner: Arc::new(PortOwner { port }) })
     }
 
     pub fn open(options: &FrontendOptions) -> Result<Self, c_int> {
@@ -90,7 +105,7 @@ impl PortFrontend {
             return Err(code);
         }
 
-        Ok(Self { port })
+        Ok(Self { port, owner: Arc::new(PortOwner { port }) })
     }
 
     pub fn wait(&self, timeout_ms: u32) -> c_int {
@@ -310,7 +325,7 @@ impl PortFrontend {
     }
 }
 
-impl Drop for PortFrontend {
+impl Drop for PortOwner {
     fn drop(&mut self) {
         unsafe { crate::datarouter_close(self.port) };
     }
