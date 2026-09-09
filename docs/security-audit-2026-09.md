@@ -169,3 +169,14 @@ latest 流程串行移动同一个标签并覆盖上传当前 wheel；确认新�
 不删除历史 benchmark 报告。引用 API 行为依据 GitHub 的
 [Git references](https://docs.github.com/en/rest/git/refs) 与
 [release assets](https://docs.github.com/en/rest/releases/assets) 文档。未执行远程发布。
+
+## direct 冗余元数据增量
+
+稳定 RX gate 已接管恢复，旧 direct_writer_* 字段不再被读取；删除热路径上的旧字段写入，
+并从已 pin、已核对身份的注册项读取 PID，减少每帧三次冗余 PID/UID 系统调用。
+共享布局和身份/注销保护保持同一实现。`build/security-writer-metadata` 全部 33 项候选检查通过。
+
+`security-writer-20260909` 的 A/B/B/A p99 为 22.370/16.730/16.650/20.410 µs；
+候选 p50 为 4.679/4.670 µs，A 为 6.780/6.740 µs。尽管 B 组重复性通过且均值降低 21.97%，
+A 组仍波动 -8.76%，整个实验标为失败，不解除最终门禁。仅 src/port.c 改变，
+产物与源码保存在 build/diagnostic-writer-a/b，清理 remaining=0。

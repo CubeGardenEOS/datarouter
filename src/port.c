@@ -924,26 +924,16 @@ int datarouter_unsafe_send(
      * atomically with ownership so teardown never mistakes a paused claimant
      * for a dead writer during identity publication. */
     unsigned int expected_writer = 0;
+    /* pin_self_entry already checked the calling PID/UID and holds this
+     * registration stable until out. Legacy direct_writer_* fields are no
+     * longer read by recovery, so publishing them only adds stores and
+     * redundant getpid/getuid calls to every frame. */
+    unsigned int writer_pid = (unsigned int)atomic_load_explicit(&self->pid, memory_order_relaxed);
     if (!atomic_compare_exchange_strong_explicit(&target_entry->rx_writer_owner,
-            &expected_writer, (unsigned int)current_pid(), memory_order_seq_cst, memory_order_relaxed)) {
+            &expected_writer, writer_pid, memory_order_seq_cst, memory_order_relaxed)) {
         rc = DATAROUTER_ERR_AGAIN;
         goto out;
     }
-    atomic_store_explicit(
-        &target_entry->direct_writer_pid,
-        current_pid(),
-        memory_order_relaxed
-    );
-    atomic_store_explicit(
-        &target_entry->direct_writer_uid,
-        current_uid(),
-        memory_order_relaxed
-    );
-    atomic_store_explicit(
-        &target_entry->direct_writer_start_id,
-        port->process_start_id,
-        memory_order_relaxed
-    );
     /* Re-verify the pinned entry is still the same active registration. */
     datarouter_registry_metadata recheck;
     if (!datarouter_registry_read_active(target_entry, &recheck) ||
