@@ -35,6 +35,10 @@ const HEADERS: &[&str] = &[
     "src/tlv.c",
     "src/keep.c",
     "src/datarouter_internal.h",
+    "src/wait_diagnostics.h",
+    "src/signal_diagnostics.h",
+    "src/wait_policy.h",
+    "src/thread_policy.h",
     "src/datarouter_registry.h",
     "src/datarouter_router.h",
     "src/datarouter_scheduler.h",
@@ -47,7 +51,7 @@ const HEADERS: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
-    for name in ["CC", "AR", "LD", "CGEOS_GIT_COMMIT"] {
+    for name in ["CC", "AR", "LD", "CGEOS_GIT_COMMIT", "DATAROUTER_WAIT_DIAGNOSTICS"] {
         println!("cargo:rerun-if-env-changed={name}");
     }
     for name in ["HEAD", "index"] {
@@ -242,6 +246,9 @@ fn compile_c(
             .arg(&object);
         if !unsafe_flag.is_empty() {
             cmd.arg(&unsafe_flag);
+        }
+        if !is_windows && env::var("DATAROUTER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
+            cmd.arg("-DDATAROUTER_WAIT_DIAGNOSTICS");
         }
         if !is_windows {
             cmd.arg("-D_POSIX_C_SOURCE=200809L").arg("-fPIC");

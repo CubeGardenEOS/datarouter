@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static void reaped(pid_t pid) {
     int status;
@@ -35,8 +36,53 @@ static pid_t sleeper(datarouter_signal *s) {
 static void interrupted(int signum) { (void)signum; }
 #endif
 
+#ifdef DATAROUTER_HAS_SLEEPER_NOTIFICATION
+static pthread_barrier_t race_boundary;
+static datarouter_signal race_signal;
+static atomic_uint race_ready;
+static unsigned int race_observed;
+static void *race_publish(void *unused) {
+    (void)unused;
+    for (unsigned i = 0; i < 20000; i++) {
+        pthread_barrier_wait(&race_boundary);
+        atomic_store_explicit(&race_ready, 1, memory_order_release);
+        datarouter_signal_post_if_waiting(&race_signal);
+        pthread_barrier_wait(&race_boundary);
+    }
+    return NULL;
+}
+static void *race_sleep(void *unused) {
+    (void)unused;
+    for (unsigned i = 0; i < 20000; i++) {
+        pthread_barrier_wait(&race_boundary);
+        assert(datarouter_signal_arm(&race_signal) == DATAROUTER_OK);
+        race_observed = atomic_load_explicit(&race_ready, memory_order_acquire);
+        pthread_barrier_wait(&race_boundary);
+    }
+    return NULL;
+}
+static void test_sleeper_publication_race(void) {
+    assert(pthread_barrier_init(&race_boundary, NULL, 3) == 0);
+    pthread_t publisher, sleeper_thread;
+    assert(pthread_create(&publisher, NULL, race_publish, NULL) == 0);
+    assert(pthread_create(&sleeper_thread, NULL, race_sleep, NULL) == 0);
+    for (unsigned i = 0; i < 20000; i++) {
+        datarouter_signal_init(&race_signal); atomic_store(&race_ready, 0);
+        pthread_barrier_wait(&race_boundary);
+        pthread_barrier_wait(&race_boundary);
+        assert(race_observed || datarouter_signal_prepare(&race_signal) != 0);
+        datarouter_signal_cancel(&race_signal);
+    }
+    pthread_join(publisher, NULL); pthread_join(sleeper_thread, NULL);
+    pthread_barrier_destroy(&race_boundary);
+}
+#endif
+
 int main(void) {
     alarm(10);
+#ifdef DATAROUTER_HAS_SLEEPER_NOTIFICATION
+    test_sleeper_publication_race();
+#endif
     datarouter_signal *s = mmap(NULL, sizeof(*s), PROT_READ | PROT_WRITE,
                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     assert(s != MAP_FAILED);
@@ -44,6 +90,21 @@ int main(void) {
     assert(datarouter_signal_wait(NULL, 1U) == DATAROUTER_ERR_INVALID_ARGUMENT);
     for (unsigned int i = 0; i < 1000000U; ++i) datarouter_signal_post(s);
     assert(datarouter_signal_wait(s, 1U) == DATAROUTER_OK);
+#ifdef DATAROUTER_HAS_SLEEPER_NOTIFICATION
+    uint32_t unchanged = datarouter_signal_prepare(s);
+    datarouter_signal_post_if_waiting(s);
+    assert(datarouter_signal_prepare(s) == unchanged); /* no notification write */
+    assert(datarouter_signal_arm(s) == DATAROUTER_OK);
+    uint32_t armed = datarouter_signal_prepare(s);
+    datarouter_signal_post_if_waiting(s); /* publish after predicate recheck */
+    assert(datarouter_signal_wait_armed(s, armed, 1) == DATAROUTER_OK);
+    assert(atomic_load(&s->waiters) == 0);
+    assert(datarouter_signal_arm(s) == DATAROUTER_OK);
+    datarouter_signal_cancel(s); /* nonempty predicate, no kernel wait */
+    assert(atomic_load(&s->waiters) == 0);
+    /* Consume the hint from the armed case before testing semaphore debt. */
+    assert(datarouter_signal_wait(s, 1U) == DATAROUTER_OK);
+#endif
     /* A million publications must not leave a million empty wakeups. */
     assert(datarouter_signal_wait(s, 1U) == DATAROUTER_ERR_TIMEOUT);
 #if DATAROUTER_LAYOUT_VERSION >= 16U

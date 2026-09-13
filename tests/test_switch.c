@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "../src/datarouter_internal.h"
 #include "../src/datarouter_registry.h"
 #include "../src/datarouter_router.h"
@@ -185,6 +188,13 @@ static void activate_test_entry_pid(datarouter_shared_memory *shm, uint32_t slot
     entry->process_start_id = process_start_id;
     datarouter_registry_store_name(entry, service);
     atomic_store_explicit(&entry->last_active_ns, datarouter_now_ns(), memory_order_release);
+    /* Mirror the switch's activation invariant (switch.c binds io_users to the
+     * route before publishing ACTIVE); pins are rejected otherwise. */
+    atomic_store_explicit(
+        &entry->io_users,
+        (unsigned long long)atomic_load_explicit(&entry->route_id, memory_order_relaxed) << 32U,
+        memory_order_release
+    );
     atomic_store_explicit(&entry->state, DATAROUTER_PORT_ACTIVE, memory_order_release);
 }
 
@@ -233,7 +243,7 @@ static void write_test_frame(datarouter_shared_memory *shm, uint32_t source_slot
     uint32_t len = (uint32_t)strlen(payload) + 1U;
     uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
     encode_test_header(header, target_route, len);
-    datarouter_channel *tx = datarouter_tx_channel(shm, source_slot);
+    datarouter_channel tx = datarouter_tx_channel(shm, source_slot);
     require_int(datarouter_ring_write(tx, header, sizeof(header)) == DATAROUTER_OK, "write test frame header");
     require_int(datarouter_ring_write(tx, (const uint8_t *)payload, len) == DATAROUTER_OK, "write test frame payload");
 }
@@ -394,7 +404,7 @@ static void test_route_and_allowlist(void) {
     require_int(strcmp(snapshot[0].service_name, "Core") == 0, "registry snapshot service");
     require_int(snapshot[0].pid > 0, "registry snapshot pid");
     require_int(snapshot[0].route_id > 0U, "registry snapshot route");
-    require_int(snapshot[0].channel_id == 0U, "registry snapshot channel");
+    require_int(snapshot[0].channel_id == 4U, "registry snapshot channel");
 
     const char payload[] = "[{\"type\":\"ping\",\"value\":42}]";
     require_int(
@@ -506,6 +516,153 @@ static void test_concurrent_send_from_shared_port(void) {
     unlink_shm(name);
 }
 #endif
+
+#ifndef _WIN32
+#define POLL_PROBE_FRAMES 400U
+
+/* datarouter_poll is a lock-free read-only RX probe: it must never advance
+ * the ring tail, so hammering it from a foreign thread while another thread
+ * waits/recvs on the same port must neither corrupt the SPSC ring nor lose
+ * frames (this pins the invariant that lets the wait spin loop stay off the
+ * RX mutex). */
+typedef struct poll_probe_args {
+    datarouter_port *port;
+    atomic_int *stop;
+    int rc;
+    unsigned long polls;
+    unsigned long poll_bad;
+} poll_probe_args;
+
+typedef struct poll_probe_receiver_args {
+    datarouter_port *receiver;
+    unsigned char seen[POLL_PROBE_FRAMES];
+    size_t received;
+    int rc;
+} poll_probe_receiver_args;
+
+static void *poll_probe_main(void *arg) {
+    poll_probe_args *probe = (poll_probe_args *)arg;
+    probe->rc = DATAROUTER_OK;
+    while (!atomic_load_explicit(probe->stop, memory_order_acquire)) {
+        int rc = datarouter_poll(probe->port);
+        probe->polls++;
+        if (rc != DATAROUTER_OK && rc != DATAROUTER_ERR_AGAIN) {
+            probe->poll_bad++;
+            probe->rc = rc;
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void *poll_probe_receiver_main(void *arg) {
+    poll_probe_receiver_args *receiver = (poll_probe_receiver_args *)arg;
+    receiver->rc = DATAROUTER_OK;
+    uint64_t started = datarouter_now_ns();
+
+    while (receiver->received < POLL_PROBE_FRAMES) {
+        if (datarouter_now_ns() - started > 10000000000ULL) {
+            receiver->rc = DATAROUTER_ERR_TIMEOUT;
+            return NULL;
+        }
+        int wait_rc = datarouter_wait(receiver->receiver, 50U);
+        if (wait_rc != DATAROUTER_OK && wait_rc != DATAROUTER_ERR_TIMEOUT) {
+            receiver->rc = wait_rc;
+            return NULL;
+        }
+        for (;;) {
+            char payload[64];
+            datarouter_message_info info;
+            int rc = datarouter_recv(receiver->receiver, payload, sizeof(payload), &info);
+            if (rc == DATAROUTER_ERR_AGAIN) {
+                break;
+            }
+            if (rc != DATAROUTER_OK) {
+                receiver->rc = rc;
+                return NULL;
+            }
+            unsigned int seq = 0U;
+            require_int(sscanf(payload, "seq=%u", &seq) == 1, "poll probe payload format");
+            require_int(seq < POLL_PROBE_FRAMES, "poll probe sequence range");
+            require_int(receiver->seen[seq] == 0U, "poll probe duplicate payload");
+            receiver->seen[seq] = 1U;
+            receiver->received++;
+        }
+    }
+    return NULL;
+}
+
+static void test_poll_probe_concurrent_with_recv(void) {
+    const char *name = "/datarouter-poll-probe-test";
+    unlink_shm(name);
+    pid_t sw = start_switch(name, 5000U);
+
+    datarouter_options opts = {0};
+    opts.shm_name = name;
+    opts.timeout_ms = 1000U;
+
+    datarouter_port *core = NULL;
+    datarouter_port *ml = NULL;
+    require_int(datarouter_open(&opts, &core) == DATAROUTER_OK, "open poll probe core");
+    require_int(datarouter_open(&opts, &ml) == DATAROUTER_OK, "open poll probe ml");
+    logon(core, "Core");
+    logon(ml, "MLHelper");
+
+    atomic_int stop;
+    atomic_init(&stop, 0);
+    poll_probe_args probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.port = core;
+    probe.stop = &stop;
+
+    pthread_t probe_thread;
+    require_int(pthread_create(&probe_thread, NULL, poll_probe_main, &probe) == 0,
+        "create poll probe thread");
+
+    poll_probe_receiver_args receiver_args;
+    memset(&receiver_args, 0, sizeof(receiver_args));
+    receiver_args.receiver = core;
+    pthread_t receiver_thread;
+    require_int(pthread_create(&receiver_thread, NULL, poll_probe_receiver_main, &receiver_args) == 0,
+        "create poll probe receiver");
+
+    for (unsigned int seq = 0U; seq < POLL_PROBE_FRAMES; seq++) {
+        char payload[64];
+        int written = snprintf(payload, sizeof(payload), "seq=%u", seq);
+        require_int(written > 0, "format poll probe payload");
+        uint64_t started = datarouter_now_ns();
+        for (;;) {
+            int rc = datarouter_send(ml, "Core", payload, (size_t)written + 1U);
+            if (rc == DATAROUTER_OK) {
+                break;
+            }
+            if (rc != DATAROUTER_ERR_FULL || datarouter_now_ns() - started > 5000000000ULL) {
+                require_int(rc == DATAROUTER_OK, "poll probe sender succeeds");
+            }
+            datarouter_sleep_us(500U);
+        }
+    }
+
+    require_int(pthread_join(receiver_thread, NULL) == 0, "join poll probe receiver");
+    atomic_store_explicit(&stop, 1, memory_order_release);
+    require_int(pthread_join(probe_thread, NULL) == 0, "join poll probe thread");
+
+    require_int(receiver_args.rc == DATAROUTER_OK, "poll probe receiver succeeds");
+    require_int(receiver_args.received == POLL_PROBE_FRAMES, "poll probe frame count");
+    for (unsigned int seq = 0U; seq < POLL_PROBE_FRAMES; seq++) {
+        require_int(receiver_args.seen[seq] == 1U, "poll probe payload delivered");
+    }
+    require_int(probe.rc == DATAROUTER_OK, "poll probe status");
+    require_int(probe.poll_bad == 0UL, "poll probe never reports transport errors");
+    require_int(probe.polls > 0UL, "poll probe observed traffic");
+
+    datarouter_close(ml);
+    datarouter_close(core);
+    stop_switch(sw);
+    unlink_shm(name);
+}
+#endif
+
 
 static void test_wait_timeout(void) {
     const char *name = "/datarouter-wait-test";
@@ -687,9 +844,6 @@ static void test_drain_batches_complete_frames(void) {
 
     datarouter_port core;
     init_test_port(&core, shm, 0U, "Core");
-    uint8_t drain_buffer[DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE];
-    core.drain_buffer = drain_buffer;
-    core.drain_buffer_capacity = sizeof(drain_buffer);
 
     drain_records records;
     memset(&records, 0, sizeof(records));
@@ -738,7 +892,7 @@ static void test_stale_target_route_is_dropped_after_slot_reuse(void) {
     memset(&stats, 0, sizeof(stats));
     require_int(datarouter_route_frames_stats(shm, &stats) == 0U, "stale target frame is not routed");
     require_int(stats.not_found == 1U, "stale target increments not_found");
-    require_int(datarouter_ring_used(datarouter_rx_channel(shm, 0U)) == 0U, "reused target rx remains empty");
+    require_int(datarouter_ring_used(datarouter_rx_channel(shm, 1U, 0U)) == 0U, "reused target rx remains empty");
     require_int(datarouter_ring_used(datarouter_tx_channel(shm, 1U)) == 0U, "stale target frame is discarded");
     free(shm);
 }
@@ -937,7 +1091,7 @@ static void test_config_allowlist_and_capacity(void) {
     datarouter_mapping mapping;
     require_int(datarouter_platform_open(name, 0U, &mapping) == DATAROUTER_OK, "open config shm mapping");
     require_int(mapping.shm->control.max_ports == 5U, "config owns active port count");
-    require_int(mapping.shm->control.channel_count == 10U, "config owns channel count");
+    require_int(mapping.shm->control.channel_count == 30U, "config owns channel count");
     datarouter_platform_close(&mapping);
 
     datarouter_options opts = {0};
@@ -1040,6 +1194,45 @@ static void test_duplicate_switch_is_rejected_and_exit_unlinks(void) {
         datarouter_platform_open(name, 0U, &mapping) == DATAROUTER_ERR_NOT_FOUND,
         "normal switch exit unlinks mapping"
     );
+}
+
+typedef struct { datarouter_port *port; int result; } restart_wait_args;
+static void *restart_wait_main(void *opaque) {
+    restart_wait_args *args = opaque;
+    args->result = datarouter_wait(args->port, 0U); /* infinite wait must observe switch death */
+    return NULL;
+}
+
+static void test_sleeping_wait_releases_pin_and_rejects_restarted_switch(void) {
+    const char *name = "/datarouter-wait-restart-test";
+    unlink_shm(name);
+    pid_t first = start_switch(name, 5000U);
+    datarouter_options opts = { .shm_name = name, .timeout_ms = 1000U };
+    datarouter_port *old = NULL;
+    require_int(datarouter_open(&opts, &old) == DATAROUTER_OK, "open wait restart port");
+    logon(old, "Core");
+    restart_wait_args args = { .port = old, .result = DATAROUTER_ERR_INTERNAL };
+    pthread_t waiter;
+    require_int(pthread_create(&waiter, NULL, restart_wait_main, &args) == 0, "start restart waiter");
+    uint64_t deadline = datarouter_now_ns() + 1000000000ULL;
+    while (!atomic_load_explicit(&old->shm->control.rx_signal[old->slot_index].waiters, memory_order_acquire)) {
+        require_int(datarouter_now_ns() < deadline, "waiter enters sleep helper");
+        datarouter_sleep_us(100U);
+    }
+    require_int((atomic_load_explicit(&old->shm->control.registry[old->slot_index].io_users,
+        memory_order_acquire) & DATAROUTER_IO_REF_MASK) == 0ULL, "sleep retains no registration pin");
+    stop_switch(first);
+    pid_t replacement = start_switch(name, 5000U);
+    require_int(pthread_join(waiter, NULL) == 0, "join old switch waiter");
+    require_int(args.result == DATAROUTER_ERR_NOT_FOUND, "old wait rejects replacement switch");
+    datarouter_port *fresh = NULL;
+    require_int(datarouter_open(&opts, &fresh) == DATAROUTER_OK, "open replacement wait port");
+    logon(fresh, "Core");
+    require_int(datarouter_wait(fresh, 1U) == DATAROUTER_ERR_TIMEOUT, "replacement handle independently waits");
+    datarouter_close(old);
+    datarouter_close(fresh);
+    stop_switch(replacement);
+    unlink_shm(name);
 }
 
 static void test_stale_switch_mapping_is_rebuilt(void) {
@@ -1222,7 +1415,7 @@ static void test_full_receiver_wakes_blocked_sender(void) {
     encode_test_header(header, shm->control.registry[2].route_id, (uint32_t)large_len);
     require_int(
         datarouter_ring_write_parts(
-            datarouter_rx_channel(shm, 0U),
+            datarouter_rx_channel(shm, 1U, 0U),
             header,
             sizeof(header),
             large,
@@ -1314,10 +1507,7 @@ static void test_inflight_is_accounted_before_rx_publish(void) {
     require_int(strcmp(published_frame_payload, "publish-race") == 0, "published payload preserved");
     require_int(strcmp(published_frame_info.source, "Source") == 0, "published source preserved");
     require_int(
-        atomic_load_explicit(
-            &shm->control.inflight_frames[0U][1U],
-            memory_order_acquire
-        ) == 0U,
+        datarouter_ring_used(datarouter_rx_channel(shm, 0U, 1U)) == 0U,
         "immediate receive cannot strand inflight accounting"
     );
     require_int(datarouter_registry_release_slot(shm, 0U), "source releases after immediate receive");
@@ -1328,7 +1518,7 @@ static void free_target_before_block_registration(
     datarouter_shared_memory *shm,
     uint32_t target_slot
 ) {
-    datarouter_ring_reset(datarouter_rx_channel(shm, target_slot));
+    datarouter_ring_reset(datarouter_rx_channel(shm, 1U, target_slot));
     (void)datarouter_scheduler_wake_blocked(shm);
 }
 
@@ -1344,7 +1534,7 @@ static void test_full_prepare_to_wait_closes_lost_wakeup_window(void) {
     require_int(fill != NULL, "allocate full race fill");
     require_int(
         datarouter_ring_write(
-            datarouter_rx_channel(shm, 0U),
+            datarouter_rx_channel(shm, 1U, 0U),
             fill,
             DATAROUTER_RING_CAPACITY
         ) == DATAROUTER_OK,
@@ -1587,7 +1777,7 @@ static void test_nonzero_short_frames_are_isolated(void) {
     );
 
     require_int(
-        datarouter_ring_write(datarouter_rx_channel(shm, 0U), &byte, 1U) == DATAROUTER_OK,
+        datarouter_ring_write(datarouter_rx_channel(shm, 1U, 0U), &byte, 1U) == DATAROUTER_OK,
         "publish short rx"
     );
     datarouter_port core;
@@ -1605,10 +1795,151 @@ static void test_nonzero_short_frames_are_isolated(void) {
     free(shm);
 }
 
+static void test_poll_probe_on_skewed_frame_never_reports_corruption(void) {
+    size_t size = datarouter_shared_memory_size(4U);
+    datarouter_shared_memory *shm = (datarouter_shared_memory *)calloc(1U, size);
+    require_int(shm != NULL, "allocate probe shm");
+    require_int(datarouter_init_shared_memory(shm, 4U) == DATAROUTER_OK, "init probe shm");
+    activate_test_entry(shm, 0U, "Core");
+
+    datarouter_port core;
+    init_test_port(&core, shm, 0U, "Core");
+
+    datarouter_channel rx = datarouter_rx_channel(shm, 1U, 0U);
+
+    /* 1. Partial/skewed bytes in ring (fewer than header size):
+     * poll must return DATAROUTER_ERR_AGAIN and must NOT mark slot corrupt! */
+    atomic_store_explicit(&rx.header->tail, 0U, memory_order_relaxed);
+    atomic_store_explicit(&rx.header->head, 3U, memory_order_relaxed);
+    require_int(datarouter_poll(&core) == DATAROUTER_ERR_AGAIN, "poll probe skewed bytes returns AGAIN");
+    require_int(atomic_load_explicit(&shm->control.corrupt_slot_mask, memory_order_acquire) == 0ULL,
+                "poll probe skewed bytes never marks corrupt");
+
+    /* 2. Malformed frame header with source_route == 0 (transient partial write):
+     * poll must return DATAROUTER_ERR_AGAIN and must NOT mark slot corrupt! */
+    atomic_store_explicit(&rx.header->tail, 0U, memory_order_relaxed);
+    atomic_store_explicit(&rx.header->head, (uint32_t)DATAROUTER_FRAME_HEADER_SIZE, memory_order_relaxed);
+    memset(rx.data, 0, DATAROUTER_FRAME_HEADER_SIZE);
+    require_int(datarouter_poll(&core) == DATAROUTER_ERR_AGAIN, "poll probe malformed header returns AGAIN");
+    require_int(atomic_load_explicit(&shm->control.corrupt_slot_mask, memory_order_acquire) == 0ULL,
+                "poll probe malformed header never marks corrupt");
+
+    /* 3. Incomplete frame body (head advanced less than frame_len):
+     * poll must return DATAROUTER_ERR_AGAIN and must NOT mark slot corrupt! */
+    uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
+    encode_test_header(header, 65U, 128U);
+    memcpy(rx.data, header, sizeof(header));
+    atomic_store_explicit(&rx.header->head, (uint32_t)DATAROUTER_FRAME_HEADER_SIZE + 10U, memory_order_relaxed);
+    require_int(datarouter_poll(&core) == DATAROUTER_ERR_AGAIN, "poll probe partial body returns AGAIN");
+    require_int(atomic_load_explicit(&shm->control.corrupt_slot_mask, memory_order_acquire) == 0ULL,
+                "poll probe partial body never marks corrupt");
+
+    free(shm);
+}
+
+static void test_pair_fairness_and_short_retry(void) {
+    size_t size = datarouter_shared_memory_size(4);
+    datarouter_shared_memory *shm = calloc(1, size);
+    require_int(shm && datarouter_init_shared_memory(shm, 4) == DATAROUTER_OK, "pair fixture");
+    activate_test_entry(shm, 0, "Target");
+    activate_test_entry(shm, 1, "Busy");
+    activate_test_entry(shm, 2, "Quiet");
+    datarouter_port target, busy, quiet;
+    init_test_port(&target, shm, 0, "Target");
+    init_test_port(&busy, shm, 1, "Busy");
+    init_test_port(&quiet, shm, 2, "Quiet");
+    for (int i = 0; i < 8; i++)
+        require_int(datarouter_unsafe_send(&busy, "Target", "busy", 5) == DATAROUTER_OK, "busy direct frame");
+    require_int(datarouter_unsafe_send(&quiet, "Target", "quiet", 6) == DATAROUTER_OK, "quiet direct frame");
+    size_t needed = 0;
+    char data[64]; datarouter_message_info info;
+    require_int(datarouter_poll(&target) == DATAROUTER_OK, "select busy");
+    require_int(datarouter_frame_len(&target, &needed) == DATAROUTER_OK && needed == 5, "selected length");
+    require_int(datarouter_recv(&target, data, 1, &info) == DATAROUTER_ERR_PAYLOAD_TOO_LARGE, "short buffer preserves frame");
+    require_int(datarouter_frame_len(&target, &needed) == DATAROUTER_OK && needed == 5, "same selected frame");
+    require_int(datarouter_recv(&target, data, sizeof(data), &info) == DATAROUTER_OK && !strcmp(info.source, "Busy"), "busy first");
+    require_int(datarouter_recv(&target, data, sizeof(data), &info) == DATAROUTER_OK && !strcmp(info.source, "Quiet"), "quiet not starved");
+    require_int(!datarouter_registry_release_slot(shm, 1), "source retained while outbound nonempty");
+    for (int i = 0; i < 7; i++)
+        require_int(datarouter_recv(&target, data, sizeof(data), &info) == DATAROUTER_OK && !strcmp(info.source, "Busy"), "source identity survives drain");
+    datarouter_registry_cleanup_releasing(shm);
+    require_int(atomic_load(&shm->control.registry[1].state) == DATAROUTER_PORT_EMPTY, "source reusable after queue drains");
+    /* Self traffic and routed/direct traffic share the same pair's FIFO. */
+    require_int(datarouter_unsafe_send(&target, "Target", "self", 5) == DATAROUTER_OK, "self send");
+    require_int(datarouter_recv(&target, data, sizeof(data), &info) == DATAROUTER_OK && !strcmp(info.source, "Target"), "self receive");
+    require_int(datarouter_unsafe_send(&quiet, "Target", "direct", 7) == DATAROUTER_OK, "direct before routed");
+    write_test_frame(shm, 2, target.route_id, "routed");
+    datarouter_scheduler_mark_tx_ready(shm, 2);
+    datarouter_channel pair = datarouter_rx_channel(shm, 2, 0);
+    atomic_store(pair.writer_owner, (unsigned int)getpid());
+    require_int(datarouter_route_frames(shm) == 0, "routed honors pair ownership");
+    atomic_store(pair.writer_owner, 0);
+    require_int(datarouter_route_frames(shm) == 1, "routed resumes");
+    require_int(datarouter_recv(&target, data, sizeof(data), &info) == DATAROUTER_OK && !strcmp(data, "direct"), "mixed first FIFO");
+    require_int(datarouter_recv(&target, data, sizeof(data), &info) == DATAROUTER_OK && !strcmp(data, "routed"), "mixed second FIFO");
+    free(shm);
+}
+
+static int nested_receive_callback(const datarouter_message_info *info, const void *data,
+                                   size_t len, void *opaque) {
+    datarouter_port *port = opaque;
+    require_int(info->len == 6 && len == 6 && !memcmp(data, "outer", 6), "outer drain bytes");
+    require_int(atomic_load(&port->shm->control.tx_ready_mask) & 2ULL, "blocked producer woken before callback");
+    char buffer[16]; datarouter_message_info nested;
+    require_int(datarouter_recv(port, buffer, sizeof(buffer), &nested) == DATAROUTER_OK &&
+                !strcmp(buffer, "inner"), "callback can receive without RX lock deadlock");
+    require_int(!memcmp(data, "outer", 6), "callback owns stable drain buffer");
+    return DATAROUTER_OK;
+}
+
+static void test_drain_callback_reentry(void) {
+    size_t size = datarouter_shared_memory_size(2);
+    datarouter_shared_memory *shm = calloc(1, size);
+    require_int(shm && datarouter_init_shared_memory(shm, 2) == DATAROUTER_OK, "callback fixture");
+    activate_test_entry(shm, 0, "Target"); activate_test_entry(shm, 1, "Source");
+    datarouter_port source, target;
+    init_test_port(&source, shm, 1, "Source"); init_test_port(&target, shm, 0, "Target");
+    require_int(datarouter_unsafe_send(&source, "Target", "outer", 6) == DATAROUTER_OK, "outer frame");
+    require_int(datarouter_unsafe_send(&source, "Target", "inner", 6) == DATAROUTER_OK, "inner frame");
+    datarouter_scheduler_mark_tx_blocked(shm, 1);
+    size_t drained;
+    require_int(datarouter_drain(&target, 1000, 1, nested_receive_callback, &target, &drained) == DATAROUTER_OK && drained == 1,
+                "reentrant callback completes");
+    free(shm);
+}
+
+static void test_stopped_and_dead_pair_writer(void) {
+    size_t size = datarouter_shared_memory_size(2);
+    datarouter_shared_memory *shm = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    require_int(shm != MAP_FAILED && datarouter_init_shared_memory(shm, 2) == DATAROUTER_OK, "writer fixture");
+    activate_test_entry(shm, 0, "Target");
+    datarouter_channel pair = datarouter_rx_channel(shm, 1, 0);
+    pid_t writer = fork(); require_int(writer >= 0, "fork pair writer");
+    if (!writer) {
+        atomic_store(pair.writer_owner, (unsigned int)getpid());
+        raise(SIGSTOP);
+        _exit(1);
+    }
+    int status;
+    require_int(waitpid(writer, &status, WUNTRACED) == writer && WIFSTOPPED(status), "writer actually stopped");
+    require_int(!datarouter_registry_release_slot(shm, 0), "stopped writer blocks reuse");
+    require_int(atomic_load(pair.writer_owner) == (unsigned int)writer, "stopped writer ownership retained");
+    require_int(kill(writer, SIGKILL) == 0 && waitpid(writer, &status, 0) == writer, "writer death confirmed");
+    datarouter_registry_cleanup_releasing(shm);
+    require_int(atomic_load(&shm->control.registry[0].state) == DATAROUTER_PORT_EMPTY &&
+                atomic_load(pair.writer_owner) == 0, "dead writer recovered before reuse");
+    munmap(shm, size);
+}
+
 int main(void) {
+    test_drain_callback_reentry();
+    test_stopped_and_dead_pair_writer();
+    test_pair_fairness_and_short_retry();
     test_route_and_allowlist();
 #ifndef _WIN32
     test_concurrent_send_from_shared_port();
+    test_poll_probe_concurrent_with_recv();
+    test_poll_probe_on_skewed_frame_never_reports_corruption();
 #endif
     test_wait_timeout();
     test_active_service_not_replaced_before_ttl();
@@ -1627,6 +1958,7 @@ int main(void) {
     test_config_is_startup_only();
     test_duplicate_switch_is_rejected_and_exit_unlinks();
     test_stale_switch_mapping_is_rebuilt();
+    test_sleeping_wait_releases_pin_and_rejects_restarted_switch();
     test_dead_unpublished_registration_claim_is_recovered();
     test_alive_unpublished_claim_does_not_block_other_mailboxes();
     test_registration_timeout_releases_own_request();

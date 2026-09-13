@@ -33,7 +33,7 @@ static void encode_frame_header(
 }
 
 static int decode_route_header(
-    datarouter_channel *tx,
+    datarouter_channel tx,
     uint32_t *route_id,
     uint32_t *payload_len
 ) {
@@ -70,7 +70,7 @@ static int decode_route_header(
 }
 
 static int tx_has_complete_frame(datarouter_shared_memory *shm, uint32_t source_slot) {
-    datarouter_channel *tx = datarouter_tx_channel(shm, source_slot);
+    datarouter_channel tx = datarouter_tx_channel(shm, source_slot);
     uint32_t route_id = 0U;
     uint32_t payload_len = 0U;
     return decode_route_header(tx, &route_id, &payload_len) == DATAROUTER_OK;
@@ -82,13 +82,13 @@ static void isolate_corrupt_slot(datarouter_shared_memory *shm, uint32_t slot_in
     }
     atomic_fetch_add_explicit(&shm->control.corrupted_rings, 1ULL, memory_order_relaxed);
     datarouter_registry_release_slot(shm, slot_index);
-    datarouter_signal_post(&shm->control.rx_signal[slot_index]);
+    datarouter_signal_post_if_waiting(&shm->control.rx_signal[slot_index]);
 }
 
 static int route_locked(datarouter_shared_memory *shm, uint32_t source_slot,
                         uint32_t target_slot, datarouter_registry_entry *source,
                         datarouter_registry_metadata source_metadata,
-                        datarouter_channel *tx, datarouter_channel *rx,
+                        datarouter_channel tx, datarouter_channel rx,
                         uint32_t payload_len, int *frame_consumed) {
     size_t frame_len = DATAROUTER_FRAME_HEADER_SIZE + (size_t)payload_len;
     int rc;
@@ -127,19 +127,7 @@ static int route_locked(datarouter_shared_memory *shm, uint32_t source_slot,
 
     uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
     encode_frame_header(header, source_metadata.route_id, payload_len);
-    /* Account for the frame before publishing the RX head. The receiver may
-     * consume immediately after that release store, so publishing first would
-     * allow its decrement to race ahead of this increment and strand the
-     * source slot forever. */
-    datarouter_registry_track_inflight(shm, source_slot, target_slot);
     rc = datarouter_ring_transfer_frame(tx, rx, header, sizeof(header), frame_len);
-    if (rc != DATAROUTER_OK) {
-        datarouter_registry_complete_inflight(
-            shm,
-            source_metadata.route_id,
-            target_slot
-        );
-    }
     if (rc == DATAROUTER_ERR_PROTOCOL) {
         isolate_corrupt_slot(shm, source_slot);
         return rc;
@@ -155,7 +143,7 @@ static int route_locked(datarouter_shared_memory *shm, uint32_t source_slot,
     if (frame_consumed) {
         *frame_consumed = 1;
     }
-    datarouter_signal_post(&shm->control.rx_signal[target_slot]);
+    datarouter_signal_post_if_waiting(&shm->control.rx_signal[target_slot]);
     datarouter_touch_entry(source, datarouter_now_ns());
     datarouter_scheduler_clear_tx_blocked(shm, source_slot);
     return DATAROUTER_OK;
@@ -177,8 +165,8 @@ static int route_one_frame(
     if (!datarouter_registry_read_routable(source, &source_metadata)) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
-    datarouter_channel *tx = datarouter_tx_channel(shm, source_slot);
-    if (!tx) {
+    datarouter_channel tx = datarouter_tx_channel(shm, source_slot);
+    if (!tx.header) {
         return DATAROUTER_ERR_INTERNAL;
     }
 
@@ -207,19 +195,19 @@ static int route_one_frame(
         return rc == DATAROUTER_OK ? DATAROUTER_ERR_NOT_FOUND : rc;
     }
     uint32_t target_slot = target->slot_index;
-    datarouter_channel *rx = datarouter_rx_channel(shm, target_slot);
-    if (!rx) {
+    datarouter_channel rx = datarouter_rx_channel(shm, source_slot, target_slot);
+    if (!rx.header) {
         return DATAROUTER_ERR_INTERNAL;
     }
     unsigned int owner = 0;
-    if (!atomic_compare_exchange_strong_explicit(&target->rx_writer_owner, &owner,
+    if (!atomic_compare_exchange_strong_explicit(rx.writer_owner, &owner,
             (unsigned int)shm->control.switch_pid, memory_order_seq_cst, memory_order_relaxed)) {
         datarouter_scheduler_mark_tx_ready(shm, source_slot);
         return DATAROUTER_ERR_AGAIN;
     }
     rc = route_locked(shm, source_slot, target_slot, source, source_metadata, tx, rx,
                       payload_len, frame_consumed);
-    atomic_store_explicit(&target->rx_writer_owner, 0U, memory_order_seq_cst);
+    atomic_store_explicit(rx.writer_owner, 0U, memory_order_seq_cst);
     return rc;
 }
 

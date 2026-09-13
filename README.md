@@ -494,18 +494,16 @@ payload 字节不透明。JSON envelope 数组会原样透传，router 不解析
 
 ## 内存布局
 
-`datarouter-switch` 创建一个 shared-memory object。对象由控制面和每个活跃 port slot 的一组 RX/TX channel 组成，每个 channel 连续 `512KiB`：
+`datarouter-switch` 创建 shared-memory layout 18：控制面、连续的队列控制头、
+按 4KiB 页对齐的 payload 分区及 KEEP。每个来源保留一个 512KiB TX；每个
+“来源→目标”（含自收发）各有一个 512KiB RX。共 `N + N²` 个队列；默认四端口
+20 个队列约 10MiB，64 端口约 2.03GiB，另加元数据与 KEEP（最多 8MiB）。
+Switch 初始化只触碰控制结构和 KEEP，payload 页由实际写者首次触碰。
 
-```text
-control plane
-slot0 RX 512KiB
-slot0 TX 512KiB
-slot1 RX 512KiB
-slot1 TX 512KiB
-...
-```
-
-显式 `--allow-any` 模式创建默认 4 个活跃 port slot。配置或 `--allow` 模式下，allowlist 同时决定允许注册的服务名和活跃 port 数量。每个 port 拥有一组 RX/TX；默认 4 slots 的 data plane 约 `4MiB`，6 slots 约 `6MiB`，64 slots 上限约 `64MiB`。
+Direct 和 routed 写入同一通信对 RX，使用该队列的可恢复写入 ownership。
+接收端逐帧轮询来源，保留队列内 FIFO；poll、frame_len 和 recv 共享选择状态，
+短缓冲不消费或跳过所选帧。来源在 TX 与出站 RX 排空且引用释放前不能复用；
+不再逐帧更新全局 inflight 矩阵。注册快照的 channel_id 表示来源 0 对该目标的 RX 索引。
 
 控制面保存活跃 port 数、channel 数、offset 和总映射大小。客户端按控制面映射 switch 拥有的对象，不假设编译期固定 data plane 大小。
 
@@ -616,16 +614,39 @@ Port 库是应用面对的 ABI。它打开 switch-owned shared memory，调用 `
 
 ### 布局升级
 
-当前开发候选使用 shared-memory **layout 17 / KEEP layout 3**。frontend ABI v2/v3
+当前开发候选使用 shared-memory **layout 18 / KEEP layout 3**。frontend ABI v2/v3
 与应用使用的 Rust 接口保留；Ring 数据容量与 8 字节线帧头不变。
-`rx_writer_owner` 保存独占 RX 写入者 PID，生命周期中不随槽位清理而重置，direct 与 switch 路由共用该保护。
+每个通信对队列的 `writer_owner` 保存独占 RX 写入者 PID；它不随槽位清理重置，direct 与 switch 路由共用该保护。
 竞争返回可重试的 `AGAIN`；活的暂停进程不会被强制夺锁。
 
 升级时先停止所属 switch 与所有消费者，删除**该实例所属**旧共享内存，统一重编译并
 替换 switch、Rust/C 库及各绑定，再启动。旧 layout 明确拒绝连接；不要全局清空 `/dev/shm`。
 本候选尚未解除性能合入门禁，完整状态见 [安全审查记录](docs/security-audit-2026-09.md)。
 
-### KEEP 区域（layout 17）
+### 专用核与等待模式
+
+Linux 的 `DATAROUTER_WAIT_MODE=auto|spin|hybrid` 默认 auto；`DATAROUTER_CPUS=0-3,8`
+可限制候选 CPU。自动选择只使用允许亲和性中的硬件线程，每个物理核最多一条，
+优先同 NUMA/末级缓存，预留两个物理核；同时为每层有限 cgroup v2 CPU 配额保留
+两个 CPU 当量。资源不足时 auto 记录原因并回退 hybrid，spin 返回平台错误。
+显式 spin + CPU 集合是由调用方分配的专用池，两个物理核的预留由分配方在池外完成；
+配额约束仍有效。Windows 当前保留 hybrid；显式 spin 返回平台错误。
+
+C 通过 Linux abstract socket 管理同一网络命名空间内跨实例的物理核/配额租约，
+线程退出和进程死亡由描述符关闭回收；fork 子进程恢复原亲和性并关闭继承的租约。
+调用方可用 `datarouter_thread_detach(void)` 提前归还并恢复亲和性。
+Go 收发调用锁定 OS 线程，在交回 Go 运行时前解绑；其他公共函数签名保留。
+
+持有租约的 Switch 和等待 API 持续 pause 轮询，同时检查超时、撤销、心跳和维护
+期限；API 返回后不制造额外空转。hybrid 保留有界自旋与睡眠。
+TX/RX 临界区采用先读后 CAS 的自旋锁；空队列重试不持锁，drain 回调在解锁后
+使用调用独占缓冲。调用期间不能销毁同一 port。
+
+数据发布使用“发布→全屏障→检查睡眠者”；睡眠使用“登记→全屏障→复查队列→等待”。
+spin 不登记睡眠者，没有睡眠者时不更新数据通知序号。C11 屏障测试见
+`tests/test_signal.c`；顺序依据参照 [Linux 内存模型说明](https://docs.kernel.org/dev-tools/lkmm/docs/recipes.html)。
+
+### KEEP 区域（layout 18）
 
 KEEP 是由 Switch 维持的 ≤8 MiB 字节缓存，命中不经 Ring。`src/keep.c` 管理
 8 字节对齐条目、环形物理游标、显式尾部填充标记、墓碑哈希及独占读写引用。
@@ -652,7 +673,7 @@ cgeos-cli datarouter verify --profile security --datarouter /path/to/datarouter 
 ### ABI 兼容性测试（缺省翻转后全链路验证）
 
 历史上的缺省翻转（`unsafe` 缺省开启）本身没有改变当时的 layout 12 / frontend ABI v2；
-当前安全候选已升级到上述 layout 17，直接数据面只是额外导出符号（`datarouter_unsafe_send` 等）。ABI
+当前开发候选已升级到上述 layout 18，直接数据面只是额外导出符号（`datarouter_unsafe_send` 等）。ABI
 表面由三层测试钉扎，任何 layout/struct 变更必须同步更新：
 
 - `tests/abi_compat.rs`：锁定 layout 12 常量（`CHANNEL_SIZE`=2^19、`RING_CAPACITY`=2^19

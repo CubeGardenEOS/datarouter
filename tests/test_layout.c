@@ -11,6 +11,43 @@ static void require_int(int ok, const char *message) {
     }
 }
 
+#if DATAROUTER_LAYOUT_VERSION >= 18U
+static void test_layout(uint32_t ports) {
+    size_t size = datarouter_shared_memory_size(ports);
+    datarouter_shared_memory *shm = calloc(1, size);
+    require_int(shm != NULL, "allocate shared memory");
+    /* Initialization must not first-touch payload pages. Sentinel at first
+     * and last payload byte survives initialization. */
+    uint8_t *bytes = (uint8_t *)shm;
+    bytes[DATAROUTER_DATA_OFFSET(ports)] = 0xa5;
+    bytes[size - 1] = 0x5a;
+    require_int(datarouter_init_shared_memory(shm, ports) == DATAROUTER_OK, "init layout");
+    require_int(bytes[DATAROUTER_DATA_OFFSET(ports)] == 0xa5 && bytes[size-1] == 0x5a, "payload not cleared");
+    require_int(datarouter_validate_shared_memory(shm, size) == DATAROUTER_OK, "valid mapping");
+    require_int(datarouter_validate_shared_memory(shm, size-1) == DATAROUTER_ERR_PROTOCOL, "short mapping");
+    require_int(shm->control.channel_count == ports + ports*ports, "N + N squared queues");
+    require_int(shm->control.data_offset % 4096 == 0, "page aligned payload base");
+    for (uint32_t source = 0; source < ports; source++) {
+        datarouter_channel tx = datarouter_tx_channel(shm, source);
+        require_int(tx.data == bytes + shm->control.data_offset + (size_t)source * DATAROUTER_RING_CAPACITY, "TX index");
+        for (uint32_t target = 0; target < ports; target++) {
+            datarouter_channel rx = datarouter_rx_channel(shm, source, target);
+            size_t index = ports + (size_t)source * ports + target;
+            require_int(rx.data == bytes + shm->control.data_offset + index * DATAROUTER_RING_CAPACITY, "pair index");
+            require_int((size_t)(rx.data-bytes) % 4096 == 0, "payload page aligned");
+            require_int((size_t)((uint8_t *)rx.header-bytes) % 64 == 0, "header cache aligned");
+            require_int(datarouter_ring_used(rx) == 0, "empty queue");
+        }
+    }
+    require_int(!datarouter_rx_channel(shm, ports, 0).header, "source overflow");
+    require_int(!datarouter_rx_channel(shm, 0, ports).header, "target overflow");
+    require_int(!datarouter_rx_channel(shm, UINT32_MAX, UINT32_MAX).header, "index overflow");
+    require_int(!datarouter_tx_channel(shm, ports).header, "TX overflow");
+    shm->control.layout_version = 17;
+    require_int(datarouter_validate_shared_memory(shm, size) == DATAROUTER_ERR_PROTOCOL, "old layout rejected");
+    free(shm);
+}
+#else
 static void test_layout(uint32_t ports) {
     size_t size = datarouter_shared_memory_size(ports);
     datarouter_shared_memory *shm = (datarouter_shared_memory *)calloc(1U, size);
@@ -58,10 +95,19 @@ static void test_layout(uint32_t ports) {
     free(shm);
 }
 
+#endif
+
 int main(void) {
     require_int(DATAROUTER_DEFAULT_MAX_PORTS == 4, "legacy default remains four ports");
     require_int(DATAROUTER_CHANNEL_SIZE == 524288U, "default channel size is 512KiB");
     require_int(DATAROUTER_FRAME_HEADER_SIZE == 8U, "frame header carries u32 route and length");
+#if DATAROUTER_LAYOUT_VERSION >= 18U
+    require_int(datarouter_shared_memory_size(4) > 10U*1024U*1024U &&
+        datarouter_shared_memory_size(4) < 11U*1024U*1024U, "four ports approximately 10MiB");
+    require_int(datarouter_shared_memory_size(64) > (size_t)2U*1024U*1024U*1024U &&
+        datarouter_shared_memory_size(64) < (size_t)2100U*1024U*1024U, "64 ports approximately 2.03GiB");
+    require_int(datarouter_shared_memory_size(0) == 0 && datarouter_shared_memory_size(65) == 0, "capacity bounds");
+#else
     require_int(
         datarouter_shared_memory_size(4U) >= 4U * 1024U * 1024U &&
             datarouter_shared_memory_size(4U) < 5U * 1024U * 1024U,
@@ -77,6 +123,7 @@ int main(void) {
             datarouter_shared_memory_size(64U) < 65U * 1024U * 1024U,
         "maximum layout is approximately 64MiB"
     );
+#endif
     uint32_t high_generation_route = datarouter_route_for_slot_generation(
         63U,
         DATAROUTER_ROUTE_GENERATION_MASK

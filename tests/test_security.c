@@ -34,10 +34,12 @@ static void *write_after_pause(void *arg) {
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <signal.h>
-#if DATAROUTER_LAYOUT_VERSION >= 14
-#define WRITER_GATE rx_writer_owner
+#if DATAROUTER_LAYOUT_VERSION >= 18
+#define WRITER_GATE_PTR(e) (datarouter_rx_channel(shm, 0, (e)->slot_index).writer_owner)
+#elif DATAROUTER_LAYOUT_VERSION >= 14
+#define WRITER_GATE_PTR(e) (&(e)->rx_writer_owner)
 #else
-#define WRITER_GATE direct_writers
+#define WRITER_GATE_PTR(e) (&(e)->direct_writers)
 #endif
 
 static void keep_boundaries(void) {
@@ -185,17 +187,17 @@ static void keep_operations(const char *scenario) {
         assert(!atomic_compare_exchange_strong(&e->io_users, &stale, stale + 1));
         assert(datarouter_registry_empty_slot_ready(e));
     } else if (!strcmp(scenario, "writer_lifetime")) {
-        atomic_store(&e->WRITER_GATE, (unsigned int)getpid());
+        atomic_store(WRITER_GATE_PTR(e), (unsigned int)getpid());
         assert(datarouter_registry_release_slot(shm, 0) == 0);
-        assert(atomic_load(&e->WRITER_GATE) == (unsigned int)getpid());
-        atomic_store(&e->WRITER_GATE, 0);
+        assert(atomic_load(WRITER_GATE_PTR(e)) == (unsigned int)getpid());
+        atomic_store(WRITER_GATE_PTR(e), 0);
         datarouter_registry_cleanup_releasing(shm);
         assert(atomic_load(&e->state) == DATAROUTER_PORT_EMPTY);
         /* Clearing metadata must never reset the separate lifetime gate. */
-        atomic_store(&e->WRITER_GATE, (unsigned int)getpid());
+        atomic_store(WRITER_GATE_PTR(e), (unsigned int)getpid());
         datarouter_registry_clear_entry(e, 0);
-        assert(atomic_load(&e->WRITER_GATE) == (unsigned int)getpid());
-        atomic_store(&e->WRITER_GATE, 0);
+        assert(atomic_load(WRITER_GATE_PTR(e)) == (unsigned int)getpid());
+        atomic_store(WRITER_GATE_PTR(e), 0);
     } else if (!strcmp(scenario, "generation")) {
         atomic_store(&e->route_id, 128);
         assert(datarouter_keep_put(&p, "k", 1, "v", 1, 0) == DATAROUTER_ERR_PERMISSION);

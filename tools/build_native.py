@@ -41,7 +41,7 @@ def build(root, target):
                   native_commands=commands.read_text() if commands.is_file() else None,
                   shared_link_argv=link_argv,
                   build_inputs={name:sha(root/name) for name in ('build.rs','Cargo.toml','Cargo.lock')},
-                  environment={k: os.environ.get(k) for k in ('CC', 'CFLAGS', 'RUSTFLAGS', 'DATAROUTER_CHANNEL_SIZE')},
+                  environment={k: os.environ.get(k) for k in ('CC', 'CFLAGS', 'RUSTFLAGS', 'DATAROUTER_CHANNEL_SIZE', 'DATAROUTER_WAIT_DIAGNOSTICS')},
                   sources={str(p.relative_to(root)): sha(p) for d in ('src', 'include')
                            for p in (root/d).rglob('*') if p.is_file()},
                   binaries={p.name: sha(p) for p in (switch, archive, out/'libblinkcms_datarouter.so')})

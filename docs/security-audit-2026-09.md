@@ -99,11 +99,18 @@ C 检查、三个消费者编译、Cargo 包重建与 MSVC C 编译链接再次�
 
 ## Windows Rust 编译增量
 
-`build/windows-rust-portable/results.json` 的 MSVC 原生 C 编译、switch 链接及 Windows
-`cargo check --lib --offline --locked` 均通过。WSL UNC 文件系统不支持 Rust 增量锁，
-因此检查显式设置 `CARGO_INCREMENTAL=0`。随后发现并修复 `Materialized.memfd` 引用
-Unix 专用 `std::os::fd` 的编译错误，改用等价的 `libc::c_int`。
-失败日志保存在 `windows-rust-logged.log`，成功日志在 `windows-rust-portable.log`。
+历史 `build/windows-rust-portable/results.json` 的 MSVC 原生 C 编译、switch
+链接及 Windows `cargo check --lib --offline --locked` 均通过；WSL UNC target
+上的失败记录保留，不将其解释为源码错误。
+
+本次 `security-simplified-20260911-configured` 的原始 Windows Cargo target
+在 WSL UNC 路径上出现 `LINK : fatal error LNK1104`，失败日志保存在
+`results/security-simplified-20260911-configured/runtime/windows-compile.log`。
+`tools/windows_check.py` 现检查可写的 Windows 本地缓存
+`%LOCALAPPDATA%\CGEOS\datarouter\target-<repo>-<commit12>`；
+manifest/source 仍从 WSL 路径读取，MSVC 与 WSLInterop 入口不变。
+`results/security-simplified-20260911-configured-final/runtime/windows/results.json`
+记录同一提交使用 Windows 本地 target 后 C/Rust 编译通过（exit=0）。
 未运行 Windows 服务或运行测试；编译通过不代表 Windows 运行门禁通过。
 
 ## UDS 故障复验
@@ -196,3 +203,15 @@ A 组仍波动 -8.76%，整个实验标为失败，不解除最终门禁。仅 s
 协议随机输入、Rust 与三个实际消费者编译、Windows 编译及源码包重建。
 C 清理 58 组进程、运行清理 9 组进程/28 项共享内存，remaining 均为 0。
 此结果不覆盖所有进程崩溃交错，也不替代 KEEP 性能和最终八语言性能门禁。
+
+## 简化源最终安全复验（2026-09-11）
+
+`datarouter-benchmark/results/security-simplified-20260911-configured-final/results.json`
+的候选安全检查 **36/36** 通过，`status=passed`；C/runtime 清理均为
+`remaining=0`。该结果使用 `SANITIZER_LIB_DIR` 指向
+`~/.cache/gcc-sanitizers/root/usr/lib64`，Python 使用已验证的
+`~/.cache/datarouter-packaging-venv/bin/python`，Windows 使用已配置的
+WSLInterop 与 MSVC。
+
+安全检查通过不解除其他门禁：PHP 完整专项仍有两项 native p99 失败，稳态全矩阵
+仍失败。相关原始目录与历史/无效尝试均保留，未覆盖或删除。

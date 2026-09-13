@@ -18,28 +18,31 @@ typedef int pid_t;
 #else
 #include <sys/types.h>
 #endif
-typedef CRITICAL_SECTION datarouter_mutex;
+
 #else
 #include <pthread.h>
 #include <sys/types.h>
-typedef pthread_mutex_t datarouter_mutex;
+
 #endif
+
+typedef struct { atomic_uint state; unsigned char padding[60]; } datarouter_mutex;
 
 typedef struct {
     _Alignas(8) atomic_uint sequence;
+    unsigned char publisher_padding[60];
     atomic_uint consumed;
     atomic_uint waiters;
-    unsigned char reserved[20];
+    unsigned char sleeper_padding[56];
 } datarouter_signal;
 _Static_assert(sizeof(atomic_uint) == 4, "futex word must be 32 bits");
-_Static_assert(sizeof(datarouter_signal) == 32, "stable signal storage");
+_Static_assert(sizeof(datarouter_signal) == 128, "stable signal storage");
 
 #ifndef CGEOS_GIT_COMMIT
 #define CGEOS_GIT_COMMIT "unknown"
 #endif
 #define DATAROUTER_VERSION CGEOS_GIT_COMMIT
 #define DATAROUTER_MAGIC 0x534D4342U
-#define DATAROUTER_LAYOUT_VERSION 17U
+#define DATAROUTER_LAYOUT_VERSION 18U
 #define DATAROUTER_IO_CLOSED 0x80000000ULL
 #define DATAROUTER_IO_REF_MASK 0x7fffffffULL
 #define DATAROUTER_KEEP_MAGIC 0x4B454550u /* "KEEP" */
@@ -59,15 +62,16 @@ _Static_assert(sizeof(datarouter_signal) == 32, "stable signal storage");
 #define DATAROUTER_ROUTE_SLOT_BITS 6U
 #define DATAROUTER_ROUTE_SLOT_MASK ((1U << DATAROUTER_ROUTE_SLOT_BITS) - 1U)
 #define DATAROUTER_ROUTE_GENERATION_MASK 0x03ffffffU
-#define DATAROUTER_RX_CHANNEL(slot_index) ((uint32_t)((slot_index) * 2U))
-#define DATAROUTER_TX_CHANNEL(slot_index) ((uint32_t)((slot_index) * 2U + 1U))
+#define DATAROUTER_QUEUE_COUNT(n) ((size_t)(n) * ((n) + 1U))
+#define DATAROUTER_TX_CHANNEL(slot_index) ((uint32_t)(slot_index))
+#define DATAROUTER_RX_CHANNEL(n, source, target) ((uint32_t)((n) + (source) * (n) + (target)))
 /* Ring geometry is defined publicly in include/datarouter.h. The assert below
  * (after the ring header typedef) keeps the internal header in lockstep. */
 #define DATAROUTER_CONTROL_LOCK_FREE 0U
 #define DATAROUTER_CONTROL_LOCK_HELD 1U
 #define DATAROUTER_DEFAULT_TTL_MS 30000U
 #define DATAROUTER_SWITCH_IDLE_US 1000U
-#define DATAROUTER_PORT_SPIN_BUDGET_US 50U
+#define DATAROUTER_PORT_SPIN_BUDGET_US 100U
 #define DATAROUTER_PORT_DRAIN_BUDGET_US 200U
 #define DATAROUTER_PORT_DRAIN_MAX_BUDGET_US 1000U
 #define DATAROUTER_SWITCH_ROUTE_BUDGET_US 200U
@@ -80,6 +84,9 @@ _Static_assert(sizeof(datarouter_signal) == 32, "stable signal storage");
 #define DATAROUTER_DIRECT_WRITER_WAIT_NS 500000ULL
 #ifndef DATAROUTER_SWITCH_SPIN_BUDGET_US
 #define DATAROUTER_SWITCH_SPIN_BUDGET_US 200U
+#endif
+#ifndef DATAROUTER_SWITCH_IDLE_WAIT_MS
+#define DATAROUTER_SWITCH_IDLE_WAIT_MS 10U
 #endif
 #ifndef DATAROUTER_SWITCH_WAIT_MS
 #define DATAROUTER_SWITCH_WAIT_MS 1U
@@ -129,7 +136,15 @@ _Static_assert(
 
 typedef struct {
     datarouter_ring_header header;
-    uint8_t data[DATAROUTER_RING_CAPACITY];
+    atomic_uint writer_owner;
+    unsigned char ownership_padding[60];
+} datarouter_queue_control;
+_Static_assert(sizeof(datarouter_queue_control) == 192U, "queue control cache lines");
+/* Local view only. No address or untrusted offset is stored in shared memory. */
+typedef struct {
+    datarouter_ring_header *header;
+    uint8_t *data;
+    atomic_uint *writer_owner;
 } datarouter_channel;
 
 typedef struct {
@@ -140,21 +155,17 @@ typedef struct {
     atomic_int pid;
     atomic_uint uid;
     atomic_ullong process_start_id;
-    /* Owner-thread pin counter (recv/touch/drain from the slot owner). The
-     * switch's finalize_release handshake zeroes it only when the owner is
-     * dead, because a dead owner's threads can never unpin. */
-    atomic_ullong io_users; /* route_id in high 32 bits; closed bit + reference count below */
-    /* Exclusive RX writer PID (0 = free), shared by direct and routed sends.
-     * A live paused writer blocks reuse. PID reuse conservatively delays
-     * reclamation rather than freeing a potentially active writer's ring. */
-    atomic_uint rx_writer_owner; /* Lifetime gate: never reset by clear_entry. */
-    atomic_uint direct_writers;
-    atomic_int direct_writer_pid;
-    atomic_uint direct_writer_uid;
-    atomic_ullong direct_writer_start_id;
-    atomic_ullong last_active_ns;
     atomic_uchar service_name[DATAROUTER_SERVICE_NAME_MAX + 1U];
+    /* Switch-written identity: 64 bytes. Owner threads write references and
+     * heartbeat on distinct cache lines. No over-aligned allocation needed. */
+    atomic_ullong io_users; /* route high 32; closed + references low 32 */
+    unsigned char reference_padding[56];
+    atomic_ullong last_active_ns;
+    unsigned char heartbeat_padding[56];
 } datarouter_registry_entry;
+_Static_assert(sizeof(datarouter_registry_entry) == 192U, "registry writer partitions");
+_Static_assert(offsetof(datarouter_registry_entry, io_users) == 64U, "reference cache line");
+_Static_assert(offsetof(datarouter_registry_entry, last_active_ns) == 128U, "heartbeat cache line");
 
 typedef struct {
     uint32_t magic;
@@ -254,18 +265,21 @@ typedef struct {
     uint32_t keep_size;
     atomic_ullong keep_write_allow_bitmap;
     atomic_uint scheduler_cursor;
-    atomic_uint inflight_frames[DATAROUTER_MAX_PORTS][DATAROUTER_MAX_PORTS];
     datarouter_register_request register_requests[DATAROUTER_REGISTRATION_REQUEST_SLOTS];
+    unsigned char notification_alignment[16];
     datarouter_signal switch_signal;
     datarouter_signal registration_signal;
     datarouter_signal rx_signal[DATAROUTER_MAX_PORTS];
     datarouter_registry_entry registry[DATAROUTER_MAX_PORTS];
     datarouter_slot_descriptor slots[DATAROUTER_MAX_PORTS];
 } datarouter_control_plane;
+_Static_assert(offsetof(datarouter_control_plane, switch_signal) % 64U == 0, "notification alignment");
+_Static_assert(offsetof(datarouter_control_plane, registry) % 64U == 0, "registry alignment");
 
 /* Real mappings are page-aligned. Round the data plane separately instead of
  * over-aligning C structs, so ordinary heap/stack fixtures remain valid C. */
-#define DATAROUTER_DATA_OFFSET ((sizeof(datarouter_control_plane) + 63U) & ~(size_t)63U)
+#define DATAROUTER_QUEUE_OFFSET ((sizeof(datarouter_control_plane) + 63U) & ~(size_t)63U)
+#define DATAROUTER_DATA_OFFSET(n) ((DATAROUTER_QUEUE_OFFSET + DATAROUTER_QUEUE_COUNT(n) * sizeof(datarouter_queue_control) + 4095U) & ~(size_t)4095U)
 
 typedef struct {
     datarouter_control_plane control;
@@ -279,6 +293,7 @@ struct datarouter_port {
     uint32_t slot_index;
     uint32_t route_id;
     char service_name[DATAROUTER_SERVICE_NAME_MAX + 1U];
+    uint32_t rx_cursor; /* selected source, advanced only after consumption */
     uint32_t cached_source_route;
     char cached_source_name[DATAROUTER_SERVICE_NAME_MAX + 1U];
     uint32_t timeout_ms;
@@ -291,11 +306,10 @@ struct datarouter_port {
     datarouter_mutex tx_mutex;
     /* Serializes concurrent ring reads in the direct (unsafe) data plane,
      * where multiple application threads may call datarouter_recv on the
-     * same SPSC RX ring without a reader thread. Process-local. */
+     * same SPSC RX ring without a reader thread. Process-local; it also
+     * protects read-only probes from concurrent consumers. */
     datarouter_mutex rx_mutex;
     atomic_ullong keep_ref_seq; /* outstanding C KEEP reference, zero if absent */
-    uint8_t *drain_buffer;
-    size_t drain_buffer_capacity;
 };
 
 typedef struct {
@@ -321,6 +335,9 @@ uint64_t datarouter_now_ns(void);
 uint64_t datarouter_clock_ticks_to_ns(uint64_t ticks, uint64_t frequency);
 void datarouter_sleep_us(uint32_t usec);
 void datarouter_yield(void);
+void datarouter_cpu_pause(void);
+/* 1 dedicated, 0 hybrid, -1 configuration/allocation failure. */
+int datarouter_thread_attach(void);
 int datarouter_pid_alive(pid_t pid);
 int datarouter_process_identity(pid_t pid, uint32_t *uid, uint64_t *start_id);
 int datarouter_process_identity_matches(pid_t pid, uint32_t uid, uint64_t start_id);
@@ -357,32 +374,32 @@ size_t datarouter_shared_memory_size_with_keep(uint32_t max_ports, uint32_t keep
 const char *datarouter_copy_strategy(void);
 uint32_t datarouter_active_max_ports(const datarouter_shared_memory *shm);
 
-void datarouter_ring_reset(datarouter_channel *channel);
-size_t datarouter_ring_used(const datarouter_channel *channel);
-size_t datarouter_ring_free(const datarouter_channel *channel);
-int datarouter_ring_validate(const datarouter_channel *channel, size_t *used);
-int datarouter_ring_write(datarouter_channel *channel, const uint8_t *data, size_t len);
+void datarouter_ring_reset(datarouter_channel channel);
+size_t datarouter_ring_used(datarouter_channel channel);
+size_t datarouter_ring_free(datarouter_channel channel);
+int datarouter_ring_validate(datarouter_channel channel, size_t *used);
+int datarouter_ring_write(datarouter_channel channel, const uint8_t *data, size_t len);
 int datarouter_ring_write_parts(
-    datarouter_channel *channel,
+    datarouter_channel channel,
     const uint8_t *first,
     size_t first_len,
     const uint8_t *second,
     size_t second_len
 );
-int datarouter_ring_peek(const datarouter_channel *channel, uint8_t *data, size_t len);
-int datarouter_ring_read(datarouter_channel *channel, uint8_t *data, size_t len);
-int datarouter_ring_read_frame(datarouter_channel *channel, uint8_t *data, size_t payload_len);
-int datarouter_ring_skip(datarouter_channel *channel, size_t len);
+int datarouter_ring_peek(datarouter_channel channel, uint8_t *data, size_t len);
+int datarouter_ring_read(datarouter_channel channel, uint8_t *data, size_t len);
+int datarouter_ring_read_frame(datarouter_channel channel, uint8_t *data, size_t payload_len);
+int datarouter_ring_skip(datarouter_channel channel, size_t len);
 int datarouter_ring_transfer_frame(
-    datarouter_channel *source,
-    datarouter_channel *target,
+    datarouter_channel source,
+    datarouter_channel target,
     const uint8_t *header,
     size_t header_len,
     size_t source_frame_len
 );
 
-datarouter_channel *datarouter_rx_channel(datarouter_shared_memory *shm, uint32_t slot_index);
-datarouter_channel *datarouter_tx_channel(datarouter_shared_memory *shm, uint32_t slot_index);
+datarouter_channel datarouter_rx_channel(datarouter_shared_memory *shm, uint32_t source, uint32_t target);
+datarouter_channel datarouter_tx_channel(datarouter_shared_memory *shm, uint32_t slot_index);
 uint32_t datarouter_route_for_slot(uint32_t slot_index);
 uint32_t datarouter_route_for_slot_generation(uint32_t slot_index, uint32_t generation);
 void datarouter_touch_entry(datarouter_registry_entry *entry, uint64_t now_ns);

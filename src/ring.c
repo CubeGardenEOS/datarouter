@@ -133,20 +133,20 @@ static uint32_t ring_masked(uint32_t value) {
     return value & (DATAROUTER_RING_CAPACITY - 1U);
 }
 
-void datarouter_ring_reset(datarouter_channel *channel) {
-    if (!channel) {
+void datarouter_ring_reset(datarouter_channel channel) {
+    if (!channel.header) {
         return;
     }
-    atomic_store_explicit(&channel->header.head, 0U, memory_order_release);
-    atomic_store_explicit(&channel->header.tail, 0U, memory_order_release);
+    atomic_store_explicit(&channel.header->head, 0U, memory_order_release);
+    atomic_store_explicit(&channel.header->tail, 0U, memory_order_release);
 }
 
-size_t datarouter_ring_used(const datarouter_channel *channel) {
+size_t datarouter_ring_used(datarouter_channel channel) {
     size_t used = 0U;
     return datarouter_ring_validate(channel, &used) == DATAROUTER_OK ? used : SIZE_MAX;
 }
 
-size_t datarouter_ring_free(const datarouter_channel *channel) {
+size_t datarouter_ring_free(datarouter_channel channel) {
     size_t used = 0U;
     if (datarouter_ring_validate(channel, &used) != DATAROUTER_OK) {
         return 0U;
@@ -154,12 +154,12 @@ size_t datarouter_ring_free(const datarouter_channel *channel) {
     return DATAROUTER_RING_CAPACITY - used;
 }
 
-int datarouter_ring_validate(const datarouter_channel *channel, size_t *used) {
-    if (!channel) {
+int datarouter_ring_validate(datarouter_channel channel, size_t *used) {
+    if (!channel.header) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
-    uint32_t head = atomic_load_explicit(&channel->header.head, memory_order_acquire);
-    uint32_t tail = atomic_load_explicit(&channel->header.tail, memory_order_acquire);
+    uint32_t head = atomic_load_explicit(&channel.header->head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&channel.header->tail, memory_order_acquire);
     size_t current = (size_t)(uint32_t)(head - tail);
     if (current > DATAROUTER_RING_CAPACITY) {
         return DATAROUTER_ERR_PROTOCOL;
@@ -170,7 +170,7 @@ int datarouter_ring_validate(const datarouter_channel *channel, size_t *used) {
     return DATAROUTER_OK;
 }
 
-static void ring_copy_in(datarouter_channel *channel, uint32_t head, const uint8_t *data, size_t len) {
+static void ring_copy_in(datarouter_channel channel, uint32_t head, const uint8_t *data, size_t len) {
     if (len == 0U) {
         return;
     }
@@ -179,13 +179,13 @@ static void ring_copy_in(datarouter_channel *channel, uint32_t head, const uint8
     if (first > len) {
         first = len;
     }
-    datarouter_copy(&channel->data[pos], data, first);
+    datarouter_copy(&channel.data[pos], data, first);
     if (len > first) {
-        datarouter_copy(channel->data, data + first, len - first);
+        datarouter_copy(channel.data, data + first, len - first);
     }
 }
 
-static void ring_copy_out(const datarouter_channel *channel, uint32_t tail, uint8_t *data, size_t len) {
+static void ring_copy_out(datarouter_channel channel, uint32_t tail, uint8_t *data, size_t len) {
     if (len == 0U) {
         return;
     }
@@ -194,14 +194,14 @@ static void ring_copy_out(const datarouter_channel *channel, uint32_t tail, uint
     if (first > len) {
         first = len;
     }
-    datarouter_copy(data, &channel->data[pos], first);
+    datarouter_copy(data, &channel.data[pos], first);
     if (len > first) {
-        datarouter_copy(data + first, channel->data, len - first);
+        datarouter_copy(data + first, channel.data, len - first);
     }
 }
 
-int datarouter_ring_write(datarouter_channel *channel, const uint8_t *data, size_t len) {
-    if (!channel || (!data && len > 0U)) {
+int datarouter_ring_write(datarouter_channel channel, const uint8_t *data, size_t len) {
+    if (!channel.header || (!data && len > 0U)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     if (len > DATAROUTER_RING_CAPACITY) {
@@ -215,20 +215,20 @@ int datarouter_ring_write(datarouter_channel *channel, const uint8_t *data, size
     if (DATAROUTER_RING_CAPACITY - used < len) {
         return DATAROUTER_ERR_FULL;
     }
-    uint32_t head = atomic_load_explicit(&channel->header.head, memory_order_relaxed);
+    uint32_t head = atomic_load_explicit(&channel.header->head, memory_order_relaxed);
     ring_copy_in(channel, head, data, len);
-    atomic_store_explicit(&channel->header.head, head + (uint32_t)len, memory_order_release);
+    atomic_store_explicit(&channel.header->head, head + (uint32_t)len, memory_order_release);
     return DATAROUTER_OK;
 }
 
 int datarouter_ring_write_parts(
-    datarouter_channel *channel,
+    datarouter_channel channel,
     const uint8_t *first,
     size_t first_len,
     const uint8_t *second,
     size_t second_len
 ) {
-    if (!channel || (!first && first_len > 0U) || (!second && second_len > 0U)) {
+    if (!channel.header || (!first && first_len > 0U) || (!second && second_len > 0U)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     if (first_len > DATAROUTER_RING_CAPACITY ||
@@ -244,15 +244,15 @@ int datarouter_ring_write_parts(
     if (DATAROUTER_RING_CAPACITY - used < total_len) {
         return DATAROUTER_ERR_FULL;
     }
-    uint32_t head = atomic_load_explicit(&channel->header.head, memory_order_relaxed);
+    uint32_t head = atomic_load_explicit(&channel.header->head, memory_order_relaxed);
     ring_copy_in(channel, head, first, first_len);
     ring_copy_in(channel, head + (uint32_t)first_len, second, second_len);
-    atomic_store_explicit(&channel->header.head, head + (uint32_t)total_len, memory_order_release);
+    atomic_store_explicit(&channel.header->head, head + (uint32_t)total_len, memory_order_release);
     return DATAROUTER_OK;
 }
 
-int datarouter_ring_peek(const datarouter_channel *channel, uint8_t *data, size_t len) {
-    if (!channel || (!data && len > 0U)) {
+int datarouter_ring_peek(datarouter_channel channel, uint8_t *data, size_t len) {
+    if (!channel.header || (!data && len > 0U)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     if (len > DATAROUTER_RING_CAPACITY) {
@@ -266,13 +266,13 @@ int datarouter_ring_peek(const datarouter_channel *channel, uint8_t *data, size_
     if (used < len) {
         return DATAROUTER_ERR_AGAIN;
     }
-    uint32_t tail = atomic_load_explicit(&channel->header.tail, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&channel.header->tail, memory_order_relaxed);
     ring_copy_out(channel, tail, data, len);
     return DATAROUTER_OK;
 }
 
-int datarouter_ring_read(datarouter_channel *channel, uint8_t *data, size_t len) {
-    if (!channel || (!data && len > 0U)) {
+int datarouter_ring_read(datarouter_channel channel, uint8_t *data, size_t len) {
+    if (!channel.header || (!data && len > 0U)) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     if (len > DATAROUTER_RING_CAPACITY) {
@@ -286,14 +286,14 @@ int datarouter_ring_read(datarouter_channel *channel, uint8_t *data, size_t len)
     if (used < len) {
         return DATAROUTER_ERR_AGAIN;
     }
-    uint32_t tail = atomic_load_explicit(&channel->header.tail, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&channel.header->tail, memory_order_relaxed);
     ring_copy_out(channel, tail, data, len);
-    atomic_store_explicit(&channel->header.tail, tail + (uint32_t)len, memory_order_release);
+    atomic_store_explicit(&channel.header->tail, tail + (uint32_t)len, memory_order_release);
     return DATAROUTER_OK;
 }
 
-int datarouter_ring_skip(datarouter_channel *channel, size_t len) {
-    if (!channel) {
+int datarouter_ring_skip(datarouter_channel channel, size_t len) {
+    if (!channel.header) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
     if (len > DATAROUTER_RING_CAPACITY) {
@@ -307,15 +307,15 @@ int datarouter_ring_skip(datarouter_channel *channel, size_t len) {
     if (used < len) {
         return DATAROUTER_ERR_AGAIN;
     }
-    uint32_t tail = atomic_load_explicit(&channel->header.tail, memory_order_relaxed);
-    atomic_store_explicit(&channel->header.tail, tail + (uint32_t)len, memory_order_release);
+    uint32_t tail = atomic_load_explicit(&channel.header->tail, memory_order_relaxed);
+    atomic_store_explicit(&channel.header->tail, tail + (uint32_t)len, memory_order_release);
     return DATAROUTER_OK;
 }
 
 static void ring_copy_between(
-    const datarouter_channel *source,
+    datarouter_channel source,
     uint32_t source_index,
-    datarouter_channel *target,
+    datarouter_channel target,
     uint32_t target_index,
     size_t len
 ) {
@@ -330,7 +330,7 @@ static void ring_copy_between(
         if (chunk > len) {
             chunk = len;
         }
-        datarouter_copy(&target->data[target_pos], &source->data[source_pos], chunk);
+        datarouter_copy(&target.data[target_pos], &source.data[source_pos], chunk);
         source_index += (uint32_t)chunk;
         target_index += (uint32_t)chunk;
         len -= chunk;
@@ -338,13 +338,13 @@ static void ring_copy_between(
 }
 
 int datarouter_ring_transfer_frame(
-    datarouter_channel *source,
-    datarouter_channel *target,
+    datarouter_channel source,
+    datarouter_channel target,
     const uint8_t *header,
     size_t header_len,
     size_t source_frame_len
 ) {
-    if (!source || !target || (!header && header_len > 0U) || source == target ||
+    if (!source.header || !target.header || (!header && header_len > 0U) || source.header == target.header ||
         header_len != DATAROUTER_FRAME_HEADER_SIZE || header_len > source_frame_len) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
@@ -368,8 +368,8 @@ int datarouter_ring_transfer_frame(
         return DATAROUTER_ERR_FULL;
     }
 
-    uint32_t source_tail = atomic_load_explicit(&source->header.tail, memory_order_relaxed);
-    uint32_t target_head = atomic_load_explicit(&target->header.head, memory_order_relaxed);
+    uint32_t source_tail = atomic_load_explicit(&source.header->tail, memory_order_relaxed);
+    uint32_t target_head = atomic_load_explicit(&target.header->head, memory_order_relaxed);
     ring_copy_in(target, target_head, header, header_len);
     size_t payload_len = source_frame_len - header_len;
     ring_copy_between(
@@ -380,12 +380,12 @@ int datarouter_ring_transfer_frame(
         payload_len
     );
     atomic_store_explicit(
-        &target->header.head,
+        &target.header->head,
         target_head + (uint32_t)source_frame_len,
         memory_order_release
     );
     atomic_store_explicit(
-        &source->header.tail,
+        &source.header->tail,
         source_tail + (uint32_t)source_frame_len,
         memory_order_release
     );
@@ -393,8 +393,8 @@ int datarouter_ring_transfer_frame(
 }
 
 /* Copy the body before releasing any byte of its frame to the producer. */
-int datarouter_ring_read_frame(datarouter_channel *channel, uint8_t *data, size_t payload_len) {
-    if (!channel || (!data && payload_len)) return DATAROUTER_ERR_INVALID_ARGUMENT;
+int datarouter_ring_read_frame(datarouter_channel channel, uint8_t *data, size_t payload_len) {
+    if (!channel.header || (!data && payload_len)) return DATAROUTER_ERR_INVALID_ARGUMENT;
     if (payload_len > DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)
         return DATAROUTER_ERR_PAYLOAD_TOO_LARGE;
     size_t used = 0;
@@ -402,8 +402,8 @@ int datarouter_ring_read_frame(datarouter_channel *channel, uint8_t *data, size_
     if (rc != DATAROUTER_OK) return rc;
     size_t total = DATAROUTER_FRAME_HEADER_SIZE + payload_len;
     if (used < total) return DATAROUTER_ERR_AGAIN;
-    uint32_t tail = atomic_load_explicit(&channel->header.tail, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&channel.header->tail, memory_order_relaxed);
     ring_copy_out(channel, tail + DATAROUTER_FRAME_HEADER_SIZE, data, payload_len);
-    atomic_store_explicit(&channel->header.tail, tail + (uint32_t)total, memory_order_release);
+    atomic_store_explicit(&channel.header->tail, tail + (uint32_t)total, memory_order_release);
     return DATAROUTER_OK;
 }

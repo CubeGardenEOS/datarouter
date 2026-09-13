@@ -100,9 +100,9 @@ static void dump_state(uint32_t iteration, const char *message) {
     fprintf(
         stderr,
         "  A rx_used=%zu tx_used=%zu B rx_used=%zu tx_used=%zu\n",
-        datarouter_ring_used(datarouter_rx_channel(shm, g_a->slot_index)),
+        datarouter_ring_used(datarouter_rx_channel(shm, g_b->slot_index, g_a->slot_index)),
         datarouter_ring_used(datarouter_tx_channel(shm, g_a->slot_index)),
-        datarouter_ring_used(datarouter_rx_channel(shm, g_b->slot_index)),
+        datarouter_ring_used(datarouter_rx_channel(shm, g_a->slot_index, g_b->slot_index)),
         datarouter_ring_used(datarouter_tx_channel(shm, g_b->slot_index))
     );
 }

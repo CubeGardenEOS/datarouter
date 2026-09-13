@@ -57,7 +57,7 @@ pub const DATAROUTER_ERR_INTERNAL: c_int = 11;
 
 pub const DATAROUTER_MAX_PORTS: usize = 64;
 pub const DATAROUTER_DEFAULT_MAX_PORTS: usize = 4;
-pub const DATAROUTER_CHANNEL_COUNT: usize = DATAROUTER_DEFAULT_MAX_PORTS * 2;
+pub const DATAROUTER_CHANNEL_COUNT: usize = DATAROUTER_DEFAULT_MAX_PORTS * (DATAROUTER_DEFAULT_MAX_PORTS + 1);
 include!(concat!(env!("OUT_DIR"), "/generated_constants.rs"));
 /// 8-byte ring header (two `atomic_uint`).
 pub const DATAROUTER_RING_HEADER_SIZE: usize = 128;

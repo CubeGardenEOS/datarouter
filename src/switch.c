@@ -1,3 +1,4 @@
+#include "wait_policy.h"
 #include "config.h"
 #include "datarouter_registry.h"
 #include "datarouter_router.h"
@@ -24,6 +25,13 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#if defined(DATAROUTER_WAIT_DIAGNOSTICS) && !defined(_WIN32)
+extern void datarouter_diagnostic_switch(datarouter_signal *, uint32_t);
+#define DR_SWITCH_EVENT(kind) datarouter_diagnostic_switch(&mapping.shm->control.switch_signal, kind)
+#else
+#define DR_SWITCH_EVENT(kind) ((void)0)
 #endif
 
 #define DATAROUTER_CREATE_RETRIES 4U
@@ -612,6 +620,23 @@ static void recover_control_requests(datarouter_shared_memory *shm) {
     }
 }
 
+/* Inspect only atomic state: request payload belongs to the claimant until
+ * publication. Unnotified crashes are found by the bounded fallback scan. */
+static int maintenance_pending(datarouter_shared_memory *shm) {
+    for (uint32_t i = 0U; i < DATAROUTER_REGISTRATION_REQUEST_SLOTS; ++i) {
+        datarouter_register_request *req = &shm->control.register_requests[i];
+        if (atomic_load_explicit(&req->state, memory_order_acquire) != DATAROUTER_REG_EMPTY ||
+            atomic_load_explicit(&req->claim_token, memory_order_acquire) != 0ULL)
+            return 1;
+    }
+    for (uint32_t i = 0U; i < datarouter_active_max_ports(shm); ++i) {
+        unsigned int state = atomic_load_explicit(&shm->control.registry[i].state, memory_order_acquire);
+        if (state == DATAROUTER_PORT_RELEASING || state == DATAROUTER_PORT_DRAINING)
+            return 1;
+    }
+    return 0;
+}
+
 static int request_identity_allowed(
     const datarouter_shared_memory *shm,
     const datarouter_register_request *req
@@ -673,7 +698,7 @@ static void activate_slot(
     uint32_t slot_index
 ) {
     datarouter_registry_entry *entry = &shm->control.registry[slot_index];
-    datarouter_ring_reset(datarouter_rx_channel(shm, slot_index));
+    /* EMPTY is published only after incident queues and references drain. */
     datarouter_ring_reset(datarouter_tx_channel(shm, slot_index));
     uint32_t generation = (entry->generation + 1U) & DATAROUTER_ROUTE_GENERATION_MASK;
     if (generation == 0U) {
@@ -937,7 +962,7 @@ static void process_corrupt_slots(datarouter_shared_memory *shm, const switch_op
         atomic_fetch_add_explicit(&shm->control.corrupted_rings, 1ULL, memory_order_relaxed);
         atomic_fetch_add_explicit(&shm->control.registration_recoveries, 1ULL, memory_order_relaxed);
         (void)datarouter_registry_release_slot(shm, slot);
-        datarouter_signal_post(&shm->control.rx_signal[slot]);
+        datarouter_signal_post_if_waiting(&shm->control.rx_signal[slot]);
     }
     datarouter_unlock(&shm->control.control_lock);
 }
@@ -1213,18 +1238,39 @@ int main(int argc, char **argv) {
         reap_interval_ns = 1000000000ULL;
     }
 
+    int dedicated = datarouter_thread_attach();
+    if (dedicated < 0) {
+        datarouter_platform_close(&mapping);
+        datarouter_platform_unlink(options.shm_name);
+        return 1;
+    }
     int exit_code = 0;
     do {
-        uint32_t signal_sequence = datarouter_signal_prepare(&mapping.shm->control.switch_signal);
         uint64_t iteration_started_ns = datarouter_now_ns();
-        if (iteration_started_ns >= next_request_recovery_ns) {
+        int maintenance_due = iteration_started_ns >= next_request_recovery_ns;
+        int control_ready = atomic_load_explicit(&mapping.shm->control.request_ready_mask,
+                                                memory_order_acquire) != 0ULL;
+        int corrupt_ready = atomic_load_explicit(&mapping.shm->control.corrupt_slot_mask,
+                                                memory_order_acquire) != 0ULL;
+        if (maintenance_due) {
             recover_control_requests(mapping.shm);
-            next_request_recovery_ns = iteration_started_ns + 1000000ULL;
         }
-        datarouter_registry_cleanup_releasing(mapping.shm);
-        process_corrupt_slots(mapping.shm, &options);
-        handle_control_requests(mapping.shm, &options);
-        uint32_t routed = datarouter_route_frames_stats(mapping.shm, &route_stats);
+        /* A new registration must see completed unregister/drain work before
+         * duplicate-name checks, even between fallback deadlines. */
+        if (maintenance_due || control_ready || corrupt_ready)
+            datarouter_registry_cleanup_releasing(mapping.shm);
+        if (corrupt_ready) process_corrupt_slots(mapping.shm, &options);
+        if (control_ready) handle_control_requests(mapping.shm, &options);
+        if (maintenance_due || control_ready || corrupt_ready) {
+            uint64_t deadline = iteration_started_ns + dr_maintenance_interval_ns(
+                maintenance_pending(mapping.shm), DATAROUTER_SWITCH_IDLE_WAIT_MS);
+            /* Notifications may shorten, but never postpone a pending scan. */
+            if (maintenance_due || deadline < next_request_recovery_ns)
+                next_request_recovery_ns = deadline;
+        }
+        uint32_t routed = atomic_load_explicit(&mapping.shm->control.tx_ready_mask,
+                                               memory_order_acquire) != 0ULL
+            ? datarouter_route_frames_stats(mapping.shm, &route_stats) : 0U;
         uint64_t now = datarouter_now_ns();
         if (options.reap_dead_processes && now >= next_dead_reap_ns) {
             reap_dead_processes(mapping.shm, &options);
@@ -1257,8 +1303,13 @@ int main(int argc, char **argv) {
             next_stats_ns = now + 5000000000ULL;
         }
 
+        if (dedicated) {
+            datarouter_cpu_pause();
+            continue;
+        }
         if (routed > 0U) {
-            idle_spin_started_ns = 0ULL;
+            if (!idle_spin_started_ns) DR_SWITCH_EVENT(4);
+            idle_spin_started_ns = now;
             if (active_spin_started_ns == 0ULL) {
                 active_spin_started_ns = now;
             }
@@ -1272,18 +1323,39 @@ int main(int argc, char **argv) {
         active_spin_started_ns = 0ULL;
         if (!options.once) {
             now = datarouter_now_ns();
-            if (idle_spin_started_ns == 0ULL) {
-                idle_spin_started_ns = now;
-            }
-            if (now - idle_spin_started_ns <
-                (uint64_t)DATAROUTER_SWITCH_SPIN_BUDGET_US * 1000ULL) {
+            /* Only forwarded frames arm this window. Maintenance and empty
+             * notifications must leave an exhausted window asleep. */
+            if (dr_idle_spin(idle_spin_started_ns, now,
+                (uint64_t)DATAROUTER_SWITCH_SPIN_BUDGET_US * 1000ULL)) {
                 continue;
             }
             idle_spin_started_ns = 0ULL;
-            int wait_rc = datarouter_signal_wait_prepared(
-                &mapping.shm->control.switch_signal,
+            uint64_t deadline = next_request_recovery_ns;
+            if (next_reap_ns < deadline) deadline = next_reap_ns;
+            if (options.reap_dead_processes && next_dead_reap_ns < deadline)
+                deadline = next_dead_reap_ns;
+            if (options.log_level >= SWITCH_LOG_DEBUG && next_stats_ns < deadline)
+                deadline = next_stats_ns;
+            uint32_t wait_ms = dr_deadline_wait_ms(now, deadline, DATAROUTER_SWITCH_IDLE_WAIT_MS);
+            if (wait_ms == 0U) {
+                datarouter_yield();
+                continue;
+            }
+            DR_SWITCH_EVENT(5);
+            datarouter_signal *signal = &mapping.shm->control.switch_signal;
+            int arm_rc = datarouter_signal_arm(signal);
+            if (arm_rc != DATAROUTER_OK) { exit_code = 1; break; }
+            uint32_t signal_sequence = datarouter_signal_prepare(signal);
+            if (g_stop || atomic_load_explicit(&mapping.shm->control.request_ready_mask, memory_order_acquire) ||
+                atomic_load_explicit(&mapping.shm->control.tx_ready_mask, memory_order_acquire) ||
+                atomic_load_explicit(&mapping.shm->control.corrupt_slot_mask, memory_order_acquire)) {
+                datarouter_signal_cancel(signal);
+                continue;
+            }
+            int wait_rc = datarouter_signal_wait_armed(
+                signal,
                 signal_sequence,
-                DATAROUTER_SWITCH_WAIT_MS
+                wait_ms
             );
             if (wait_rc != DATAROUTER_OK && wait_rc != DATAROUTER_ERR_TIMEOUT) {
                 switch_log(&options, SWITCH_LOG_ERROR, "signal wait failed: %s", datarouter_strerror(wait_rc));
@@ -1312,5 +1384,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "datarouter-switch: unlink shm failed: %s\n", datarouter_strerror(rc));
         return 1;
     }
+    datarouter_thread_detach();
     return exit_code;
 }
