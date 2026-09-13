@@ -14,6 +14,22 @@ if ($case === 'auth') {
         datarouter_send($a, 'core', $wire); $m = datarouter_recv($b); check($m['source'] === 'portal' && $m['data'] === $wire);
         datarouter_send($b, 'portal', $wire); check(datarouter_recv($a)['data'] === $wire);
     }
+    // Alternating capacities and retained return values must never share storage.
+    $saved = []; $expected = [];
+    foreach ([0,4087,4088,4089,307200,1,32768,0,307200,3] as $n) {
+        $body = str_repeat("\0", $n); $wire = datarouter_pack($body);
+        datarouter_send($a, 'core', $wire); $saved[] = datarouter_recv($b)['data']; $expected[] = $wire;
+        check(end($saved) === $wire); check(datarouter_unpack(end($saved))['body'] === $body);
+    }
+    foreach ($saved as $i=>$value) check($value === $expected[$i]);
+    foreach (['', "\x07", str_repeat("\0",7), "\x07\0\0\0\x01\0\0\0",
+              "\x07\0\0\0\0\0\0\0X", "\x07\0\x01\0\0\0\0\0X",
+              "\x07\0\x03\0\0\0\0\0\x10\xff\xff",
+              "\x07\0\x04\0\0\0\0\0\x10\x02\0X"] as $bad) {
+        errorCode(10, fn()=>datarouter_unpack($bad));
+    }
+    $wire = "\xfe\xa5\x05\0\x03\0\0\0\x10\x02\0\0Xz\0q";
+    check(datarouter_unpack($wire) === ['type'=>254,'flags'=>165,'body'=>"z\0q",'var_data'=>"\x10\x02\0\0X"]);
     $max = datarouter_max_payload(); check($max > 300*1024);
     foreach ([$max-1, $max] as $n) {
         $wire = datarouter_pack(str_repeat('x', $n-8)); check(strlen($wire) === $n);

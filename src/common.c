@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "datarouter_internal.h"
 #include "datarouter_registry.h"
 #include "datarouter_scheduler.h"
@@ -19,6 +22,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+#include "thread_policy.h"
 
 const char *datarouter_version(void) {
     return DATAROUTER_VERSION;
@@ -302,11 +307,8 @@ size_t datarouter_shared_memory_size_with_keep(uint32_t max_ports, uint32_t keep
     if (max_ports == 0U || max_ports > DATAROUTER_MAX_PORTS) {
         return 0U;
     }
-    size_t channel_count = (size_t)max_ports * 2U;
-    if (channel_count > (SIZE_MAX - DATAROUTER_DATA_OFFSET) / sizeof(datarouter_channel)) {
-        return 0U;
-    }
-    size_t base = DATAROUTER_DATA_OFFSET + channel_count * sizeof(datarouter_channel);
+    size_t channel_count = DATAROUTER_QUEUE_COUNT(max_ports);
+    size_t base = DATAROUTER_DATA_OFFSET(max_ports) + channel_count * DATAROUTER_RING_CAPACITY;
     if (keep_size == 0U) {
         return base;
     }
@@ -350,6 +352,7 @@ void datarouter_touch_entry(datarouter_registry_entry *entry, uint64_t now_ns) {
 }
 
 int datarouter_try_lock(atomic_uint *lock) {
+    if (atomic_load_explicit(lock, memory_order_relaxed) != DATAROUTER_CONTROL_LOCK_FREE) return 0;
     unsigned int expected = DATAROUTER_CONTROL_LOCK_FREE;
     return atomic_compare_exchange_strong_explicit(
         lock,
@@ -412,18 +415,18 @@ int datarouter_init_shared_memory_with_keep(
     if (!shm || ttl_ms == 0U || total_size == 0U || total_size > UINT32_MAX) {
         return DATAROUTER_ERR_INVALID_ARGUMENT;
     }
-    memset(shm, 0, total_size);
+    memset(shm, 0, DATAROUTER_DATA_OFFSET(max_ports));
     shm->control.magic = DATAROUTER_MAGIC;
     shm->control.layout_version = DATAROUTER_LAYOUT_VERSION;
     shm->control.max_ports = max_ports;
-    shm->control.channel_count = max_ports * 2U;
+    shm->control.channel_count = (uint32_t)DATAROUTER_QUEUE_COUNT(max_ports);
     shm->control.channel_size = DATAROUTER_CHANNEL_SIZE;
     shm->control.control_size = (uint32_t)sizeof(datarouter_control_plane);
-    shm->control.data_offset = (uint32_t)DATAROUTER_DATA_OFFSET;
+    shm->control.data_offset = (uint32_t)DATAROUTER_DATA_OFFSET(max_ports);
     shm->control.keep_size = keep_size;
-    uint32_t channel_blob = max_ports * 2U * (uint32_t)sizeof(datarouter_channel);
+    uint32_t channel_blob = (uint32_t)DATAROUTER_QUEUE_COUNT(max_ports) * DATAROUTER_RING_CAPACITY;
     shm->control.keep_offset =
-        keep_size > 0U ? (uint32_t)DATAROUTER_DATA_OFFSET + channel_blob : 0u;
+        keep_size > 0U ? (uint32_t)DATAROUTER_DATA_OFFSET(max_ports) + channel_blob : 0u;
     atomic_store_explicit(
         &shm->control.keep_write_allow_bitmap, 0ULL, memory_order_release);
     shm->control.total_size = (uint32_t)total_size;
@@ -459,15 +462,6 @@ int datarouter_init_shared_memory_with_keep(
         switch_start_id,
         memory_order_release
     );
-    for (uint32_t source = 0U; source < DATAROUTER_MAX_PORTS; source++) {
-        for (uint32_t target = 0U; target < DATAROUTER_MAX_PORTS; target++) {
-            atomic_store_explicit(
-                &shm->control.inflight_frames[source][target],
-                0U,
-                memory_order_relaxed
-            );
-        }
-    }
     for (uint32_t i = 0U; i < DATAROUTER_REGISTRATION_REQUEST_SLOTS; i++) {
         datarouter_register_request *request = &shm->control.register_requests[i];
         request->operation = DATAROUTER_REG_OP_NONE;
@@ -486,17 +480,17 @@ int datarouter_init_shared_memory_with_keep(
             return DATAROUTER_ERR_PLATFORM;
         }
         shm->control.slots[i].slot_index = i;
-        shm->control.slots[i].rx_channel_index = DATAROUTER_RX_CHANNEL(i);
+        shm->control.slots[i].rx_channel_index = DATAROUTER_RX_CHANNEL(max_ports, 0U, i);
         shm->control.slots[i].tx_channel_index = DATAROUTER_TX_CHANNEL(i);
         datarouter_registry_clear_entry(&shm->control.registry[i], i);
     }
-    datarouter_channel *channels = (datarouter_channel *)((uint8_t *)shm + shm->control.data_offset);
-    for (uint32_t i = 0; i < shm->control.channel_count; i++) {
-        datarouter_ring_reset(&channels[i]);
+    datarouter_queue_control *queues = (void *)((uint8_t *)shm + DATAROUTER_QUEUE_OFFSET);
+    for (size_t i = 0; i < DATAROUTER_QUEUE_COUNT(max_ports); i++) {
+        atomic_init(&queues[i].header.head, 0U);
+        atomic_init(&queues[i].header.tail, 0U);
+        atomic_init(&queues[i].writer_owner, 0U);
     }
-    if (shm->control.keep_size > 0U) {
-        datarouter_keep_init(shm, keep_slot_capacity);
-    }
+    if (keep_size) datarouter_keep_init(shm, keep_slot_capacity);
     atomic_store_explicit(&shm->control.initialized, 1U, memory_order_release);
     return DATAROUTER_OK;
 }
@@ -519,10 +513,10 @@ int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_
         shm->control.layout_version != DATAROUTER_LAYOUT_VERSION ||
         shm->control.max_ports == 0U ||
         shm->control.max_ports > DATAROUTER_MAX_PORTS ||
-        shm->control.channel_count != shm->control.max_ports * 2U ||
+        shm->control.channel_count != (uint32_t)DATAROUTER_QUEUE_COUNT(shm->control.max_ports) ||
         shm->control.channel_size != DATAROUTER_CHANNEL_SIZE ||
         shm->control.control_size != (uint32_t)sizeof(datarouter_control_plane) ||
-        shm->control.data_offset != (uint32_t)DATAROUTER_DATA_OFFSET ||
+        shm->control.data_offset != (uint32_t)DATAROUTER_DATA_OFFSET(shm->control.max_ports) ||
         shm->control.total_size != (uint32_t)datarouter_shared_memory_size_with_keep(
             shm->control.max_ports, shm->control.keep_size) ||
         map_size < shm->control.total_size) {
@@ -530,8 +524,8 @@ int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_
     }
     if (shm->control.keep_size > 0U) {
         uint32_t expected_keep_offset =
-            (uint32_t)DATAROUTER_DATA_OFFSET +
-            shm->control.max_ports * 2U * (uint32_t)sizeof(datarouter_channel);
+            (uint32_t)DATAROUTER_DATA_OFFSET(shm->control.max_ports) +
+            (uint32_t)DATAROUTER_QUEUE_COUNT(shm->control.max_ports) * DATAROUTER_RING_CAPACITY;
         if (shm->control.keep_offset != expected_keep_offset ||
             shm->control.keep_size > 8u * 1024u * 1024u ||
             shm->control.keep_size < DATAROUTER_KEEP_MIN_SIZE ||
@@ -557,20 +551,26 @@ int datarouter_validate_shared_memory(const datarouter_shared_memory *shm, size_
     return DATAROUTER_OK;
 }
 
-datarouter_channel *datarouter_rx_channel(datarouter_shared_memory *shm, uint32_t slot_index) {
-    uint32_t max_ports = datarouter_active_max_ports(shm);
-    if (!shm || slot_index >= max_ports) {
-        return NULL;
-    }
-    datarouter_channel *channels = (datarouter_channel *)((uint8_t *)shm + shm->control.data_offset);
-    return &channels[DATAROUTER_RX_CHANNEL(slot_index)];
+static datarouter_channel channel_view(datarouter_shared_memory *shm, uint32_t index) {
+    datarouter_channel empty = {0};
+    uint32_t n = datarouter_active_max_ports(shm);
+    if (!shm || !n || index >= DATAROUTER_QUEUE_COUNT(n)) return empty;
+    datarouter_queue_control *queues = (void *)((uint8_t *)shm + DATAROUTER_QUEUE_OFFSET);
+    datarouter_channel view = {
+        &queues[index].header,
+        (uint8_t *)shm + DATAROUTER_DATA_OFFSET(n) + (size_t)index * DATAROUTER_RING_CAPACITY,
+        &queues[index].writer_owner
+    };
+    return view;
 }
 
-datarouter_channel *datarouter_tx_channel(datarouter_shared_memory *shm, uint32_t slot_index) {
-    uint32_t max_ports = datarouter_active_max_ports(shm);
-    if (!shm || slot_index >= max_ports) {
-        return NULL;
-    }
-    datarouter_channel *channels = (datarouter_channel *)((uint8_t *)shm + shm->control.data_offset);
-    return &channels[DATAROUTER_TX_CHANNEL(slot_index)];
+datarouter_channel datarouter_rx_channel(datarouter_shared_memory *shm, uint32_t source, uint32_t target) {
+    uint32_t n = datarouter_active_max_ports(shm);
+    if (!shm || source >= n || target >= n) return (datarouter_channel){0};
+    return channel_view(shm, DATAROUTER_RX_CHANNEL(n, source, target));
+}
+
+datarouter_channel datarouter_tx_channel(datarouter_shared_memory *shm, uint32_t slot_index) {
+    if (!shm || slot_index >= datarouter_active_max_ports(shm)) return (datarouter_channel){0};
+    return channel_view(shm, DATAROUTER_TX_CHANNEL(slot_index));
 }

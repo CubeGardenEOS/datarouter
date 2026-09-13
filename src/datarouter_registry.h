@@ -42,16 +42,6 @@ int datarouter_registry_find_source_metadata_by_route(
     uint32_t route_id,
     datarouter_registry_metadata *out
 );
-void datarouter_registry_track_inflight(
-    datarouter_shared_memory *shm,
-    uint32_t source_slot,
-    uint32_t target_slot
-);
-void datarouter_registry_complete_inflight(
-    datarouter_shared_memory *shm,
-    uint32_t source_route,
-    uint32_t target_slot
-);
 int datarouter_registry_publish_control_response(
     datarouter_shared_memory *shm,
     datarouter_register_request *request,

@@ -63,13 +63,15 @@ def main():
             static_out.mkdir()
             run(common + ['-Wall', '-Wextra', '-Werror', '-fanalyzer', '-c'] + sources + [source/'src/config.c', source/'src/switch.c'],
                 label+'-static', static_out)
-            for test in ['test_security', 'test_ring', 'test_layout', 'test_protocol_fuzz', 'test_signal', 'test_clock']:
+            for test in ['test_security', 'test_ring', 'test_layout', 'test_protocol_fuzz', 'test_signal', 'test_clock', 'test_wait_policy', 'test_switch_maintenance']:
                 binary = out/(label+'-'+test)
                 # Use the candidate's regression contract against both source trees.
                 test_source = ROOT/'tests'/(test+'.c')
                 copied = out/(label+'-'+test+'.c')
                 copied.write_text(test_source.read_text().replace('../src/', str(source/'src')+'/'))
                 test_flags = ['-DDATAROUTER_TEST_WRAP_PID', '-Wl,--wrap=getpid'] if test == 'test_security' else []
+                if test == 'test_switch_maintenance':
+                    test_flags += ['-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections']
                 if run(common + test_flags + ['-g', '-O1', '-fno-omit-frame-pointer',
                                  '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
                                  copied] + sources + ['-o', binary], label+'-'+test+'-build', source):
@@ -86,6 +88,18 @@ def main():
         proc = Processes(runtime_out)
         try:
             native_build(proc)
+            for test in ('test_thread_policy', 'test_switch'):
+                binary = runtime_out/test
+                argv = ['cc', '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-DDATAROUTER_UNSAFE',
+                        '-DDATAROUTER_TEST_HOOKS', '-I'+str(ROOT/'include'), '-I'+str(ROOT/'src'),
+                        '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', ROOT/'tests'/(test+'.c')]
+                argv += [ROOT/'src'/(name+'.c') for name in SOURCES]
+                try:
+                    proc.run(argv + ['-o', binary], test+'-build', 120, cwd=ROOT)
+                    proc.run([binary], test, 180, cwd=ROOT)
+                    result['checks'].append(dict(name='candidate-'+test, exit=0))
+                except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                    result['checks'].append(dict(name='candidate-'+test, exit=1, error=str(exc)))
             try:
                 proc.run(['cargo', 'test', '--release', '--tests', '--', '--test-threads=1'],
                          'rust-tests', 600, cwd=ROOT)

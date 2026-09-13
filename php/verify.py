@@ -22,6 +22,7 @@ from build import ROOT, environment, build, fingerprint, command
 class Processes:
     def __init__(self, out):
         self.out = out
+        self.benchmark = ROOT.parent / 'datarouter-benchmark'
         self.children = []
         self.shm = set()
         self.known = {}
@@ -31,7 +32,7 @@ class Processes:
         self.thread = threading.Thread(target=self.watch, daemon=True)
         self.thread.start()
     def watch(self):
-        while not self.done.wait(.02):
+        while not self.done.wait(.1):
             self.scan()
     @staticmethod
     def identity(pid):
@@ -139,12 +140,24 @@ class Processes:
         for path in self.shm: path.unlink(missing_ok=True)
         if alive: raise RuntimeError(f'leftover process groups: {alive}')
         return dict(process_groups=len(self.children), shared_memory=len(self.shm), remaining=0)
+    def switch_cpu_list(self):
+        if hasattr(self, 'switch_cpus'): return ','.join(map(str, self.switch_cpus))
+        groups = {}
+        for cpu in sorted(os.sched_getaffinity(0)):
+            topology = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+            key = tuple((topology/name).read_text().strip() for name in ('physical_package_id','core_id'))
+            groups.setdefault(key, cpu)
+        cpus = list(groups.values())
+        if not cpus: raise RuntimeError('no allowed switch CPU')
+        return str(cpus[min(2, len(cpus)-1)])
+
     def switch(self, name, token=False):
         shm = '/dr-php-'+uuid.uuid4().hex
         path = Path('/dev/shm') / shm[1:]
         if path.exists(): raise RuntimeError('shared memory collision')
         self.shm.add(path)
-        args = [ROOT/'build/datarouter-switch', '--name', shm, '--allow-any', '--max-ports', '8', '--ttl-ms', '60000']
+        pinned_exec = self.benchmark / 'tools/pinned_exec.py'
+        args = [sys.executable, pinned_exec, self.switch_cpu_list(), '-', ROOT/'build/datarouter-switch', '--name', shm, '--allow-any', '--max-ports', '8', '--ttl-ms', '60000']
         if token: args += ['--token-stdin']
         if name=='restart-switch':args += ['--reap-dead-processes']
         p = self.spawn(args, name, stdin_data=b'secret' if token else None)
@@ -318,7 +331,8 @@ def restart_test(proc, php):
         (directory/'down').write_text('1');marker('closed')
         proc.stop(sw)
         Path('/dev/shm',shm[1:]).unlink(missing_ok=True)
-        sw=proc.spawn([ROOT/'build/datarouter-switch','--name',shm,'--allow-any','--max-ports','8'],'restart-new-switch')
+        pinned_exec = proc.benchmark / 'tools/pinned_exec.py'
+        sw=proc.spawn([sys.executable, pinned_exec, proc.switch_cpu_list(), '-', ROOT/'build/datarouter-switch','--name',shm,'--allow-any','--max-ports','8'],'restart-new-switch')
         end=time.monotonic()+5
         while not Path('/dev/shm',shm[1:]).exists():
             if sw.poll() is not None or time.monotonic()>end:raise RuntimeError('restart failed')
@@ -375,14 +389,17 @@ def main():
     ap.add_argument('--out',type=Path)
     ap.add_argument('--only',choices=['faults','benchmarks'],help='targeted retest, not a full gate')
     a=ap.parse_args()
+    cpu_budget_option=os.environ.get('DATAROUTER_ENFORCE_CPU_BUDGETS','1')
+    if cpu_budget_option not in ('0','1'): raise ValueError('DATAROUTER_ENFORCE_CPU_BUDGETS must be 0 or 1')
     out=(a.out or a.benchmark/'results'/('php-'+time.strftime('%Y%m%d-%H%M%S'))).resolve()
     out.mkdir(parents=True,exist_ok=False)
-    proc=Processes(out);result=dict(profile=a.profile,coverage=a.only or 'all',status='failed',cases=[])
+    proc=Processes(out);result=dict(profile=a.profile,coverage=a.only or 'all',status='failed',cases=[],cpu_budgets_enforced=cpu_budget_option=='1')
     frozen=None;task_snapshot=None
     def interrupted(signum, frame): raise KeyboardInterrupt(f'signal {signum}')
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,interrupted)
     try:
         a.benchmark=a.benchmark.resolve()
+        proc.benchmark=a.benchmark
         frozen=frozen_sources(a.benchmark)
         result['frozen_sources']=frozen
         task_snapshot=task_sources(a.benchmark)
@@ -392,17 +409,32 @@ def main():
         native_build(proc)
         spec=importlib.util.spec_from_file_location('php_benchmark',a.benchmark/'languages/php/verify.py')
         bench=importlib.util.module_from_spec(spec);spec.loader.exec_module(bench)
+        from execution_evidence import evidence, unchanged as executors_unchanged
+        execution=evidence(a.benchmark,['idle_budget.py','tail_verify.py','report.py'])
+        result['executor_sha256']=execution['executor_sha256']
+        result['executor_sha256'][str(Path(__file__).resolve())]=fingerprint(Path(__file__).resolve())
+        result['execution_environment']=execution['environment']
+        result['diagnostic_capabilities']=execution['diagnostic_capabilities']
         bench.build_c(proc,a.benchmark)
         if a.only!='faults':result['affinity']=bench.configure_affinity(proc)
         if a.profile=='full' and not a.only:result['native_regression_failures']=regressions(proc)
         native_fingerprint=fingerprint(ROOT/'build/libblinkcms_datarouter.so')
-        if a.profile=='full' and a.only!='faults':baseline=bench.matrix(proc,a.benchmark,meta,False,'baseline')
         # Run phpize/make in a managed process group too.
         proc.run([sys.executable,ROOT/'php/build.py'],'php-build',180)
         meta=json.loads((ROOT/'build/php/manifest.json').read_text());result['environment']=meta
+        if a.profile=='full' and a.only!='faults':
+            from tail_verify import idle
+            from idle_budget import assess_idle
+            idle_bin=out/'idle-probe'
+            proc.run(['cc','-O3','-std=c11','-D_POSIX_C_SOURCE=200809L','-I'+str(ROOT/'include'),
+                a.benchmark/'tools/idle_probe.c','-L'+str(ROOT/'build'),'-Wl,-rpath,'+str(ROOT/'build'),
+                '-lblinkcms_datarouter','-o',idle_bin],'idle-probe-build',120)
+            result['idle_probe_sha256']=fingerprint(idle_bin)
+            result['idle']={'baseline':idle(proc,ROOT,idle_bin,'native-baseline')}
+            baseline=bench.matrix(proc,a.benchmark,meta,False,'baseline')
         php=[meta['tools']['PHP'],'-n','-d','opcache.enable_cli=0','-d','opcache.jit=0','-d','extension='+meta['extension']]
         if not a.only:
-            for case,expected in [('basic',26),('auth',2),('routed',2)]:
+            for case,expected in [('basic',65),('auth',2),('routed',2)]:
                 shm,sw=proc.switch(case+'-switch',case=='auth');echo=None
                 try:
                     if case=='routed':
@@ -424,9 +456,15 @@ def main():
         if a.only!='faults':result['benchmarks']=bench.matrix(proc,a.benchmark,meta,True,'php',quick=a.profile=='smoke')
         if a.profile=='full' and a.only!='faults':
             if fingerprint(ROOT/'build/libblinkcms_datarouter.so')!=native_fingerprint:raise RuntimeError('native library changed between baseline and candidate')
+            result['idle']['candidate']=idle(proc,ROOT,idle_bin,'native-candidate')
             candidate=bench.matrix(proc,a.benchmark,meta,False,'candidate')
             result['performance']=bench.compare(baseline,candidate,out)
-            if not result['performance']['passed']:raise RuntimeError('native performance regression exceeds 5%; merge blocked')
+            result['idle_budget']=assess_idle(result['idle'],'same-library-control',enforce_budget=result['cpu_budgets_enforced'])
+            result['idle_budget_subjects']=result['idle_budget']['idle_budget_subjects']
+            result['performance']['metrics_passed']=result['performance']['passed']
+            result['performance']['idle_budget']=result['idle_budget']
+            result['performance']['passed']=result['performance']['passed'] and result['idle_budget']['passed']
+            if not result['performance']['passed']:raise RuntimeError('native performance or idle CPU gate failed; merge blocked')
         expected=2 if a.only=='faults' else (0 if a.only=='benchmarks' else (5 if a.profile=='smoke' else 8))
         if len(result['cases'])!=expected:raise RuntimeError('missing cases')
         if result.get('native_regression_failures'):raise RuntimeError('native regression failures; merge blocked')
@@ -443,6 +481,9 @@ def main():
         try:result['task_sources_unchanged']=task_snapshot is not None and task_snapshot==task_sources(a.benchmark)
         except Exception:result['task_sources_unchanged']=False
         if not result['task_sources_unchanged']:result['status']='failed';result['source_error']='task sources changed during verification'
+        if 'executor_sha256' in result:
+            result['executors_unchanged']=executors_unchanged(result)
+            if not result['executors_unchanged']:result['status']='failed'
         result['full_gate']=result['status']=='passed' and a.profile=='full' and not a.only
         (out/'verification.json').write_text(json.dumps(result,indent=2)+'\n')
     print(f"{result['status']} ({result['coverage']}): {out/'verification.json'}",flush=True)

@@ -1,7 +1,25 @@
 # 安全改动后的源代码对照（2026-09-09）
 
-结论：当前测量契约下正确性通过，性能门禁失败；不得合入或更新消费者 DataRouter 指针。
-这不是原计划的最终成绩：尚未加入八语言序号 ACK 核验，C64 因果诊断也未完成。
+结论：最新简化源安全检查 36/36 通过，但 PHP native 两项与稳态全矩阵仍失败；
+未合入或更新消费者 DataRouter 指针。下方 2026-09-09 内容为历史对照，失败与无效尝试均保留。
+## 当前简化源汇总（2026-09-11）
+
+- `../datarouter-benchmark/results/security-simplified-20260911-configured-final/results.json`：
+  `status=passed`，候选检查 **36/36**，C/runtime 清理 `remaining=0`；Windows
+  Cargo target 使用本地 `%LOCALAPPDATA%\CGEOS\datarouter\target-datarouter-4b79a1601b94`。
+- `../datarouter-benchmark/results/php-full-simplified-20260911-cached/verification.json`：
+  功能 8/8、10243 项检查/请求、错误 0；benchmark 84 项、错误 0；native p99
+  仍有 2 项失败：1024B `+15.270509%`、307200B `+26.556762%`。native
+  baseline/candidate 是同一当前原生库、同一机器和同一参数的两轮控制语义，不是历史版本 baseline。
+- `../datarouter-benchmark/results/steady-simplified-20260911-baseline-known-env/comparison.json`：
+  `status=failed`、`correctness=false`、`matching_coverage=true`、
+  `performance=false`；1440 项比较中 55 项 `regression=true`；绝对重复性超 5%
+  为基线 **135/720**、候选 **98/720**。
+- 基线 Go 的 4 个 `open sender: protocol error` 仍按历史记录保留；固定名称或旧
+  shm snapshot 只是推断，未证实为根因。当前隔离改动已直接执行 CLI 所列出的 Go
+  绑定测试命令，两轮 **4/4** 通过，package **1.028/1.031s** 且无 `dr-go` 残留。
+
+安全门禁通过不代表性能/PHP 门禁通过；未满足全部门禁前不提交。
 
 ## 固定条件与记录
 

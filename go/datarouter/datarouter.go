@@ -91,6 +91,9 @@ type Frontend struct {
 
 // Open connects through the switch control plane and registers ServiceName.
 func Open(opts Options) (*Frontend, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer C.datarouter_thread_detach()
 	if opts.ShmName == "" {
 		opts.ShmName = "/datarouter"
 	}
@@ -134,6 +137,9 @@ func Open(opts Options) (*Frontend, error) {
 // plane the message must be a single frame ≤ MaxPayload; larger messages
 // return ErrPayloadTooLarge (use the routed plane for chunking).
 func (f *Frontend) Send(targetService string, data []byte, timeoutMs uint32) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer C.datarouter_thread_detach()
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	defer runtime.KeepAlive(f)
@@ -152,6 +158,9 @@ func (f *Frontend) Send(targetService string, data []byte, timeoutMs uint32) err
 // ErrPayloadTooLarge is returned; query FrameLen and retry with a larger
 // buffer.
 func (f *Frontend) Recv(buf []byte, timeoutMs uint32) (int, string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer C.datarouter_thread_detach()
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	defer runtime.KeepAlive(f)
@@ -178,6 +187,9 @@ func (f *Frontend) Recv(buf []byte, timeoutMs uint32) (int, string, error) {
 // FrameLen peeks the next RX frame's payload length without consuming it.
 // Returns ErrAgain when the RX ring is empty.
 func (f *Frontend) FrameLen() (int, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer C.datarouter_thread_detach()
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	defer runtime.KeepAlive(f)
@@ -191,6 +203,9 @@ func (f *Frontend) FrameLen() (int, error) {
 
 // Close releases the frontend handle. Safe to call multiple times.
 func (f *Frontend) Close() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer C.datarouter_thread_detach()
 	if f == nil {
 		return
 	}

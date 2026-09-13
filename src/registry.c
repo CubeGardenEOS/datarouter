@@ -171,50 +171,6 @@ int datarouter_registry_find_source_metadata_by_route(
     return 1;
 }
 
-void datarouter_registry_track_inflight(
-    datarouter_shared_memory *shm,
-    uint32_t source_slot,
-    uint32_t target_slot
-) {
-    if (!shm || source_slot >= datarouter_active_max_ports(shm) ||
-        target_slot >= datarouter_active_max_ports(shm)) {
-        return;
-    }
-    atomic_fetch_add_explicit(
-        &shm->control.inflight_frames[source_slot][target_slot],
-        1U,
-        memory_order_release
-    );
-}
-
-void datarouter_registry_complete_inflight(
-    datarouter_shared_memory *shm,
-    uint32_t source_route,
-    uint32_t target_slot
-) {
-    if (!shm || source_route == 0U || target_slot >= datarouter_active_max_ports(shm)) {
-        return;
-    }
-    uint32_t source_slot = source_route & DATAROUTER_ROUTE_SLOT_MASK;
-    if (source_slot >= datarouter_active_max_ports(shm)) {
-        return;
-    }
-    /* A source slot cannot be reused while this counter is non-zero, so the
-     * route's slot bits are sufficient here and avoid a registry snapshot on
-     * every received frame. */
-    atomic_uint *counter = &shm->control.inflight_frames[source_slot][target_slot];
-    unsigned int current = atomic_load_explicit(counter, memory_order_acquire);
-    while (current > 0U &&
-           !atomic_compare_exchange_weak_explicit(
-               counter,
-               &current,
-               current - 1U,
-               memory_order_acq_rel,
-               memory_order_acquire
-           )) {
-    }
-}
-
 int datarouter_registry_entry_alive(const datarouter_registry_entry *entry) {
     datarouter_registry_metadata metadata;
     if (!datarouter_registry_read_routable(entry, &metadata)) {
@@ -301,10 +257,6 @@ void datarouter_registry_clear_entry(datarouter_registry_entry *entry, uint32_t 
     atomic_store_explicit(&entry->io_users,
         ((unsigned long long)atomic_load_explicit(&entry->route_id, memory_order_relaxed) << 32U) | DATAROUTER_IO_CLOSED,
         memory_order_release);
-    atomic_store_explicit(&entry->direct_writers, 0U, memory_order_seq_cst);
-    atomic_store_explicit(&entry->direct_writer_pid, 0, memory_order_relaxed);
-    atomic_store_explicit(&entry->direct_writer_uid, 0U, memory_order_relaxed);
-    atomic_store_explicit(&entry->direct_writer_start_id, 0ULL, memory_order_relaxed);
     atomic_store_explicit(&entry->state, DATAROUTER_PORT_EMPTY, memory_order_seq_cst);
 }
 
@@ -321,63 +273,59 @@ static int force_dead_owner_pin_release(datarouter_registry_entry *entry) {
     return 1;
 }
 
-/* Wait for an in-flight direct (unsafe) data-plane writer to finish.
- *
- * direct_writers is pinned by live writer processes, so unlike owner pins it
- * must NEVER be zeroed while the writer is still alive: doing so would reset
- * the rings underneath its memcpy and corrupt the next occupant's RX channel
- * (and its later unpin would underflow the counter). Instead we wait out the
- * bounded write, and only force-release when the recorded writer process is
- * provably dead (crashed mid-write). An alive-but-preempted writer simply
- * defers the finalize; the switch's cleanup loop retries. */
-/* Acquire the stable lifetime gate before resetting a ring. The gate itself
- * survives clear_entry, so late stale senders cannot unlock a new generation.
- * Unknown/reused live PIDs conservatively prevent reclamation. */
-static int writer_gate_for_release(datarouter_shared_memory *shm, datarouter_registry_entry *entry) {
+/* Ownership is per communication pair and survives registration generations.
+ * Only a confirmed dead PID can be replaced; SIGSTOP never grants takeover. */
+static int writer_gate_for_release(datarouter_shared_memory *shm, atomic_uint *gate) {
     unsigned int owner = 0;
     unsigned int switch_pid = (unsigned int)shm->control.switch_pid;
-    if (atomic_compare_exchange_strong_explicit(&entry->rx_writer_owner, &owner, switch_pid,
-                                               memory_order_seq_cst, memory_order_relaxed)) return 1;
+    if (atomic_compare_exchange_strong_explicit(gate, &owner, switch_pid,
+            memory_order_seq_cst, memory_order_relaxed)) return 1;
     if (datarouter_pid_alive((int32_t)owner)) return 0;
-    return atomic_compare_exchange_strong_explicit(&entry->rx_writer_owner, &owner, switch_pid,
-                                                   memory_order_seq_cst, memory_order_relaxed);
+    return atomic_compare_exchange_strong_explicit(gate, &owner, switch_pid,
+            memory_order_seq_cst, memory_order_relaxed);
 }
 
 static int finalize_release(datarouter_shared_memory *shm, uint32_t slot_index) {
     datarouter_registry_entry *entry = &shm->control.registry[slot_index];
     atomic_fetch_or_explicit(&entry->io_users, DATAROUTER_IO_CLOSED, memory_order_acq_rel);
     if ((atomic_load_explicit(&entry->io_users, memory_order_acquire) & DATAROUTER_IO_REF_MASK) != 0U &&
-        !force_dead_owner_pin_release(entry)) {
-        return 0;
-    }
-    if (!writer_gate_for_release(shm, entry)) {
-        return 0;
-    }
-    datarouter_scheduler_forget_slot(shm, slot_index);
-    datarouter_ring_reset(datarouter_rx_channel(shm, slot_index));
-    datarouter_ring_reset(datarouter_tx_channel(shm, slot_index));
-    for (uint32_t source = 0U; source < datarouter_active_max_ports(shm); source++) {
-        atomic_store_explicit(
-            &shm->control.inflight_frames[source][slot_index],
-            0U,
-            memory_order_release
-        );
-    }
-    if (datarouter_scheduler_wake_blocked(shm) > 0U) {
-        datarouter_signal_post(&shm->control.switch_signal);
-    }
-    for (uint32_t target = 0U; target < datarouter_active_max_ports(shm); target++) {
-        if (atomic_load_explicit(
-                &shm->control.inflight_frames[slot_index][target],
-                memory_order_acquire
-            ) != 0U) {
-            atomic_store_explicit(&entry->rx_writer_owner, 0U, memory_order_seq_cst);
-            return 0;
+        !force_dead_owner_pin_release(entry)) return 0;
+    uint32_t n = datarouter_active_max_ports(shm);
+    atomic_uint *held[DATAROUTER_MAX_PORTS * 2U];
+    uint32_t count = 0;
+    int complete = 0;
+    for (uint32_t other = 0; other < n; other++) {
+        datarouter_channel in = datarouter_rx_channel(shm, other, slot_index);
+        if (!writer_gate_for_release(shm, in.writer_owner)) goto unlock;
+        held[count++] = in.writer_owner;
+        if (other != slot_index) {
+            datarouter_channel out = datarouter_rx_channel(shm, slot_index, other);
+            if (!writer_gate_for_release(shm, out.writer_owner)) goto unlock;
+            held[count++] = out.writer_owner;
         }
     }
+    datarouter_scheduler_forget_slot(shm, slot_index);
+    datarouter_channel tx = datarouter_tx_channel(shm, slot_index);
+    datarouter_ring_reset(&tx);
+    /* Revoked/dead destinations discard their inbound frames under all writer
+     * gates and after all reader references have gone. Live destinations keep
+     * source metadata until they have consumed every outbound queue. */
+    for (uint32_t other = 0; other < n; other++) {
+        datarouter_channel rx = datarouter_rx_channel(shm, other, slot_index);
+        datarouter_ring_reset(&rx);
+    }
+    if (datarouter_scheduler_wake_blocked(shm) > 0U)
+        datarouter_signal_post_if_waiting(&shm->control.switch_signal);
+    for (uint32_t other = 0; other < n; other++) {
+        datarouter_channel rx = datarouter_rx_channel(shm, slot_index, other);
+        if (datarouter_ring_used(&rx) != 0U)
+            goto unlock;
+    }
     datarouter_registry_clear_entry(entry, slot_index);
-    atomic_store_explicit(&entry->rx_writer_owner, 0U, memory_order_seq_cst);
-    return 1;
+    complete = 1;
+unlock:
+    while (count) atomic_store_explicit(held[--count], 0U, memory_order_seq_cst);
+    return complete;
 }
 
 int datarouter_registry_release_slot(datarouter_shared_memory *shm, uint32_t slot_index) {
@@ -435,14 +383,15 @@ void datarouter_registry_cleanup_releasing(datarouter_shared_memory *shm) {
     for (uint32_t slot = 0U; slot < max_ports; slot++) {
         datarouter_registry_entry *entry = &shm->control.registry[slot];
         unsigned int state = atomic_load_explicit(&entry->state, memory_order_seq_cst);
-        unsigned int writer = atomic_load_explicit(&entry->rx_writer_owner, memory_order_seq_cst);
-        if ((state == DATAROUTER_PORT_ACTIVE || state == DATAROUTER_PORT_DRAINING) &&
-            writer && !datarouter_pid_alive((int32_t)writer)) {
-            /* A crashed producer may have left bytes/counters half-written.
-             * Retire this destination generation rather than exposing them. */
-            (void)datarouter_registry_release_slot(shm, slot);
-            continue;
+        int dead_writer = 0;
+        if (state == DATAROUTER_PORT_ACTIVE || state == DATAROUTER_PORT_DRAINING) {
+            for (uint32_t source = 0; source < max_ports; source++) {
+                datarouter_channel rx = datarouter_rx_channel(shm, source, slot);
+                unsigned int writer = atomic_load_explicit(rx.writer_owner, memory_order_seq_cst);
+                if (writer && !datarouter_pid_alive((int32_t)writer)) { dead_writer = 1; break; }
+            }
         }
+        if (dead_writer) { (void)datarouter_registry_release_slot(shm, slot); continue; }
         if (state == DATAROUTER_PORT_RELEASING) {
             (void)finalize_release(shm, slot);
             continue;
@@ -454,9 +403,9 @@ void datarouter_registry_cleanup_releasing(datarouter_shared_memory *shm) {
             !force_dead_owner_pin_release(entry)) {
             continue;
         }
-        datarouter_channel *tx = datarouter_tx_channel(shm, slot);
+        datarouter_channel tx = datarouter_tx_channel(shm, slot);
         size_t used = 0U;
-        int rc = datarouter_ring_validate(tx, &used);
+        int rc = datarouter_ring_validate(&tx, &used);
         if (rc != DATAROUTER_OK) {
             (void)datarouter_registry_release_slot(shm, slot);
         } else if (used == 0U) {

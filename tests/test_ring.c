@@ -16,83 +16,103 @@ static void require_int(int ok, const char *message) {
     }
 }
 
+#if DATAROUTER_LAYOUT_VERSION >= 18U
+typedef datarouter_channel test_channel;
+static test_channel new_channel(void) {
+    datarouter_queue_control *control = calloc(1, sizeof(*control) + DATAROUTER_RING_CAPACITY);
+    require_int(control != NULL, "allocate ring");
+    return (test_channel){&control->header, (uint8_t *)(control + 1), &control->writer_owner};
+}
+#define HEAD(c) ((c).header->head)
+#define TAIL(c) ((c).header->tail)
+#define EXISTS(c) ((c).header != NULL)
+#define FREE(c) free((c).header)
+#else
+typedef datarouter_channel *test_channel;
+static test_channel new_channel(void) { return calloc(1, sizeof(datarouter_channel)); }
+#define HEAD(c) ((c)->header.head)
+#define TAIL(c) ((c)->header.tail)
+#define EXISTS(c) ((c) != NULL)
+#define FREE(c) free(c)
+#endif
+
 static void test_counter_wraparound(void) {
-    datarouter_channel *channel = (datarouter_channel *)calloc(1U, sizeof(*channel));
-    require_int(channel != NULL, "allocate wrap ring");
+    test_channel channel = new_channel();
+    require_int(EXISTS(channel), "allocate wrap ring");
     uint32_t start = UINT32_MAX - 3U;
-    atomic_store_explicit(&channel->header.head, start, memory_order_relaxed);
-    atomic_store_explicit(&channel->header.tail, start, memory_order_relaxed);
+    atomic_store_explicit(&HEAD(channel), start, memory_order_relaxed);
+    atomic_store_explicit(&TAIL(channel), start, memory_order_relaxed);
     const uint8_t input[] = { 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U };
     uint8_t output[sizeof(input)] = {0};
-    require_int(datarouter_ring_write(channel, input, sizeof(input)) == DATAROUTER_OK, "write over u32 wrap");
-    require_int(datarouter_ring_used(channel) == sizeof(input), "used survives u32 wrap");
-    require_int(datarouter_ring_read(channel, output, sizeof(output)) == DATAROUTER_OK, "read over u32 wrap");
+    require_int(datarouter_ring_write(&channel, input, sizeof(input)) == DATAROUTER_OK, "write over u32 wrap");
+    require_int(datarouter_ring_used(&channel) == sizeof(input), "used survives u32 wrap");
+    require_int(datarouter_ring_read(&channel, output, sizeof(output)) == DATAROUTER_OK, "read over u32 wrap");
     require_int(memcmp(input, output, sizeof(input)) == 0, "u32 wrap preserves bytes");
-    free(channel);
+    FREE(channel);
 }
 
 static void test_counter_corruption(void) {
-    datarouter_channel *channel = (datarouter_channel *)calloc(1U, sizeof(*channel));
-    require_int(channel != NULL, "allocate corrupt ring");
+    test_channel channel = new_channel();
+    require_int(EXISTS(channel), "allocate corrupt ring");
     atomic_store_explicit(
-        &channel->header.head,
+        &HEAD(channel),
         (uint32_t)DATAROUTER_RING_CAPACITY + 1U,
         memory_order_relaxed
     );
-    atomic_store_explicit(&channel->header.tail, 0U, memory_order_relaxed);
+    atomic_store_explicit(&TAIL(channel), 0U, memory_order_relaxed);
     size_t used = 0U;
     uint8_t byte = 0U;
-    require_int(datarouter_ring_validate(channel, &used) == DATAROUTER_ERR_PROTOCOL, "corrupt counters rejected");
-    require_int(datarouter_ring_used(channel) == SIZE_MAX, "corrupt used is explicit");
-    require_int(datarouter_ring_write(channel, &byte, 1U) == DATAROUTER_ERR_PROTOCOL, "corrupt write rejected");
-    require_int(datarouter_ring_read(channel, &byte, 1U) == DATAROUTER_ERR_PROTOCOL, "corrupt read rejected");
-    free(channel);
+    require_int(datarouter_ring_validate(&channel, &used) == DATAROUTER_ERR_PROTOCOL, "corrupt counters rejected");
+    require_int(datarouter_ring_used(&channel) == SIZE_MAX, "corrupt used is explicit");
+    require_int(datarouter_ring_write(&channel, &byte, 1U) == DATAROUTER_ERR_PROTOCOL, "corrupt write rejected");
+    require_int(datarouter_ring_read(&channel, &byte, 1U) == DATAROUTER_ERR_PROTOCOL, "corrupt read rejected");
+    FREE(channel);
 }
 
 static void test_direct_transfer(void) {
-    datarouter_channel *source = (datarouter_channel *)calloc(1U, sizeof(*source));
-    datarouter_channel *target = (datarouter_channel *)calloc(1U, sizeof(*target));
-    require_int(source != NULL && target != NULL, "allocate transfer rings");
+    test_channel source = new_channel();
+    test_channel target = new_channel();
+    require_int(EXISTS(source) && EXISTS(target), "allocate transfer rings");
     uint32_t source_start = (uint32_t)DATAROUTER_RING_CAPACITY - 4U;
     uint32_t target_start = (uint32_t)DATAROUTER_RING_CAPACITY - 2U;
-    atomic_store_explicit(&source->header.head, source_start, memory_order_relaxed);
-    atomic_store_explicit(&source->header.tail, source_start, memory_order_relaxed);
-    atomic_store_explicit(&target->header.head, target_start, memory_order_relaxed);
-    atomic_store_explicit(&target->header.tail, target_start, memory_order_relaxed);
+    atomic_store_explicit(&HEAD(source), source_start, memory_order_relaxed);
+    atomic_store_explicit(&TAIL(source), source_start, memory_order_relaxed);
+    atomic_store_explicit(&HEAD(target), target_start, memory_order_relaxed);
+    atomic_store_explicit(&TAIL(target), target_start, memory_order_relaxed);
 
     const uint8_t old_header[DATAROUTER_FRAME_HEADER_SIZE] = { 9U, 9U, 9U, 9U, 4U, 0U, 0U, 0U };
     const uint8_t new_header[DATAROUTER_FRAME_HEADER_SIZE] = { 1U, 2U, 3U, 4U, 4U, 0U, 0U, 0U };
     const uint8_t payload[] = { 7U, 8U, 9U, 10U };
     require_int(
-        datarouter_ring_write_parts(source, old_header, sizeof(old_header), payload, sizeof(payload)) == DATAROUTER_OK,
+        datarouter_ring_write_parts(&source, old_header, sizeof(old_header), payload, sizeof(payload)) == DATAROUTER_OK,
         "prepare wrapped source frame"
     );
     require_int(
         datarouter_ring_transfer_frame(
-            source,
-            target,
+            &source,
+            &target,
             new_header,
             sizeof(new_header),
             sizeof(new_header) + sizeof(payload)
         ) == DATAROUTER_OK,
         "direct wrapped transfer"
     );
-    require_int(datarouter_ring_used(source) == 0U, "transfer consumes source atomically");
+    require_int(datarouter_ring_used(&source) == 0U, "transfer consumes source atomically");
     require_int(
-        datarouter_ring_used(target) == sizeof(new_header) + sizeof(payload),
+        datarouter_ring_used(&target) == sizeof(new_header) + sizeof(payload),
         "transfer publishes complete target frame"
     );
     uint8_t output[sizeof(new_header) + sizeof(payload)] = {0};
-    require_int(datarouter_ring_read(target, output, sizeof(output)) == DATAROUTER_OK, "read transferred frame");
+    require_int(datarouter_ring_read(&target, output, sizeof(output)) == DATAROUTER_OK, "read transferred frame");
     require_int(memcmp(output, new_header, sizeof(new_header)) == 0, "transfer rewrites header");
     require_int(memcmp(output + sizeof(new_header), payload, sizeof(payload)) == 0, "transfer preserves payload");
-    free(target);
-    free(source);
+    FREE(target);
+    FREE(source);
 }
 
 #ifndef _WIN32
 typedef struct {
-    datarouter_channel *channel;
+    test_channel channel;
     const uint8_t *header;
     const uint8_t *payload;
     size_t payload_len;
@@ -104,7 +124,7 @@ static void *publish_frame(void *opaque) {
     publish_args *args = (publish_args *)opaque;
     atomic_store_explicit(&args->started, 1, memory_order_release);
     args->rc = datarouter_ring_write_parts(
-        args->channel,
+        &args->channel,
         args->header,
         DATAROUTER_FRAME_HEADER_SIZE,
         args->payload,
@@ -114,9 +134,9 @@ static void *publish_frame(void *opaque) {
 }
 
 static void test_complete_frame_visibility(void) {
-    datarouter_channel *channel = (datarouter_channel *)calloc(1U, sizeof(*channel));
+    test_channel channel = new_channel();
     uint8_t *payload = (uint8_t *)malloc(DATAROUTER_RING_CAPACITY / 2U);
-    require_int(channel != NULL && payload != NULL, "allocate visibility fixture");
+    require_int(EXISTS(channel) && payload != NULL, "allocate visibility fixture");
     memset(payload, 0x5a, DATAROUTER_RING_CAPACITY / 2U);
     uint32_t payload_len = (uint32_t)(DATAROUTER_RING_CAPACITY / 2U);
     uint8_t header[DATAROUTER_FRAME_HEADER_SIZE] = {
@@ -140,7 +160,7 @@ static void test_complete_frame_visibility(void) {
     }
     size_t complete_len = DATAROUTER_FRAME_HEADER_SIZE + (size_t)payload_len;
     for (;;) {
-        size_t used = datarouter_ring_used(channel);
+        size_t used = datarouter_ring_used(&channel);
         require_int(used == 0U || used == complete_len, "reader never observes a half frame");
         if (used == complete_len) {
             break;
@@ -149,12 +169,12 @@ static void test_complete_frame_visibility(void) {
     require_int(pthread_join(writer, NULL) == 0, "join visibility writer");
     require_int(args.rc == DATAROUTER_OK, "visibility write succeeds");
     free(payload);
-    free(channel);
+    FREE(channel);
 }
 #endif
 
 int main(void) {
-    datarouter_channel channel;
+    test_channel channel = new_channel();
     datarouter_ring_reset(&channel);
     require_int(datarouter_ring_used(&channel) == 0U, "new ring is empty");
 
@@ -190,6 +210,7 @@ int main(void) {
     require_int(written > 0U, "filled bytes");
     require_int(datarouter_ring_write(&channel, fill, sizeof(fill)) == DATAROUTER_ERR_FULL, "full ring");
 
+    FREE(channel);
     test_counter_wraparound();
     test_counter_corruption();
     test_direct_transfer();

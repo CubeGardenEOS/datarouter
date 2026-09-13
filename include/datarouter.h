@@ -24,7 +24,7 @@ extern "C" {
 #define DATAROUTER_DEFAULT_SHM_NAME "/datarouter"
 #define DATAROUTER_MAX_PORTS 64
 #define DATAROUTER_DEFAULT_MAX_PORTS 4
-#define DATAROUTER_CHANNEL_COUNT (DATAROUTER_DEFAULT_MAX_PORTS * 2)
+#define DATAROUTER_CHANNEL_COUNT (DATAROUTER_DEFAULT_MAX_PORTS * (DATAROUTER_DEFAULT_MAX_PORTS + 1))
 #ifndef DATAROUTER_CHANNEL_SIZE
 #define DATAROUTER_CHANNEL_SIZE 524288U
 #endif
@@ -47,6 +47,9 @@ extern "C" {
 /* ---- KEEP 区域（layout 17） ---- */
 #define DATAROUTER_KEEP_DEFAULT_SIZE (8u * 1024u * 1024u) /* 8 MiB */
 #define DATAROUTER_KEEP_KEY_MAX 256u
+
+/* Return the calling thread's dedicated CPU lease and restore its affinity. */
+void datarouter_thread_detach(void);
 
 typedef struct datarouter_port datarouter_port;
 

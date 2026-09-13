@@ -14,7 +14,7 @@
 #endif
 static int dr_resource;
 static zend_class_entry *dr_exception;
-typedef struct { datarouter_frontend *port; pid_t owner; } dr_handle;
+typedef struct { datarouter_frontend *port; pid_t owner; size_t recv_capacity; } dr_handle;
 static void fail(int code) {
     zend_throw_exception_ex(dr_exception, code, "DataRouter error=%d", code);
 }
@@ -50,7 +50,7 @@ PHP_FUNCTION(datarouter_open) {
     datarouter_frontend *p = NULL;
     int rc = datarouter_frontend_open_v3(&o, sizeof(o), DATAROUTER_FRONTEND_ABI_VERSION_V3, &p);
     if (rc) { fail(rc); RETURN_THROWS(); }
-    dr_handle *h = emalloc(sizeof(*h)); h->port = p; h->owner = getpid();
+    dr_handle *h = emalloc(sizeof(*h)); h->port = p; h->owner = getpid(); h->recv_capacity = 4096;
     RETURN_RES(zend_register_resource(h, dr_resource));
 }
 PHP_FUNCTION(datarouter_close) {
@@ -74,7 +74,7 @@ PHP_FUNCTION(datarouter_recv) {
     ZEND_PARSE_PARAMETERS_START(1, 2) Z_PARAM_RESOURCE(r) Z_PARAM_OPTIONAL Z_PARAM_LONG(timeout) ZEND_PARSE_PARAMETERS_END();
     dr_handle *h = handle(r, 0); if (!h || !timeout_ok(timeout)) RETURN_THROWS();
     datarouter_message_info info = {0};
-    size_t cap = 4096;
+    size_t cap = h->recv_capacity;
     zend_string *s = zend_string_alloc(cap, 0);
     int rc = datarouter_frontend_recv(h->port, ZSTR_VAL(s), cap, &info, timeout);
     if (rc == DATAROUTER_ERR_PAYLOAD_TOO_LARGE) {
@@ -83,6 +83,7 @@ PHP_FUNCTION(datarouter_recv) {
         rc = datarouter_frontend_recv(h->port, ZSTR_VAL(s), cap, &info, timeout);
     }
     if (rc) { zend_string_release(s); fail(rc); RETURN_THROWS(); }
+    if (info.len > h->recv_capacity) h->recv_capacity = info.len;
     ZSTR_LEN(s) = info.len; ZSTR_VAL(s)[info.len] = 0;
     array_init(return_value); add_assoc_str(return_value, "data", s);
     add_assoc_string(return_value, "source", info.source);
@@ -109,15 +110,17 @@ PHP_FUNCTION(datarouter_pack) {
 }
 PHP_FUNCTION(datarouter_unpack) {
     char *wire; size_t n; ZEND_PARSE_PARAMETERS_START(1, 1) Z_PARAM_STRING(wire, n) ZEND_PARSE_PARAMETERS_END();
-    datarouter_message *m = NULL; int rc = datarouter_msg_unpack(wire, n, &m);
+    datarouter_frame_layout layout;
+    int rc = datarouter_protocol_frame_layout((const uint8_t *)wire, n, &layout);
     if (rc) { fail(rc); RETURN_THROWS(); }
-    array_init(return_value); add_assoc_long(return_value, "type", datarouter_msg_type(m));
-    add_assoc_long(return_value, "flags", datarouter_msg_flags(m));
-    const char *body = (const char *)datarouter_msg_body(m);
-    const char *vars = (const char *)datarouter_msg_var_data(m);
-    add_assoc_stringl(return_value, "body", body ? body : "", datarouter_msg_body_len(m));
-    add_assoc_stringl(return_value, "var_data", vars ? vars : "", datarouter_msg_var_data_len(m));
-    datarouter_msg_free(m);
+    const char *vars = wire + 8;
+    if (!datarouter_protocol_validate_tlvs((const uint8_t *)vars, layout.var_data_length)) {
+        fail(DATAROUTER_ERR_PROTOCOL); RETURN_THROWS();
+    }
+    array_init(return_value); add_assoc_long(return_value, "type", layout.message_type);
+    add_assoc_long(return_value, "flags", layout.flags);
+    add_assoc_stringl(return_value, "body", vars + layout.var_data_length, layout.body_length);
+    add_assoc_stringl(return_value, "var_data", vars, layout.var_data_length);
 }
 PHP_FUNCTION(datarouter_max_payload) { ZEND_PARSE_PARAMETERS_NONE(); RETURN_LONG(datarouter_max_app_payload()); }
 ZEND_BEGIN_ARG_INFO_EX(a_open, 0, 0, 2)
