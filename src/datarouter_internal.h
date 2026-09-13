@@ -293,6 +293,11 @@ struct datarouter_port {
      * where multiple application threads may call datarouter_recv on the
      * same SPSC RX ring without a reader thread. Process-local. */
     datarouter_mutex rx_mutex;
+    /* Coordinates lock-free poll snapshots with authoritative ring reads.
+     * Process-local: poll readers briefly announce themselves; a receiver
+     * waits for those snapshots before touching the ring. */
+    atomic_uint rx_probe_readers;
+    atomic_uint rx_consumer_active;
     atomic_ullong keep_ref_seq; /* outstanding C KEEP reference, zero if absent */
     uint8_t *drain_buffer;
     size_t drain_buffer_capacity;

@@ -31,7 +31,7 @@ class Processes:
         self.thread = threading.Thread(target=self.watch, daemon=True)
         self.thread.start()
     def watch(self):
-        while not self.done.wait(.02):
+        while not self.done.wait(.1):
             self.scan()
     @staticmethod
     def identity(pid):
@@ -144,7 +144,8 @@ class Processes:
         path = Path('/dev/shm') / shm[1:]
         if path.exists(): raise RuntimeError('shared memory collision')
         self.shm.add(path)
-        args = [ROOT/'build/datarouter-switch', '--name', shm, '--allow-any', '--max-ports', '8', '--ttl-ms', '60000']
+        pinned_exec = ROOT.parent / 'datarouter-benchmark/tools/pinned_exec.py'
+        args = [sys.executable, pinned_exec, '4,5', '-', ROOT/'build/datarouter-switch', '--name', shm, '--allow-any', '--max-ports', '8', '--ttl-ms', '60000']
         if token: args += ['--token-stdin']
         if name=='restart-switch':args += ['--reap-dead-processes']
         p = self.spawn(args, name, stdin_data=b'secret' if token else None)
@@ -318,7 +319,8 @@ def restart_test(proc, php):
         (directory/'down').write_text('1');marker('closed')
         proc.stop(sw)
         Path('/dev/shm',shm[1:]).unlink(missing_ok=True)
-        sw=proc.spawn([ROOT/'build/datarouter-switch','--name',shm,'--allow-any','--max-ports','8'],'restart-new-switch')
+        pinned_exec = ROOT.parent / 'datarouter-benchmark/tools/pinned_exec.py'
+        sw=proc.spawn([sys.executable, pinned_exec, '4,5', '-', ROOT/'build/datarouter-switch','--name',shm,'--allow-any','--max-ports','8'],'restart-new-switch')
         end=time.monotonic()+5
         while not Path('/dev/shm',shm[1:]).exists():
             if sw.poll() is not None or time.monotonic()>end:raise RuntimeError('restart failed')

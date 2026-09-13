@@ -185,6 +185,13 @@ static void activate_test_entry_pid(datarouter_shared_memory *shm, uint32_t slot
     entry->process_start_id = process_start_id;
     datarouter_registry_store_name(entry, service);
     atomic_store_explicit(&entry->last_active_ns, datarouter_now_ns(), memory_order_release);
+    /* Mirror the switch's activation invariant (switch.c binds io_users to the
+     * route before publishing ACTIVE); pins are rejected otherwise. */
+    atomic_store_explicit(
+        &entry->io_users,
+        (unsigned long long)atomic_load_explicit(&entry->route_id, memory_order_relaxed) << 32U,
+        memory_order_release
+    );
     atomic_store_explicit(&entry->state, DATAROUTER_PORT_ACTIVE, memory_order_release);
 }
 
@@ -506,6 +513,153 @@ static void test_concurrent_send_from_shared_port(void) {
     unlink_shm(name);
 }
 #endif
+
+#ifndef _WIN32
+#define POLL_PROBE_FRAMES 400U
+
+/* datarouter_poll is a lock-free read-only RX probe: it must never advance
+ * the ring tail, so hammering it from a foreign thread while another thread
+ * waits/recvs on the same port must neither corrupt the SPSC ring nor lose
+ * frames (this pins the invariant that lets the wait spin loop stay off the
+ * RX mutex). */
+typedef struct poll_probe_args {
+    datarouter_port *port;
+    atomic_int *stop;
+    int rc;
+    unsigned long polls;
+    unsigned long poll_bad;
+} poll_probe_args;
+
+typedef struct poll_probe_receiver_args {
+    datarouter_port *receiver;
+    unsigned char seen[POLL_PROBE_FRAMES];
+    size_t received;
+    int rc;
+} poll_probe_receiver_args;
+
+static void *poll_probe_main(void *arg) {
+    poll_probe_args *probe = (poll_probe_args *)arg;
+    probe->rc = DATAROUTER_OK;
+    while (!atomic_load_explicit(probe->stop, memory_order_acquire)) {
+        int rc = datarouter_poll(probe->port);
+        probe->polls++;
+        if (rc != DATAROUTER_OK && rc != DATAROUTER_ERR_AGAIN) {
+            probe->poll_bad++;
+            probe->rc = rc;
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void *poll_probe_receiver_main(void *arg) {
+    poll_probe_receiver_args *receiver = (poll_probe_receiver_args *)arg;
+    receiver->rc = DATAROUTER_OK;
+    uint64_t started = datarouter_now_ns();
+
+    while (receiver->received < POLL_PROBE_FRAMES) {
+        if (datarouter_now_ns() - started > 10000000000ULL) {
+            receiver->rc = DATAROUTER_ERR_TIMEOUT;
+            return NULL;
+        }
+        int wait_rc = datarouter_wait(receiver->receiver, 50U);
+        if (wait_rc != DATAROUTER_OK && wait_rc != DATAROUTER_ERR_TIMEOUT) {
+            receiver->rc = wait_rc;
+            return NULL;
+        }
+        for (;;) {
+            char payload[64];
+            datarouter_message_info info;
+            int rc = datarouter_recv(receiver->receiver, payload, sizeof(payload), &info);
+            if (rc == DATAROUTER_ERR_AGAIN) {
+                break;
+            }
+            if (rc != DATAROUTER_OK) {
+                receiver->rc = rc;
+                return NULL;
+            }
+            unsigned int seq = 0U;
+            require_int(sscanf(payload, "seq=%u", &seq) == 1, "poll probe payload format");
+            require_int(seq < POLL_PROBE_FRAMES, "poll probe sequence range");
+            require_int(receiver->seen[seq] == 0U, "poll probe duplicate payload");
+            receiver->seen[seq] = 1U;
+            receiver->received++;
+        }
+    }
+    return NULL;
+}
+
+static void test_poll_probe_concurrent_with_recv(void) {
+    const char *name = "/datarouter-poll-probe-test";
+    unlink_shm(name);
+    pid_t sw = start_switch(name, 5000U);
+
+    datarouter_options opts = {0};
+    opts.shm_name = name;
+    opts.timeout_ms = 1000U;
+
+    datarouter_port *core = NULL;
+    datarouter_port *ml = NULL;
+    require_int(datarouter_open(&opts, &core) == DATAROUTER_OK, "open poll probe core");
+    require_int(datarouter_open(&opts, &ml) == DATAROUTER_OK, "open poll probe ml");
+    logon(core, "Core");
+    logon(ml, "MLHelper");
+
+    atomic_int stop;
+    atomic_init(&stop, 0);
+    poll_probe_args probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.port = core;
+    probe.stop = &stop;
+
+    pthread_t probe_thread;
+    require_int(pthread_create(&probe_thread, NULL, poll_probe_main, &probe) == 0,
+        "create poll probe thread");
+
+    poll_probe_receiver_args receiver_args;
+    memset(&receiver_args, 0, sizeof(receiver_args));
+    receiver_args.receiver = core;
+    pthread_t receiver_thread;
+    require_int(pthread_create(&receiver_thread, NULL, poll_probe_receiver_main, &receiver_args) == 0,
+        "create poll probe receiver");
+
+    for (unsigned int seq = 0U; seq < POLL_PROBE_FRAMES; seq++) {
+        char payload[64];
+        int written = snprintf(payload, sizeof(payload), "seq=%u", seq);
+        require_int(written > 0, "format poll probe payload");
+        uint64_t started = datarouter_now_ns();
+        for (;;) {
+            int rc = datarouter_send(ml, "Core", payload, (size_t)written + 1U);
+            if (rc == DATAROUTER_OK) {
+                break;
+            }
+            if (rc != DATAROUTER_ERR_FULL || datarouter_now_ns() - started > 5000000000ULL) {
+                require_int(rc == DATAROUTER_OK, "poll probe sender succeeds");
+            }
+            datarouter_sleep_us(500U);
+        }
+    }
+
+    require_int(pthread_join(receiver_thread, NULL) == 0, "join poll probe receiver");
+    atomic_store_explicit(&stop, 1, memory_order_release);
+    require_int(pthread_join(probe_thread, NULL) == 0, "join poll probe thread");
+
+    require_int(receiver_args.rc == DATAROUTER_OK, "poll probe receiver succeeds");
+    require_int(receiver_args.received == POLL_PROBE_FRAMES, "poll probe frame count");
+    for (unsigned int seq = 0U; seq < POLL_PROBE_FRAMES; seq++) {
+        require_int(receiver_args.seen[seq] == 1U, "poll probe payload delivered");
+    }
+    require_int(probe.rc == DATAROUTER_OK, "poll probe status");
+    require_int(probe.poll_bad == 0UL, "poll probe never reports transport errors");
+    require_int(probe.polls > 0UL, "poll probe observed traffic");
+
+    datarouter_close(ml);
+    datarouter_close(core);
+    stop_switch(sw);
+    unlink_shm(name);
+}
+#endif
+
 
 static void test_wait_timeout(void) {
     const char *name = "/datarouter-wait-test";
@@ -1605,10 +1759,54 @@ static void test_nonzero_short_frames_are_isolated(void) {
     free(shm);
 }
 
+static void test_poll_probe_on_skewed_frame_never_reports_corruption(void) {
+    size_t size = datarouter_shared_memory_size(4U);
+    datarouter_shared_memory *shm = (datarouter_shared_memory *)calloc(1U, size);
+    require_int(shm != NULL, "allocate probe shm");
+    require_int(datarouter_init_shared_memory(shm, 4U) == DATAROUTER_OK, "init probe shm");
+    activate_test_entry(shm, 0U, "Core");
+
+    datarouter_port core;
+    init_test_port(&core, shm, 0U, "Core");
+
+    datarouter_channel *rx = datarouter_rx_channel(shm, 0U);
+
+    /* 1. Partial/skewed bytes in ring (fewer than header size):
+     * poll must return DATAROUTER_ERR_AGAIN and must NOT mark slot corrupt! */
+    atomic_store_explicit(&rx->header.tail, 0U, memory_order_relaxed);
+    atomic_store_explicit(&rx->header.head, 3U, memory_order_relaxed);
+    require_int(datarouter_poll(&core) == DATAROUTER_ERR_AGAIN, "poll probe skewed bytes returns AGAIN");
+    require_int(atomic_load_explicit(&shm->control.corrupt_slot_mask, memory_order_acquire) == 0ULL,
+                "poll probe skewed bytes never marks corrupt");
+
+    /* 2. Malformed frame header with source_route == 0 (transient partial write):
+     * poll must return DATAROUTER_ERR_AGAIN and must NOT mark slot corrupt! */
+    atomic_store_explicit(&rx->header.tail, 0U, memory_order_relaxed);
+    atomic_store_explicit(&rx->header.head, (uint32_t)DATAROUTER_FRAME_HEADER_SIZE, memory_order_relaxed);
+    memset(rx->data, 0, DATAROUTER_FRAME_HEADER_SIZE);
+    require_int(datarouter_poll(&core) == DATAROUTER_ERR_AGAIN, "poll probe malformed header returns AGAIN");
+    require_int(atomic_load_explicit(&shm->control.corrupt_slot_mask, memory_order_acquire) == 0ULL,
+                "poll probe malformed header never marks corrupt");
+
+    /* 3. Incomplete frame body (head advanced less than frame_len):
+     * poll must return DATAROUTER_ERR_AGAIN and must NOT mark slot corrupt! */
+    uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
+    encode_test_header(header, 65U, 128U);
+    memcpy(rx->data, header, sizeof(header));
+    atomic_store_explicit(&rx->header.head, (uint32_t)DATAROUTER_FRAME_HEADER_SIZE + 10U, memory_order_relaxed);
+    require_int(datarouter_poll(&core) == DATAROUTER_ERR_AGAIN, "poll probe partial body returns AGAIN");
+    require_int(atomic_load_explicit(&shm->control.corrupt_slot_mask, memory_order_acquire) == 0ULL,
+                "poll probe partial body never marks corrupt");
+
+    free(shm);
+}
+
 int main(void) {
     test_route_and_allowlist();
 #ifndef _WIN32
     test_concurrent_send_from_shared_port();
+    test_poll_probe_concurrent_with_recv();
+    test_poll_probe_on_skewed_frame_never_reports_corruption();
 #endif
     test_wait_timeout();
     test_active_service_not_replaced_before_ttl();

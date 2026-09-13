@@ -124,6 +124,36 @@ static int port_rx_mutex_lock(datarouter_port *port) {
 #endif
 }
 
+static int port_rx_probe_begin(datarouter_port *port) {
+    if (!port) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+    atomic_fetch_add_explicit(&port->rx_probe_readers, 1U, memory_order_seq_cst);
+    if (atomic_load_explicit(&port->rx_consumer_active, memory_order_seq_cst) != 0U) {
+        atomic_fetch_sub_explicit(&port->rx_probe_readers, 1U, memory_order_seq_cst);
+        return DATAROUTER_ERR_AGAIN;
+    }
+    return DATAROUTER_OK;
+}
+
+static void port_rx_probe_end(datarouter_port *port) {
+    if (!port) {
+        return;
+    }
+    atomic_fetch_sub_explicit(&port->rx_probe_readers, 1U, memory_order_seq_cst);
+}
+
+static void port_rx_consumer_begin(datarouter_port *port) {
+    atomic_store_explicit(&port->rx_consumer_active, 1U, memory_order_seq_cst);
+    while (atomic_load_explicit(&port->rx_probe_readers, memory_order_seq_cst) != 0U) {
+        datarouter_yield();
+    }
+}
+
+static void port_rx_consumer_end(datarouter_port *port) {
+    atomic_store_explicit(&port->rx_consumer_active, 0U, memory_order_seq_cst);
+}
+
 static void port_rx_mutex_unlock(datarouter_port *port) {
     if (!port) {
         return;
@@ -236,43 +266,65 @@ static void touch_self(datarouter_port *port) {
 }
 
 static int channel_has_complete_frame(datarouter_port *port, datarouter_channel *rx) {
-    size_t used = 0U;
-    int rc = datarouter_ring_validate(rx, &used);
-    if (rc != DATAROUTER_OK) {
-        if (rc == DATAROUTER_ERR_PROTOCOL) {
-            report_corrupt_self(port);
+    (void)port;
+    if (!rx) {
+        return DATAROUTER_ERR_INVALID_ARGUMENT;
+    }
+
+    /* Read-only probe is strictly non-authoritative. Concurrent recv/drain
+     * calls on the same port may advance tail during or between cursor loads
+     * and ring peek, producing a transient torn snapshot. We verify that tail
+     * remained stable across the snapshot; if it changed, retry. If bounds
+     * still appear inconsistent or partial, return DATAROUTER_ERR_AGAIN. NEVER
+     * report corruption or tear down the port from this probe; authoritative
+     * validation belongs in recv_frame_unchecked under port_rx_mutex. */
+    for (int retry = 0; retry < 3; retry++) {
+        uint32_t tail_before = atomic_load_explicit(&rx->header.tail, memory_order_acquire);
+        uint32_t head = atomic_load_explicit(&rx->header.head, memory_order_acquire);
+        uint32_t tail_after = atomic_load_explicit(&rx->header.tail, memory_order_acquire);
+
+        if (tail_before != tail_after) {
+            continue;
         }
-        return rc;
-    }
-    if (used < DATAROUTER_FRAME_HEADER_SIZE) {
-        if (used != 0U) {
-            report_corrupt_self(port);
-            return DATAROUTER_ERR_PROTOCOL;
+
+        size_t used = (size_t)(uint32_t)(head - tail_after);
+        if (used > DATAROUTER_RING_CAPACITY || used < DATAROUTER_FRAME_HEADER_SIZE) {
+            return DATAROUTER_ERR_AGAIN;
         }
-        return DATAROUTER_ERR_AGAIN;
-    }
-    uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
-    rc = datarouter_ring_peek(rx, header, sizeof(header));
-    if (rc != DATAROUTER_OK) {
-        if (rc == DATAROUTER_ERR_PROTOCOL) {
-            report_corrupt_self(port);
+
+        uint8_t header[DATAROUTER_FRAME_HEADER_SIZE];
+        uint32_t pos = tail_after & (DATAROUTER_RING_CAPACITY - 1U);
+        if (DATAROUTER_RING_CAPACITY - (size_t)pos >= DATAROUTER_FRAME_HEADER_SIZE) {
+            memcpy(header, &rx->data[pos], DATAROUTER_FRAME_HEADER_SIZE);
+        } else {
+            size_t first = DATAROUTER_RING_CAPACITY - (size_t)pos;
+            memcpy(header, &rx->data[pos], first);
+            memcpy(header + first, rx->data, DATAROUTER_FRAME_HEADER_SIZE - first);
         }
-        return rc;
+
+        uint32_t tail_verify = atomic_load_explicit(&rx->header.tail, memory_order_acquire);
+        if (tail_verify != tail_after) {
+            continue;
+        }
+
+        uint32_t source_route = 0U;
+        uint32_t payload_len = 0U;
+        decode_frame_header(header, &source_route, &payload_len);
+
+        if (source_route == 0U ||
+            payload_len > (uint32_t)(DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)) {
+            return DATAROUTER_ERR_AGAIN;
+        }
+
+        size_t frame_len = DATAROUTER_FRAME_HEADER_SIZE + (size_t)payload_len;
+        if (used < frame_len) {
+            return DATAROUTER_ERR_AGAIN;
+        }
+
+        return DATAROUTER_OK;
     }
-    uint32_t source_route = 0U;
-    uint32_t payload_len = 0U;
-    decode_frame_header(header, &source_route, &payload_len);
-    if (source_route == 0U ||
-        payload_len > (uint32_t)(DATAROUTER_RING_CAPACITY - DATAROUTER_FRAME_HEADER_SIZE)) {
-        report_corrupt_self(port);
-        return DATAROUTER_ERR_PROTOCOL;
-    }
-    size_t frame_len = DATAROUTER_FRAME_HEADER_SIZE + (size_t)payload_len;
-    if (used < frame_len) {
-        report_corrupt_self(port);
-        return DATAROUTER_ERR_PROTOCOL;
-    }
-    return DATAROUTER_OK;
+
+    return DATAROUTER_ERR_AGAIN;
 }
 
 int datarouter_frame_len(datarouter_port *port, size_t *payload_len) {
@@ -289,6 +341,7 @@ int datarouter_frame_len(datarouter_port *port, size_t *payload_len) {
         datarouter_registry_unpin(self);
         return lock_rc;
     }
+    port_rx_consumer_begin(port);
     datarouter_touch_entry(self, datarouter_now_ns());
     datarouter_channel *rx = datarouter_rx_channel(port->shm, port->slot_index);
     size_t used = 0U;
@@ -317,6 +370,7 @@ int datarouter_frame_len(datarouter_port *port, size_t *payload_len) {
     if (rc == DATAROUTER_ERR_PROTOCOL) {
         report_corrupt_self(port);
     }
+    port_rx_consumer_end(port);
     port_rx_mutex_unlock(port);
     datarouter_registry_unpin(self);
     return rc;
@@ -726,6 +780,8 @@ int datarouter_open(const datarouter_options *options, datarouter_port **out) {
     port->switch_start_id = mapping.shm->control.switch_start_id;
     atomic_init(&port->last_switch_identity_check_ns, datarouter_now_ns());
     atomic_init(&port->switch_dead, 0U);
+    atomic_init(&port->rx_probe_readers, 0U);
+    atomic_init(&port->rx_consumer_active, 0U);
     uint32_t identity_uid = 0U;
     rc = datarouter_process_identity((pid_t)current_pid(), &identity_uid, &port->process_start_id);
     if (rc != DATAROUTER_OK || identity_uid != current_uid()) {
@@ -1002,7 +1058,9 @@ int datarouter_recv(
         datarouter_registry_unpin(self);
         return rx_lock_rc;
     }
+    port_rx_consumer_begin(port);
     int rc = recv_frame_unchecked(port, rx, buffer, capacity, info, 1);
+    port_rx_consumer_end(port);
     port_rx_mutex_unlock(port);
     datarouter_registry_unpin(self);
     return rc;
@@ -1017,10 +1075,12 @@ int datarouter_poll(datarouter_port *port) {
         return DATAROUTER_ERR_NOT_FOUND;
     }
     datarouter_touch_entry(self, datarouter_now_ns());
-    int rc = port_rx_mutex_lock(port);
+    /* Poll only announces a short read-only snapshot. If an authoritative
+     * consumer is active, skip this iteration; the wait loop retries. */
+    int rc = port_rx_probe_begin(port);
     if (rc == DATAROUTER_OK) {
         rc = channel_has_complete_frame(port, datarouter_rx_channel(port->shm, port->slot_index));
-        port_rx_mutex_unlock(port);
+        port_rx_probe_end(port);
     }
     datarouter_registry_unpin(self);
     return rc;
@@ -1082,7 +1142,7 @@ int datarouter_wait(datarouter_port *port, uint32_t timeout_ms) {
             signal_sequence,
             wait_ms
         );
-        if (!switch_identity_alive(port, 1)) {
+        if (!switch_identity_alive(port, 0)) {
             return DATAROUTER_ERR_NOT_FOUND;
         }
         touch_self(port);
@@ -1142,6 +1202,7 @@ int datarouter_drain(
         datarouter_registry_unpin(self);
         return rx_lock_rc;
     }
+    port_rx_consumer_begin(port);
     while (*drained < max_frames) {
         datarouter_message_info info;
         int rc = recv_frame_unchecked(
@@ -1170,6 +1231,7 @@ int datarouter_drain(
     if (*drained > 0U && datarouter_scheduler_wake_blocked(port->shm) > 0U) {
         datarouter_signal_post(&port->shm->control.switch_signal);
     }
+    port_rx_consumer_end(port);
     port_rx_mutex_unlock(port);
     datarouter_registry_unpin(self);
     return *drained > 0U && last_rc == DATAROUTER_ERR_AGAIN ? DATAROUTER_OK : last_rc;
