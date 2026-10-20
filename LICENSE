@@ -1,185 +1,166 @@
-CubeGarden 通则软件许可（CGSGL）
-================================
+                   GNU LESSER GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
 
-CubeGarden General Software License
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
 
-Version 2 — 2026-08-16
 
-本通则许可（以下简称「本通则」）是 CubeGarden Studio（以下简称「许可方」）
-对其发布的全部软件项目、组件、库、文档与相关材料（以下简称「软件」）适用的
-统一许可条款。本通则取代此前各项目随附的 Version 1 协议文本；各仓库/产品可在
-随附的 NOTICE 或 manifest 中声明具体适用对象与授权范围，未另行声明时一律适用
-本通则全部条款。
+  This version of the GNU Lesser General Public License incorporates
+the terms and conditions of version 3 of the GNU General Public
+License, supplemented by the additional permissions listed below.
 
-许可方：CubeGarden Studio
-被许可方：获得软件合法副本的个人或实体（以下简称「被许可方」）
+  0. Additional Definitions.
+
+  As used herein, "this License" refers to version 3 of the GNU Lesser
+General Public License, and the "GNU GPL" refers to version 3 of the GNU
+General Public License.
+
+  "The Library" refers to a covered work governed by this License,
+other than an Application or a Combined Work as defined below.
+
+  An "Application" is any work that makes use of an interface provided
+by the Library, but which is not otherwise based on the Library.
+Defining a subclass of a class defined by the Library is deemed a mode
+of using an interface provided by the Library.
+
+  A "Combined Work" is a work produced by combining or linking an
+Application with the Library.  The particular version of the Library
+with which the Combined Work was made is also called the "Linked
+Version".
+
+  The "Minimal Corresponding Source" for a Combined Work means the
+Corresponding Source for the Combined Work, excluding any source code
+for portions of the Combined Work that, considered in isolation, are
+based on the Application, and not on the Linked Version.
+
+  The "Corresponding Application Code" for a Combined Work means the
+object code and/or source code for the Application, including any data
+and utility programs needed for reproducing the Combined Work from the
+Application, but excluding the System Libraries of the Combined Work.
+
+  1. Exception to Section 3 of the GNU GPL.
+
+  You may convey a covered work under sections 3 and 4 of this License
+without being bound by section 3 of the GNU GPL.
+
+  2. Conveying Modified Versions.
+
+  If you modify a copy of the Library, and, in your modifications, a
+facility refers to a function or data to be supplied by an Application
+that uses the facility (other than as an argument passed when the
+facility is invoked), then you may convey a copy of the modified
+version:
+
+   a) under this License, provided that you make a good faith effort to
+   ensure that, in the event an Application does not supply the
+   function or data, the facility still operates, and performs
+   whatever part of its purpose remains meaningful, or
+
+   b) under the GNU GPL, with none of the additional permissions of
+   this License applicable to that copy.
+
+  3. Object Code Incorporating Material from Library Header Files.
+
+  The object code form of an Application may incorporate material from
+a header file that is part of the Library.  You may convey such object
+code under terms of your choice, provided that, if the incorporated
+material is not limited to numerical parameters, data structure
+layouts and accessors, or small macros, inline functions and templates
+(ten or fewer lines in length), you do both of the following:
+
+   a) Give prominent notice with each copy of the object code that the
+   Library is used in it and that the Library and its use are
+   covered by this License.
+
+   b) Accompany the object code with a copy of the GNU GPL and this license
+   document.
+
+  4. Combined Works.
+
+  You may convey a Combined Work under terms of your choice that,
+taken together, effectively do not restrict modification of the
+portions of the Library contained in the Combined Work and reverse
+engineering for debugging such modifications, if you also do each of
+the following:
+
+   a) Give prominent notice with each copy of the Combined Work that
+   the Library is used in it and that the Library and its use are
+   covered by this License.
+
+   b) Accompany the Combined Work with a copy of the GNU GPL and this license
+   document.
+
+   c) For a Combined Work that displays copyright notices during
+   execution, include the copyright notice for the Library among
+   these notices, as well as a reference directing the user to the
+   copies of the GNU GPL and this license document.
+
+   d) Do one of the following:
+
+       0) Convey the Minimal Corresponding Source under the terms of this
+       License, and the Corresponding Application Code in a form
+       suitable for, and under terms that permit, the user to
+       recombine or relink the Application with a modified version of
+       the Linked Version to produce a modified Combined Work, in the
+       manner specified by section 6 of the GNU GPL for conveying
+       Corresponding Source.
+
+       1) Use a suitable shared library mechanism for linking with the
+       Library.  A suitable mechanism is one that (a) uses at run time
+       a copy of the Library already present on the user's computer
+       system, and (b) will operate properly with a modified version
+       of the Library that is interface-compatible with the Linked
+       Version.
+
+   e) Provide Installation Information, but only if you would otherwise
+   be required to provide such information under section 6 of the
+   GNU GPL, and only to the extent that such information is
+   necessary to install and execute a modified version of the
+   Combined Work produced by recombining or relinking the
+   Application with a modified version of the Linked Version. (If
+   you use option 4d0, the Installation Information must accompany
+   the Minimal Corresponding Source and Corresponding Application
+   Code. If you use option 4d1, you must provide the Installation
+   Information in the manner specified by section 6 of the GNU GPL
+   for conveying Corresponding Source.)
+
+  5. Combined Libraries.
+
+  You may place library facilities that are a work based on the
+Library side by side in a single library together with other library
+facilities that are not Applications and are not covered by this
+License, and convey such a combined library under terms of your
+choice, if you do both of the following:
+
+   a) Accompany the combined library with a copy of the same work based
+   on the Library, uncombined with any other library facilities,
+   conveyed under the terms of this License.
+
+   b) Give prominent notice with the combined library that part of it
+   is a work based on the Library, and explaining where to find the
+   accompanying uncombined form of the same work.
+
+  6. Revised Versions of the GNU Lesser General Public License.
+
+  The Free Software Foundation may publish revised and/or new versions
+of the GNU Lesser General Public License from time to time. Such new
+versions will be similar in spirit to the present version, but may
+differ in detail to address new problems or concerns.
+
+  Each version is given a distinguishing version number. If the
+Library as you received it specifies that a certain numbered version
+of the GNU Lesser General Public License "or any later version"
+applies to it, you have the option of following the terms and
+conditions either of that published version or of any later version
+published by the Free Software Foundation. If the Library as you
+received it does not specify a version number of the GNU Lesser
+General Public License, you may choose any version of the GNU Lesser
+General Public License ever published by the Free Software Foundation.
+
+  If the Library as you received it specifies that a proxy can decide
+whether future versions of the GNU Lesser General Public License shall
+apply, that proxy's public statement of acceptance of any version is
+permanent authorization for you to choose that version for the
+Library.
 
-许可方拥有并持续开发本通则所覆盖的各软件项目。被许可方经合法渠道（授权部署、
-源码分发、源码订阅或由许可方明示的其他方式）取得软件副本，即视为同意并接受
-本通则约束。
-
-
-第一条  定义
-
-1.1  「软件」—— 指适用本通则的全部项目交付物，包括但不限于源代码、目标代码、
-      二进制产物、容器镜像、安装包、数据库结构、配置模板、接口协议定义、
-      文档、设计资料、图片、图标、脚本、构建描述与其它随附材料。
-
-1.2  「源代码」—— 指以人类可读的高级编程语言编写的计算机程序文本，包括相关
-      脚本、构建描述、开发注释与技术规格说明。
-
-1.3  「二进制产物」—— 指由源代码编译、汇编或打包生成的可执行文件、库文件、
-      容器镜像或在线/离线安装包，供部署运行。
-
-1.4  「授权范围」—— 指许可方针对特定软件通过采购订单、授权记录、订阅协议、
-      部署许可、开源化公告或仓库内 NOTICE 等途径向被许可方授予的部署规模、
-      实例数量、用户数、可用范围与使用期限的约定。未作特别约定时，授权范围
-      为被许可方在自身经营边界内的非商业性内部使用。
-
-1.5  「商业秘密」—— 指软件的架构设计、算法实现、定价表达式、限流策略、计费
-      逻辑、数据库模式、接口协议及许可方未公开的全部技术信息与经营信息，
-      无论是否明示标记为「机密」。
-
-1.6  「关联方」—— 指控制被许可方、受被许可方控制或与被许可方同受一方控制的
-      实体。「控制」指持有 50% 以上股权或表决权，或通过合同、人事安排对经营
-      决策施加支配性影响。关联方仅在授权范围明确涵盖时方可使用软件。
-
-
-第二条  授权的授予
-
-2.1  许可方授予被许可方一项有限、非独占、不可转让、不可再许可的授权，在授权
-      范围内使用、运行并部署软件。
-
-2.2  被许可方可以：
-      (a) 在自有或授权范围内托管的计算环境安装、运行、部署软件；
-      (b) 为适配运行环境（操作系统、依赖版本、部署拓扑）对软件进行必要的
-          修改，但修改不得改变软件的产品边界与对外服务形态；
-      (c) 为数据安全与业务连续性制作合理数量的备份副本；
-      (d) 在遵守第三条前提下，将随附文档用于内部培训与运维。
-
-2.3  除本通则明确授予的权利外，许可方保留软件的全部权利，包括未明示授予的
-      一切权利。本通则不构成任何形式的知识产权转让。
-
-
-第三条  限制
-
-未经许可方事先书面同意，被许可方不得：
-
-3.1  以任何形式再分发、转售、出租、出借、再许可或公开软件或其衍生作品，
-      包括但不限于将其上传至公开代码托管平台、打包进开源发行版、随第三方
-      产品或服务发布；
-
-3.2  将软件或其衍生作品作为对外提供的服务（SaaS、托管服务、API 转售、
-      算力出租等）向授权范围之外的第三方交付或出售；
-
-3.3  移除、遮挡或修改软件及其副本中的版权声明、许可声明、标识、序列号、
-      校验逻辑与其它权利管理信息；
-
-3.4  对软件进行逆向工程、反编译、反汇编或试图推导其源代码与内部逻辑，
-      但适用法律明确允许或经许可方书面许可的除外；
-
-3.5  将软件用于构建或参与构建与许可方存在直接竞争的产品或服务，除非获得
-      许可方书面豁免；
-
-3.6  绕过或削弱软件的任何授权校验、计量、限流或安全机制。
-
-
-第四条  修改与衍生作品
-
-4.1  被许可方在授权范围内对软件所作的修改及衍生作品，其所有权仍归被许可方，
-      但修改与衍生作品仅可在授权范围内使用，并须保留许可方全部权利管理信息。
-
-4.2  被许可方不得将修改或衍生作品脱离本通则单独对外许可、发布或开源。
-
-4.3  被许可方为修复缺陷或适配环境所作修改，如许可方书面请求，被许可方应按
-      合理方式回传相关修改说明，以便许可方评估是否并入上游版本。
-
-
-第五条  商业秘密与保密
-
-5.1  软件中的商业秘密归许可方所有。被许可方应对其接触的软件商业秘密承担
-      保密义务，保密义务不因授权终止而解除。
-
-5.2  未经许可方书面同意，被许可方不得向任何第三方披露软件的架构设计、
-      算法实现、定价与限流策略、计费逻辑、数据库模式与接口协议细节。
-
-5.3  被许可方应对其员工、承包商与关联方的保密义务承担责任，并采取与其自身
-      商业秘密同等级别的保护措施。
-
-
-第六条  商标与品牌
-
-6.1  本通则不授予任何使用许可方商标、商号、标识、域名或其它品牌元素的权利。
-
-6.2  被许可方不得在任何宣传材料、网站、软件名称或服务名称中使用许可方品牌
-      元素，或作出可能使第三方误认其与许可方存在关联、背书或合作关系的表述。
-
-
-第七条  免责声明
-
-软件按「现状」提供，不作任何形式的明示或默示保证。许可方明确否认关于软件
-适销性、特定用途适用性、不侵权、准确性、完整性、稳定性与安全性的全部默示
-保证。被许可方应自行评估并承担使用软件的全部风险与责任，包括但不限于数据
-丢失、业务中断、直接或间接损失。
-
-
-第八条  责任限制
-
-在适用法律允许的最大范围内，许可方及其关联方、管理人员、雇员对因使用或
-无法使用软件引起的任何索赔、损害或责任（包括但不限于利润损失、商誉损失、
-数据损失、业务中断及间接、附带、特殊或惩罚性损害）不承担责任，无论该等
-责任基于合同、侵权或其它法律理论，即使许可方已知悉该等损害发生的可能性。
-
-
-第九条  终止
-
-9.1  被许可方违反本通则任何条款的，许可方有权书面通知后立即终止本通则项下
-      全部授权；被许可方应停止使用、删除并销毁软件的全部副本（含备份）。
-
-9.2  授权终止不影响双方在本通则项下已产生的权利、义务与责任条款（特别是
-      第五条保密义务、第七条免责声明、第八条责任限制）的存续。
-
-9.3  许可方可以书面形式对本通则进行修订；修订版本发布后，继续使用软件即
-      视为接受修订后的条款。
-
-
-第十条  法律适用与争议解决
-
-10.1 本通则的解释与执行适用中华人民共和国法律（不适用其冲突法规则）。
-
-10.2 因本通则引起的争议，双方应首先友好协商解决；协商不成的，任何一方可向
-      许可方所在地有管辖权的人民法院提起诉讼。
-
-10.3 本通则任何条款被认定为无效或不可执行的，不影响其余条款的效力。
-
-
-第十一条  通则的适用与复用
-
-11.1 本通则作为通则条款适用于许可方发布的全部软件项目。特定项目的适用对象、
-      授权范围、开源化状态或附加条件，以该项目仓库随附的 NOTICE、README 或
-      manifest 声明为准；未声明时适用本通则全文。
-
-11.2 各项目仓库中的 LICENSE 文件应为本通则全文或其同义引用；项目可在随附
-      NOTICE 中声明：
-      (a) 适用对象与版本；
-      (b) 授权范围（内部使用 / 指定客户部署 / 订阅制 / 开源例外）；
-      (c) 联系渠道与授权申请方式。
-
-11.3 本通则可与第三方组件许可并存：软件中引入的第三方开源组件适用其各自
-      原始许可，不因本通则而改变。
-
-11.4 本通则 Version 2 生效后，各项目随附的 Version 1 文本自动失效并被本通则
-      取代；已按 Version 1 签署的合同性安排继续有效，但其软件授权条款按本
-      通则第二条至第四条执行。
-
----
-
-NOTICE 模板（随附于各仓库，按需填写）：
-
-```text
-Project: <仓库名>
-License: CubeGarden 通则软件许可（CGSGL）Version 2
-Applies to: <适用对象 / 组件>
-Authorization scope: <内部使用 / 指定客户部署 / 订阅制 / 开源例外>
-Contact: <联系渠道>
-```

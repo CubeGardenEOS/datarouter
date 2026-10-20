@@ -2,7 +2,7 @@
 name = "blinkcms-datarouter"
 version = "0.2.0"
 edition = "2024"
-license = "Proprietary"
+license = "LGPL-3.0-only"
 description = "BlinkCMS local shared-memory datarouter C ABI packaged for Cargo"
 readme = "README.md"
 repository = "https://github.com/Creeper23456/blinkcms"

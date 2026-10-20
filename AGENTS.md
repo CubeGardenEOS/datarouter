@@ -6,8 +6,9 @@ CGEOS 平台中的角色见下方「仓库拓扑」。
 
 ## 许可
 
-所有子仓库（及其 submodule）受 `LICENSE`（CubeGarden 通则软件许可（CGSGL）
-Version 2）约束。新增代码与文档默认沿用该许可，不得引入与之冲突的第三方许可组件。
+本仓库（datarouter）以 GNU LGPL-3.0-only 开源：`LICENSE` 为 LGPL-3.0 官方文本，`COPYING` 为其引用的
+GPL-3.0 官方文本。新增代码与文档默认沿用该许可，不得引入与之冲突的第三方许可组件。
+CGEOS 家族其他子仓库仍按各自仓库的 `LICENSE` 约束。
 
 ## 仓库拓扑
 
